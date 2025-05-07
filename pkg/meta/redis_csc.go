@@ -30,7 +30,7 @@ import (
 // setupClientSideCaching configures Redis client-side caching
 func (m *redisMeta) setupClientSideCaching(expiry time.Duration) error {
 	ctx := Background()
-	
+
 	// For cluster clients, we need a separate connection for tracking
 	// Note: we'll use m.rdb directly which has the Do method
 	if _, ok := m.rdb.(*redis.ClusterClient); ok {
@@ -40,26 +40,26 @@ func (m *redisMeta) setupClientSideCaching(expiry time.Duration) error {
 			return err
 		}
 	}
-		// Enable tracking
-	mode := "ON"
+	// Enable tracking - first disable tracking if already enabled
+	_ = m.rdb.Do(ctx, "CLIENT", "TRACKING", "OFF").Err() // Ignore errors if not previously enabled
+
+	// Now enable tracking with the correct mode
+	var err error
 	if m.clientCacheBcast {
-		mode = "ON BCAST"
+		err = m.rdb.Do(ctx, "CLIENT", "TRACKING", "ON", "BCAST").Err()
 	} else {
-		mode = "ON OPTIN"
+		err = m.rdb.Do(ctx, "CLIENT", "TRACKING", "ON").Err()
 	}
-	
-	// Use Do() to execute arbitrary Redis commands
-	err := m.rdb.Do(ctx, "CLIENT", "TRACKING", mode, "REDIRECT", "0").Err()
 	if err != nil {
 		return err
 	}
-	
+
 	// Subscribe to invalidation messages
 	m.cacheSubscription = m.rdb.Subscribe(ctx, "__redis__:invalidate")
-	
+
 	// Start a goroutine to handle invalidation messages
 	go m.handleCacheInvalidation()
-	
+
 	return nil
 }
 
@@ -71,7 +71,7 @@ func (m *redisMeta) handleCacheInvalidation() {
 		if key == "" || !strings.HasPrefix(key, m.prefix) {
 			continue
 		}
-		
+
 		m.cacheMu.Lock()
 		if strings.HasPrefix(key, m.prefix+"i") {
 			// Invalidate inode cache
