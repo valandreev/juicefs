@@ -1,0 +1,101 @@
+//go:build !noredis
+// +build !noredis
+
+/*
+ * JuiceFS, Copyright 2020 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package meta
+
+import (
+	"fmt"
+	"syscall"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// doLookupWithCache implements a cached version of lookup
+func (m *redisMeta) doLookupWithCache(ctx Context, parent Ino, name string, inode *Ino, attr *Attr) syscall.Errno {
+	// Try to get from cache first
+	cacheKey := fmt.Sprintf("%d:%s", parent, name)
+	m.cacheMu.RLock()
+	if cached, ok := m.entryCache.Get(cacheKey); ok {
+		m.cacheMu.RUnlock()
+		entry := cached.(struct{
+			ino  Ino
+			attr Attr
+		})
+		*inode = entry.ino
+		*attr = entry.attr
+		return 0
+	}
+	m.cacheMu.RUnlock()
+	
+	// Not in cache, perform actual lookup
+	var foundIno Ino
+	var foundType uint8
+	
+	entryKey := m.entryKey(parent)
+	
+	// In OPTIN mode, we need to track keys we want to cache
+	if !m.clientCacheBcast {
+		err := m.rdb.Do(ctx, "CLIENT", "CACHING", "YES").Err()
+		if err != nil {
+			logger.Warnf("Failed to set CLIENT CACHING YES: %v", err)
+		}
+	}
+	
+	// Get the entry
+	buf, err := m.rdb.HGet(ctx, entryKey, name).Bytes()
+	if err != nil {
+		return errno(err)
+	}
+	
+	foundType, foundIno = m.parseEntry(buf)
+	if foundType == 0 {
+		return syscall.ENOENT
+	}
+		// Get the inode attributes
+	if !m.clientCacheBcast {
+		err = m.rdb.Do(ctx, "CLIENT", "CACHING", "YES").Err()
+		if err != nil {
+			logger.Warnf("Failed to set CLIENT CACHING YES: %v", err)
+		}
+	}
+	
+	encodedAttr, err := m.rdb.Get(ctx, m.inodeKey(foundIno)).Bytes()
+	
+	if err == nil {
+		m.parseAttr(encodedAttr, attr)
+		
+		// Add to cache
+		m.cacheMu.Lock()
+		m.entryCache.Add(cacheKey, struct{
+			ino  Ino
+			attr Attr
+		}{foundIno, *attr})
+		m.cacheMu.Unlock()
+	} else if err == redis.Nil {
+		*attr = Attr{Typ: foundType}
+		err = nil
+	}
+	
+	if err != nil {
+		return errno(err)
+	}
+	
+	*inode = foundIno
+	return 0
+}

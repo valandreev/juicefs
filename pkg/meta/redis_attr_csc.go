@@ -20,32 +20,34 @@
 package meta
 
 import (
-	"fmt"
+	"syscall"
 )
 
-// Helper method to invalidate cache entries
-func (m *redisMeta) invalidateInodeCache(inode Ino) {
-	if !m.clientCache {
-		return
+// doGetAttrWithCache implements attribute retrieval with client-side cache
+func (m *redisMeta) doGetAttrWithCache(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+	// Try to get from cache first
+	m.cacheMu.RLock()
+	if cached, ok := m.inodeCache.Get(inode); ok {
+		m.cacheMu.RUnlock()
+		cachedAttr := cached.(*Attr)
+		*attr = *cachedAttr
+		return 0
+	}
+	m.cacheMu.RUnlock()
+	
+	// Not in cache, fetch from Redis
+	a, err := m.rdb.Get(ctx, m.inodeKey(inode)).Bytes()
+	if err != nil {
+		return errno(err)
 	}
 	
+	m.parseAttr(a, attr)
+	
+	// Add to cache
+	cachedAttr := *attr
 	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
+	m.inodeCache.Add(inode, &cachedAttr)
+	m.cacheMu.Unlock()
 	
-	m.inodeCache.Remove(inode)
-	logger.Debugf("Manually invalidated inode cache for %d", inode)
-}
-
-// Helper method to invalidate directory entry cache
-func (m *redisMeta) invalidateEntryCache(parent Ino, name string) {
-	if !m.clientCache {
-		return
-	}
-	
-	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
-	
-	cacheKey := fmt.Sprintf("%d:%s", parent, name)
-	m.entryCache.Remove(cacheKey)
-	logger.Debugf("Manually invalidated entry cache for %d:%s", parent, name)
+	return 0
 }

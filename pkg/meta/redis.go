@@ -91,9 +91,9 @@ type redisMeta struct {
 	prefix     string
 	shaLookup  string // The SHA returned by Redis for the loaded `scriptLookup`
 	shaResolve string // The SHA returned by Redis for the loaded `scriptResolve`
-	
+
 	// Client-side caching
-	clientCache       bool 
+	clientCache       bool
 	clientCacheBcast  bool
 	inodeCache        *lru.Cache
 	entryCache        *lru.Cache
@@ -129,13 +129,13 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	keyFile := query.pop("tls-key-file")
 	caCertFile := query.pop("tls-ca-cert-file")
 	tlsServerName := query.pop("tls-server-name")
-	
+
 	// --- Client-Side Caching options ---
 	clientCache := query.pop("client-cache")
 	clientCacheBcast := query.pop("client-cache-bcast") != ""
 	clientCacheSize := query.int("client-cache-size", 100000)
 	clientCacheExpire := query.duration("client-cache-expire", "client_cache_expire", time.Minute*5)
-	
+
 	u.RawQuery = values.Encode()
 
 	hosts := u.Host
@@ -266,11 +266,11 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 		rdb:      rdb,
 		prefix:   prefix,
 	}
-	m.en = m	// Setup client-side caching if enabled
+	m.en = m // Setup client-side caching if enabled
 	if clientCache != "" && strings.ToLower(clientCache) != "false" {
 		m.clientCache = true
 		m.clientCacheBcast = clientCacheBcast
-		
+
 		// Create LRU caches
 		var err error
 		m.inodeCache, err = lru.New(clientCacheSize)
@@ -278,13 +278,13 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			logger.Warnf("Failed to create inode cache: %v", err)
 			m.clientCache = false
 		}
-		
+
 		m.entryCache, err = lru.New(clientCacheSize)
 		if err != nil {
 			logger.Warnf("Failed to create entry cache: %v", err)
 			m.clientCache = false
 		}
-		
+
 		// Enable tracking and subscribe to invalidation messages
 		if m.clientCache {
 			if err := m.setupClientSideCaching(clientCacheExpire); err != nil {
@@ -295,9 +295,9 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 				if !clientCacheBcast {
 					mode = "OPTIN"
 				}
-				logger.Infof("Redis client-side caching enabled (mode: %s, size: %d, expire: %v)", 
-						 mode, clientCacheSize, clientCacheExpire)
-				
+				logger.Infof("Redis client-side caching enabled (mode: %s, size: %d, expire: %v)",
+					mode, clientCacheSize, clientCacheExpire)
+
 				// Override the default methods with cached versions
 				m.overrideWithCachedMethods()
 			}
@@ -913,6 +913,10 @@ func (m *redisMeta) handleLuaResult(op string, res interface{}, err error, retur
 }
 
 func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, attr *Attr) syscall.Errno {
+	if m.clientCache {
+		return m.doLookupWithCache(ctx, parent, name, inode, attr)
+	}
+	
 	var foundIno Ino
 	var foundType uint8
 	var encodedAttr []byte
@@ -982,6 +986,9 @@ func (m *redisMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, at
 }
 
 func (m *redisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+	if m.clientCache {
+		return m.doGetAttrWithCache(ctx, inode, attr)
+	}
 	a, err := m.rdb.Get(ctx, m.inodeKey(inode)).Bytes()
 	if err == nil {
 		m.parseAttr(a, attr)
