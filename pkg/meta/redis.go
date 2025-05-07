@@ -44,6 +44,7 @@ import (
 	"syscall"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru"
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/pkg/errors"
@@ -90,6 +91,14 @@ type redisMeta struct {
 	prefix     string
 	shaLookup  string // The SHA returned by Redis for the loaded `scriptLookup`
 	shaResolve string // The SHA returned by Redis for the loaded `scriptResolve`
+	
+	// Client-side caching
+	clientCache       bool 
+	clientCacheBcast  bool
+	inodeCache        *lru.Cache
+	entryCache        *lru.Cache
+	cacheSubscription *redis.PubSub
+	cacheMu           sync.RWMutex
 }
 
 var _ Meta = &redisMeta{}
@@ -120,6 +129,13 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	keyFile := query.pop("tls-key-file")
 	caCertFile := query.pop("tls-ca-cert-file")
 	tlsServerName := query.pop("tls-server-name")
+	
+	// --- Client-Side Caching options ---
+	clientCache := query.pop("client-cache")
+	clientCacheBcast := query.pop("client-cache-bcast") != ""
+	clientCacheSize := query.int("client-cache-size", 100000)
+	clientCacheExpire := query.duration("client-cache-expire", "client_cache_expire", time.Minute*5)
+	
 	u.RawQuery = values.Encode()
 
 	hosts := u.Host
@@ -245,18 +261,57 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			prefix = fmt.Sprintf("{%d}", opt.DB)
 		}
 	}
-
 	m := &redisMeta{
 		baseMeta: newBaseMeta(addr, conf),
 		rdb:      rdb,
 		prefix:   prefix,
 	}
-	m.en = m
+	m.en = m	// Setup client-side caching if enabled
+	if clientCache != "" && strings.ToLower(clientCache) != "false" {
+		m.clientCache = true
+		m.clientCacheBcast = clientCacheBcast
+		
+		// Create LRU caches
+		var err error
+		m.inodeCache, err = lru.New(clientCacheSize)
+		if err != nil {
+			logger.Warnf("Failed to create inode cache: %v", err)
+			m.clientCache = false
+		}
+		
+		m.entryCache, err = lru.New(clientCacheSize)
+		if err != nil {
+			logger.Warnf("Failed to create entry cache: %v", err)
+			m.clientCache = false
+		}
+		
+		// Enable tracking and subscribe to invalidation messages
+		if m.clientCache {
+			if err := m.setupClientSideCaching(clientCacheExpire); err != nil {
+				logger.Warnf("Failed to enable Redis client-side caching: %v", err)
+				m.clientCache = false
+			} else {
+				mode := "BCAST"
+				if !clientCacheBcast {
+					mode = "OPTIN"
+				}
+				logger.Infof("Redis client-side caching enabled (mode: %s, size: %d, expire: %v)", 
+						 mode, clientCacheSize, clientCacheExpire)
+				
+				// Override the default methods with cached versions
+				m.overrideWithCachedMethods()
+			}
+		}
+	}
+
 	m.checkServerConfig()
 	return m, nil
 }
 
 func (m *redisMeta) Shutdown() error {
+	if m.clientCache && m.cacheSubscription != nil {
+		_ = m.cacheSubscription.Close()
+	}
 	return m.rdb.Close()
 }
 

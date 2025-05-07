@@ -111,6 +111,19 @@ func (qm *queryMap) pop(key string) string {
 	return qm.Get(key)
 }
 
+func (qm *queryMap) int(key string, defaultValue int) int {
+	val := qm.pop(key)
+	if val == "" {
+		return defaultValue
+	}
+	if n, err := strconv.Atoi(val); err == nil {
+		return n
+	} else {
+		logger.Warnf("Parse integer %s for key %s: %s", val, key, err)
+		return defaultValue
+	}
+}
+
 func errno(err error) syscall.Errno {
 	if err == nil {
 		return 0
