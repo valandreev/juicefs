@@ -28,10 +28,10 @@ func (m *redisMeta) invalidateInodeCache(inode Ino) {
 	if !m.clientCache {
 		return
 	}
-	
+
 	m.cacheMu.Lock()
 	defer m.cacheMu.Unlock()
-	
+
 	m.inodeCache.Remove(inode)
 	logger.Debugf("Manually invalidated inode cache for %d", inode)
 }
@@ -41,10 +41,10 @@ func (m *redisMeta) invalidateEntryCache(parent Ino, name string) {
 	if !m.clientCache {
 		return
 	}
-	
+
 	m.cacheMu.Lock()
 	defer m.cacheMu.Unlock()
-	
+
 	cacheKey := fmt.Sprintf("%d:%s", parent, name)
 	m.entryCache.Remove(cacheKey)
 	logger.Debugf("Manually invalidated entry cache for %d:%s", parent, name)

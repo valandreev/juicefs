@@ -1,0 +1,170 @@
+//go:build !noredis
+// +build !noredis
+
+/*
+ * JuiceFS, Copyright 2020 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package meta
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// Helper method to invalidate cache entries
+func (m *redisMeta) invalidateInodeCache(inode Ino) {
+	if !m.clientCache {
+		return
+	}
+	
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	
+	m.inodeCache.Remove(inode)
+}
+
+// Helper method to invalidate directory entry cache
+func (m *redisMeta) invalidateEntryCache(parent Ino, name string) {
+	if !m.clientCache {
+		return
+	}
+	
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	
+	cacheKey := fmt.Sprintf("%d:%s", parent, name)
+	m.entryCache.Remove(cacheKey)
+}
+
+// For examples and documentation purposes only
+// Each method would need to be updated to call invalidateInodeCache or invalidateEntryCache 
+// after modifying Redis data
+
+/*
+// Example of how to modify doSetAttr to use cache invalidation
+func (m *redisMeta) doSetAttrWithCache(ctx Context, inode Ino, set uint16, attr *Attr) syscall.Errno {
+	// Call original method
+	ret := m.doSetAttr(ctx, inode, set, attr)
+	
+	// If successful, invalidate cache
+	if ret == 0 && m.clientCache {
+		m.invalidateInodeCache(inode)
+	}
+	
+	return ret
+}
+
+// Example of how to modify doRename to use cache invalidation
+func (m *redisMeta) doRenameWithCache(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
+	// Call original method
+	ret := m.doRename(ctx, parentSrc, nameSrc, parentDst, nameDst, flags, inode, attr)
+	
+	// If successful, invalidate cache entries
+	if ret == 0 && m.clientCache {
+		m.invalidateEntryCache(parentSrc, nameSrc)
+		m.invalidateEntryCache(parentDst, nameDst)
+	}
+	
+	return ret
+}
+*/
+
+// handleCacheInvalidation processes invalidation messages from Redis
+func (m *redisMeta) handleCacheInvalidation() {
+    ch := m.cacheSubscription.Channel()
+    for msg := range ch {
+        key := msg.Payload
+        if key == "" || !strings.HasPrefix(key, m.prefix) {
+            continue
+        }
+        
+        logger.Debugf("Redis cache invalidation for key: %s", key)
+        
+        m.cacheMu.Lock()
+        // Check key type and invalidate appropriate cache
+        if strings.HasPrefix(key, m.prefix+"i") {
+            // Inode key (i$inode)
+            inodeStr := key[len(m.prefix)+1:]
+            inode, err := strconv.ParseUint(inodeStr, 10, 64)
+            if err == nil {
+                logger.Debugf("Invalidating inode cache for inode: %d", inode)
+                m.inodeCache.Remove(Ino(inode))
+                
+                // Also invalidate related file content entries
+                // This is important when file content is modified
+                for k, _ := range m.entryCache.Keys() {
+                    if strings.Contains(k.(string), fmt.Sprintf(":%d:", inode)) {
+                        logger.Debugf("Invalidating related entry cache: %s", k)
+                        m.entryCache.Remove(k)
+                    }
+                }
+            }
+        } else if strings.HasPrefix(key, m.prefix+"d") {
+            // Directory entry key (d$inode)
+            parentStr := key[len(m.prefix)+1:]
+            parent, err := strconv.ParseUint(parentStr, 10, 64)
+            if err == nil {
+                logger.Debugf("Invalidating directory cache for parent: %d", parent)
+                m.entryCache.Remove(Ino(parent))
+            }
+        } else if strings.HasPrefix(key, m.prefix+"c") {
+            // File content key (c$inode_$indx)
+            parts := strings.SplitN(key[len(m.prefix)+1:], "_", 2)
+            if len(parts) > 0 {
+                inodeStr := parts[0]
+                inode, err := strconv.ParseUint(inodeStr, 10, 64)
+                if err == nil {
+                    logger.Debugf("Invalidating file content cache for inode: %d", inode)
+                    m.inodeCache.Remove(Ino(inode))
+                    
+                    // Also invalidate any related entry cache entries
+                    for k, _ := range m.entryCache.Keys() {
+                        if strings.Contains(k.(string), fmt.Sprintf(":%d:", inode)) {
+                            logger.Debugf("Invalidating related entry cache: %s", k)
+                            m.entryCache.Remove(k)
+                        }
+                    }
+                }
+            }
+        }
+        m.cacheMu.Unlock()
+    }
+}
+
+// Override the CreateFile method to ensure cache invalidation
+func (m *redisMeta) overrideCreateFile() {
+    original := m.CreateFile
+    m.CreateFile = func(ctx Context, parent Ino, name string, mode uint16, cumask uint16, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
+        result := original(ctx, parent, name, mode, cumask, flags, inode, attr)
+        
+        // Force invalidate caches for this new file
+        if result == 0 && m.clientCache {
+            m.cacheMu.Lock()
+            m.inodeCache.Remove(*inode)
+            // Invalidate parent directory entries
+            m.entryCache.Remove(parent)
+            // Invalidate specific entry if cached
+            cacheKey := fmt.Sprintf("%d:%s", parent, name)
+            m.entryCache.Remove(cacheKey)
+            m.cacheMu.Unlock()
+            
+            logger.Debugf("Forced cache invalidation after file creation: %s (inode: %d)", name, *inode)
+        }
+        
+        return result
+    }
+}

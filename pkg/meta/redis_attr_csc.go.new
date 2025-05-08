@@ -24,6 +24,7 @@ import (
 )
 
 // doGetAttrWithCache implements attribute retrieval with client-side cache
+// This is an example implementation showing how CSC could be used
 func (m *redisMeta) doGetAttrWithCache(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 	// Try to get from cache first
 	m.cacheMu.RLock()
@@ -34,20 +35,20 @@ func (m *redisMeta) doGetAttrWithCache(ctx Context, inode Ino, attr *Attr) sysca
 		return 0
 	}
 	m.cacheMu.RUnlock()
-
+	
 	// Not in cache, fetch from Redis
 	a, err := m.rdb.Get(ctx, m.inodeKey(inode)).Bytes()
 	if err != nil {
 		return errno(err)
 	}
-
+	
 	m.parseAttr(a, attr)
-
+	
 	// Add to cache
 	cachedAttr := *attr
 	m.cacheMu.Lock()
 	m.inodeCache.Add(inode, &cachedAttr)
 	m.cacheMu.Unlock()
-
+	
 	return 0
 }

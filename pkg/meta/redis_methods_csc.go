@@ -21,7 +21,9 @@ package meta
 
 import (
 	"fmt"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -33,7 +35,7 @@ func (m *redisMeta) doLookupWithCache(ctx Context, parent Ino, name string, inod
 	m.cacheMu.RLock()
 	if cached, ok := m.entryCache.Get(cacheKey); ok {
 		m.cacheMu.RUnlock()
-		entry := cached.(struct{
+		entry := cached.(struct {
 			ino  Ino
 			attr Attr
 		})
@@ -42,13 +44,13 @@ func (m *redisMeta) doLookupWithCache(ctx Context, parent Ino, name string, inod
 		return 0
 	}
 	m.cacheMu.RUnlock()
-	
+
 	// Not in cache, perform actual lookup
 	var foundIno Ino
 	var foundType uint8
-	
+
 	entryKey := m.entryKey(parent)
-	
+
 	// In OPTIN mode, we need to track keys we want to cache
 	if !m.clientCacheBcast {
 		err := m.rdb.Do(ctx, "CLIENT", "CACHING", "YES").Err()
@@ -56,33 +58,33 @@ func (m *redisMeta) doLookupWithCache(ctx Context, parent Ino, name string, inod
 			logger.Warnf("Failed to set CLIENT CACHING YES: %v", err)
 		}
 	}
-	
+
 	// Get the entry
 	buf, err := m.rdb.HGet(ctx, entryKey, name).Bytes()
 	if err != nil {
 		return errno(err)
 	}
-	
+
 	foundType, foundIno = m.parseEntry(buf)
 	if foundType == 0 {
 		return syscall.ENOENT
 	}
-		// Get the inode attributes
+	// Get the inode attributes
 	if !m.clientCacheBcast {
 		err = m.rdb.Do(ctx, "CLIENT", "CACHING", "YES").Err()
 		if err != nil {
 			logger.Warnf("Failed to set CLIENT CACHING YES: %v", err)
 		}
 	}
-	
+
 	encodedAttr, err := m.rdb.Get(ctx, m.inodeKey(foundIno)).Bytes()
-	
+
 	if err == nil {
 		m.parseAttr(encodedAttr, attr)
-		
+
 		// Add to cache
 		m.cacheMu.Lock()
-		m.entryCache.Add(cacheKey, struct{
+		m.entryCache.Add(cacheKey, struct {
 			ino  Ino
 			attr Attr
 		}{foundIno, *attr})
@@ -91,11 +93,70 @@ func (m *redisMeta) doLookupWithCache(ctx Context, parent Ino, name string, inod
 		*attr = Attr{Typ: foundType}
 		err = nil
 	}
-	
+
 	if err != nil {
 		return errno(err)
 	}
-	
+
 	*inode = foundIno
 	return 0
+}
+
+// invalidateFileCache explicitly invalidates cached data for a file
+func (m *redisMeta) invalidateFileCache(inode Ino) {
+	if !m.clientCache {
+		return
+	}
+
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+
+	// Remove from inode cache
+	m.inodeCache.Remove(inode)
+	// Remove any related entry cache items
+	for _, k := range m.entryCache.Keys() {
+		keyStr, ok := k.(string)
+		if !ok {
+			continue
+		}
+
+		// Check if this entry references our inode
+		if strings.Contains(keyStr, fmt.Sprintf(":%d:", uint64(inode))) ||
+			strings.HasSuffix(keyStr, fmt.Sprintf(":%d", uint64(inode))) {
+			m.entryCache.Remove(keyStr)
+		}
+	}
+
+	logger.Debugf("Explicitly invalidated cache for inode %d", inode)
+}
+
+// File modification methods that automatically invalidate cache
+// These are helper functions to be called directly, not method overrides
+
+// writeCached wraps the Write operation with cache invalidation
+func (m *redisMeta) writeCached(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
+	result := m.baseMeta.Write(ctx, inode, indx, off, slice, mtime)
+	if result == 0 {
+		m.invalidateFileCache(inode)
+	}
+	return result
+}
+
+// truncateCached wraps the Truncate operation with cache invalidation
+func (m *redisMeta) truncateCached(ctx Context, inode Ino, flags uint8, length uint64, attr *Attr, skipPermCheck bool) syscall.Errno {
+	result := m.baseMeta.Truncate(ctx, inode, flags, length, attr, skipPermCheck)
+	if result == 0 {
+		m.invalidateFileCache(inode)
+	}
+	return result
+}
+
+// createFileCached wraps file creation with cache invalidation
+func (m *redisMeta) createFileCached(ctx Context, parent Ino, name string, mode uint16, cumask uint16, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
+	result := m.baseMeta.Create(ctx, parent, name, mode, cumask, flags, inode, attr)
+	if result == 0 {
+		// Invalidate parent directory cache
+		m.invalidateEntryCache(parent, name)
+	}
+	return result
 }

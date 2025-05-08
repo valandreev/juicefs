@@ -132,9 +132,8 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 
 	// --- Client-Side Caching options ---
 	clientCache := query.pop("client-cache")
-	clientCacheBcast := query.pop("client-cache-bcast") != ""
 	clientCacheSize := query.int("client-cache-size", 100000)
-	clientCacheExpire := query.duration("client-cache-expire", "client_cache_expire", time.Minute*5)
+	clientCacheExpire := query.duration("client-cache-expire", "client_cache_expire", time.Second*30) // Default to 30 seconds now
 
 	u.RawQuery = values.Encode()
 
@@ -269,20 +268,23 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	m.en = m // Setup client-side caching if enabled
 	if clientCache != "" && strings.ToLower(clientCache) != "false" {
 		m.clientCache = true
-		m.clientCacheBcast = clientCacheBcast
+		m.clientCacheBcast = true // Always use BCAST mode
 
 		// Create LRU caches
-		var err error
-		m.inodeCache, err = lru.New(clientCacheSize)
+		inodeCache, err := lru.New(clientCacheSize)
 		if err != nil {
 			logger.Warnf("Failed to create inode cache: %v", err)
 			m.clientCache = false
+		} else {
+			m.inodeCache = inodeCache
 		}
 
-		m.entryCache, err = lru.New(clientCacheSize)
+		entryCache, err := lru.New(clientCacheSize)
 		if err != nil {
 			logger.Warnf("Failed to create entry cache: %v", err)
 			m.clientCache = false
+		} else {
+			m.entryCache = entryCache
 		}
 
 		// Enable tracking and subscribe to invalidation messages
@@ -291,15 +293,11 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 				logger.Warnf("Failed to enable Redis client-side caching: %v", err)
 				m.clientCache = false
 			} else {
-				mode := "BCAST"
-				if !clientCacheBcast {
-					mode = "OPTIN"
-				}
-				logger.Infof("Redis client-side caching enabled (mode: %s, size: %d, expire: %v)",
-					mode, clientCacheSize, clientCacheExpire)
+				logger.Infof("Redis client-side caching enabled (mode: BCAST, size: %d, expire: %v)",
+					clientCacheSize, clientCacheExpire)
 
-				// Override the default methods with cached versions
-				m.overrideWithCachedMethods()
+				// Setup cached methods
+				m.setupCachedMethods()
 			}
 		}
 	}
@@ -309,8 +307,8 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *redisMeta) Shutdown() error {
-	if m.clientCache && m.cacheSubscription != nil {
-		_ = m.cacheSubscription.Close()
+	if m.clientCache {
+		m.shutdownClientSideCaching()
 	}
 	return m.rdb.Close()
 }
@@ -916,7 +914,7 @@ func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, a
 	if m.clientCache {
 		return m.doLookupWithCache(ctx, parent, name, inode, attr)
 	}
-	
+
 	var foundIno Ino
 	var foundType uint8
 	var encodedAttr []byte

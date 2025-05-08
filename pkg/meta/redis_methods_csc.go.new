@@ -1,0 +1,136 @@
+//go:build !noredis
+// +build !noredis
+
+/*
+ * JuiceFS, Copyright 2020 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package meta
+
+import (
+	"fmt"
+	"syscall"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// This file contains example implementations or extensions for Redis methods
+// that would use client-side caching. These are for reference only and are not
+// meant to replace the existing methods directly.
+
+// Example of how getAttr could be implemented with caching
+func (m *redisMeta) getAttrWithCache(ctx Context, inode Ino) (*Attr, syscall.Errno) {
+	var attr Attr
+	
+	// Try to get from cache first if caching is enabled
+	if m.clientCache {
+		m.cacheMu.RLock()
+		if cached, ok := m.inodeCache.Get(inode); ok {
+			m.cacheMu.RUnlock()
+			cachedAttr := cached.(*Attr)
+			return cachedAttr, 0
+		}
+		m.cacheMu.RUnlock()
+	}
+	
+	// Not in cache or caching disabled, fetch from Redis
+	a, err := m.rdb.Get(ctx, m.inodeKey(inode)).Bytes()
+	if err != nil {
+		return nil, errno(err)
+	}
+	
+	m.parseAttr(a, &attr)
+	
+	// Add to cache if caching is enabled
+	if m.clientCache {
+		cachedAttr := attr
+		m.cacheMu.Lock()
+		m.inodeCache.Add(inode, &cachedAttr)
+		m.cacheMu.Unlock()
+	}
+	
+	return &attr, 0
+}
+
+// Example of how lookup could be implemented with caching
+func (m *redisMeta) lookupWithCache(ctx Context, parent Ino, name string) (Ino, *Attr, syscall.Errno) {
+	// Try to get from cache first if caching is enabled
+	if m.clientCache {
+		cacheKey := fmt.Sprintf("%d:%s", parent, name)
+		m.cacheMu.RLock()
+		if cached, ok := m.entryCache.Get(cacheKey); ok {
+			m.cacheMu.RUnlock()
+			entry := cached.(struct{
+				ino  Ino
+				attr Attr
+			})
+			return entry.ino, &entry.attr, 0
+		}
+		m.cacheMu.RUnlock()
+	}
+	
+	// Not in cache or caching disabled, perform actual lookup
+	entryKey := m.entryKey(parent)
+	
+	// In OPTIN mode, tell Redis we want to track this key
+	if m.clientCache && !m.clientCacheBcast {
+		err := m.rdb.Eval(ctx, "return redis.call('CLIENT', 'CACHING', 'YES')", []string{}).Err()
+		if err != nil {
+			logger.Warnf("Failed to set CLIENT CACHING YES: %v", err)
+		}
+	}
+	
+	// Get the entry
+	buf, err := m.rdb.HGet(ctx, entryKey, name).Bytes()
+	if err != nil {
+		return 0, nil, errno(err)
+	}
+	
+	foundType, foundIno := m.parseEntry(buf)
+	if foundType == 0 {
+		return 0, nil, syscall.ENOENT
+	}
+	
+	// Get the inode attributes
+	if m.clientCache && !m.clientCacheBcast {
+		err = m.rdb.Eval(ctx, "return redis.call('CLIENT', 'CACHING', 'YES')", []string{}).Err()
+		if err != nil {
+			logger.Warnf("Failed to set CLIENT CACHING YES: %v", err)
+		}
+	}
+	
+	var attr Attr
+	encodedAttr, err := m.rdb.Get(ctx, m.inodeKey(foundIno)).Bytes()
+	
+	if err == nil {
+		m.parseAttr(encodedAttr, &attr)
+		
+		// Add to cache if caching is enabled
+		if m.clientCache {
+			m.cacheMu.Lock()
+			m.entryCache.Add(fmt.Sprintf("%d:%s", parent, name), struct{
+				ino  Ino
+				attr Attr
+			}{foundIno, attr})
+			m.cacheMu.Unlock()
+		}
+	} else if err == redis.Nil {
+		attr = Attr{Typ: foundType}
+	} else {
+		return 0, nil, errno(err)
+	}
+	
+	return foundIno, &attr, 0
+}

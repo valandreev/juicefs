@@ -17,27 +17,24 @@ This results in reduced network traffic, lower latency, and higher throughput.
 JuiceFS supports Redis CSC through the following options in the metadata URL:
 
 ```
---meta-url="redis://localhost/1?client-cache=true"  # Enable client-side caching
---meta-url="redis://localhost/1?client-cache=true&client-cache-bcast=true"  # Use BCAST mode
---meta-url="redis://localhost/1?client-cache=true&client-cache-size=50000"  # Set cache size (default 100000)
---meta-url="redis://localhost/1?client-cache=true&client-cache-expire=3m"   # Set cache expiration (default 5m)
+--meta-url="redis://localhost/1?client-cache=true" # Enable client-side caching (always BCAST mode) 
+--meta-url="redis://localhost/1?client-cache=true&client-cache-size=50000" # Set cache size (default 100000) 
+--meta-url="redis://localhost/1?client-cache-expire=30s" # Set cache expiration (default 30s)
 ```
 
 ### Options
 
-- `client-cache`: Enables client-side caching (set to any non-empty value except "false")
-- `client-cache-bcast`: If present, uses broadcast mode to track all keys (better for workloads with many keys)
+- `client-cache`: Enables client-side caching in BCAST mode (set to any value except "false")
 - `client-cache-size`: Maximum number of cached entries (default: 100000)
-- `client-cache-expire`: Cache expiration time (default: 5 minutes)
+- `client-cache-expire`: Cache expiration time (default: 30 seconds)
 
 ## Modes
 
-JuiceFS supports two CSC tracking modes:
+JuiceFS uses BCAST mode for simplicity and reliability:
 
-1. **OPTIN mode (default)**: Only keys that are explicitly requested to be tracked are tracked.
-2. **BCAST mode**: All keys accessed by the client are tracked.
+- **BCAST mode**: All keys accessed by the client are tracked and notifications are sent for any changes.
 
-BCAST mode is simpler but may generate more invalidation traffic. OPTIN mode is more selective but requires careful management of which keys to track.
+BCAST mode provides the simplest implementation while ensuring cache coherence across all clients.
 
 ## Requirements
 
@@ -47,25 +44,17 @@ BCAST mode is simpler but may generate more invalidation traffic. OPTIN mode is 
 ## Performance Considerations
 
 1. Avoid setting cache too large to prevent excessive memory usage
-2. For small to medium deployments, BCAST mode is easier to use
-3. For very large deployments with many clients, consider OPTIN mode
-4. CSC works best when data reads are much more frequent than writes
-
-## Limitations
-
-Redis CSC has some limitations to be aware of:
-
-1. Large workloads with high write rates may result in many invalidation messages
-2. Cluster mode has some additional overhead for tracking
-3. When many clients connect to Redis with CSC enabled, memory usage on the Redis server increases
+2. The cache is most effective for metadata-heavy workloads with many repeated operations
+3. Write operations automatically invalidate related cache entries to maintain consistency
+4. For very write-heavy workloads, consider disabling CSC as invalidation traffic may offset benefits
 
 ## Troubleshooting
 
-To verify CSC is working properly:
+If you experience crashes or instability with CSC enabled:
 
-1. Check JuiceFS logs for "Redis client-side caching enabled" messages
-2. Monitor Redis CPU and memory usage
-3. If performance degrades, consider adjusting cache size or disabling CSC
+1. Update to the latest JuiceFS version which contains important fixes for CSC
+2. Try reducing the cache size with `client-cache-size`
+3. If problems persist, disable CSC by removing the `client-cache` parameter
 
 ## References
 
