@@ -133,7 +133,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	// --- Client-Side Caching options ---
 	clientCache := query.pop("client-cache")
 	clientCacheSize := query.int("client-cache-size", 100000)
-	clientCacheExpire := query.duration("client-cache-expire", "client_cache_expire", time.Second*30) // Default to 30 seconds now
+	clientCacheExpire := query.duration("client-cache-expire", "client_cache_expire", time.Second*300) // Default to 300 seconds now
 
 	u.RawQuery = values.Encode()
 
