@@ -26,7 +26,7 @@ JuiceFS supports Redis CSC through the following options in the metadata URL:
 
 - `client-cache`: Enables client-side caching in BCAST mode (set to any value except "false")
 - `client-cache-size`: Maximum number of cached entries (default: 100000)
-- `client-cache-expire`: Cache expiration time (default: 30 seconds)
+- `client-cache-expire`: Cache expiration time (default: 300 seconds)
 
 ## Modes
 
