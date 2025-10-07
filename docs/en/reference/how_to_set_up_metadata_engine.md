@@ -79,6 +79,57 @@ juicefs format \
 
 For security purposes, it is recommended to pass the password using the environment variable `META_PASSWORD` or `REDIS_PASSWORD`, e.g.
 
+### Redis split (master + replica) {#redis-split}
+
+JuiceFS provides an optional metadata engine named `redis-split` for geo-distributed deployments where reads benefit from low-latency replicas but all writes must still go to an authoritative Redis master. It works by routing write, transaction, and lock operations to the master while sending most read operations to a replica. Replication is managed by Redis itself; JuiceFS only consumes the endpoints that you expose.
+
+**URL format**
+
+```
+redis-split://<master_url>?replica=<replica_url>
+```
+
+Both `<master_url>` and `<replica_url>` must use the standard Redis connection syntax (`redis://` or `rediss://` with optional credentials, port, and DB number). For example, if your master runs on `redis://10.0.0.1:6379/1` and the replica on `redis://10.0.0.2:16379/1`, the metadata endpoint becomes:
+
+```shell
+redis-split://redis://10.0.0.1:6379/1?replica=redis://10.0.0.2:16379/1
+```
+
+> Ensure that replication between the two instances is already configured and healthy. JuiceFS does not bootstrap or manage Redis replication.
+
+**Formatting**
+
+```shell
+juicefs format \
+  --storage s3 \
+  --bucket https://my-bucket.s3.amazonaws.com \
+  redis-split://redis://:master-pass@100.123.245.11:6379/1?replica=redis://:replica-pass@100.93.213.27:16379/1 \
+  studio
+```
+
+You can keep credentials out of the command line by exporting `META_PASSWORD`, `REDIS_PASSWORD`, or using Redis ACL users. The DB number in the master and replica URLs must match, because metadata lives in the same logical database on both sides.
+
+**Mounting and caching recommendations**
+
+Because replica reads are eventually consistent, we strongly recommend enabling generous metadata caches on clients so they observe their own writes while replication catches up:
+
+```shell
+juicefs mount redis-split://... /mnt/jfs \
+  --attr-cache 60s \
+  --entry-cache 60s \
+  --open-cache 30s
+```
+
+Tune these durations to match your workload—longer caches reduce redundant reads against the replica at the cost of fresher metadata.
+
+**Replica health and failover**
+
+- If the replica connection fails or returns an error other than `redis.Nil`, JuiceFS automatically logs the issue and reroutes reads to the master until the replica responds to periodic health checks (default interval 5 seconds).
+- When the replica recovers, reads are transparently shifted back without operator intervention.
+- Locking- or consistency-sensitive operations (e.g., `Setlk`, `Flock`, `doMknod`, transactions) always stay on the master regardless of replica health.
+
+Monitor the logs emitted by the `juicefs` process (`redis-split: replica … unavailable/recovered`) to track failover events. If you need stricter consistency guarantees, consider keeping caches short or pinning critical operations to the master via your access pattern.
+
 ```shell
 export META_PASSWORD=mypassword
 ```

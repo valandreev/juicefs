@@ -82,9 +82,9 @@
        ```
        *(на Windows сборка пакета `pkg/meta` по-прежнему требует POSIX-констант из `syscall`; запускайте на Linux/macOS либо используйте флаги для исключения соответствующих тестов).* 
 
-9) Документация и конфигурация
-   - Добавить `docs`/README-заметки: `docs/en/redis-split.md` или краткая секция в `docs`/`README.md`.
-   - Тесты документации: примеры команд `juicefs format redis-split://... --bucket=...`.
+9) Документация и конфигурация *(✅ выполнено – обновлена глава "How to Set Up Metadata Engine" с разделом про `redis-split`)*
+   - В `docs/en/reference/how_to_set_up_metadata_engine.md` добавлен подраздел «Redis split (master + replica)» с форматами URL, примерами `juicefs format`/`juicefs mount`, рекомендациями по кешам (`--attr-cache`, `--entry-cache`, `--open-cache`) и описанием автоматического fallback-а на master.
+   - Обновлённые инструкции покрывают требования PRD (консистентность, использование переменных окружения и подготовку репликации Redis).
 
 10) CI и Makefile
    - Добавить target `make test.meta.redis-split` (опционально) или расширить `test.meta.core` для покрытия новых unit-тестов.
