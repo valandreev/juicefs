@@ -63,14 +63,15 @@
      - `TestDoMknod_RoutesToMaster` — для создания inode — используется master.
    - Реализация: при необходимости вынести общие куски кода (например, `handleLuaResult`) в библиотечные хелперы чтобы переиспользовать с минимальными дублированиями.
 
-7) Интеграционный тест парой реальных Redis (локально / CI)
-   - Цель: проверить end-to-end поведение (FR1–FR4) с настоящими Redis: master + replica.
-   - Подготовка: использовать `.github/scripts/start_meta_engine.sh` или Docker compose (CI использует скрипты в workflows).
-   - Тестовый сценарий (`pkg/meta/redis_split_integration_test.go`):
-     - Запустить/объявить master и replica (или использовать тестовые адреса из PRD).
-     - Вызвать `juicefs format <meta-url>` по адресу `redis-split://<master>?replica=<replica>` (можно запускать бинарь `./juicefs` или использовать meta API напрямую).
-     - Проверить: последовательность `ls -l` / `stat` выполняются успешно и читают через replica (можно измерять логи / counters на fake clients, либо проверять задержки как эвристика).
-   - Acceptance: интеграционный тест корректно монтирует (или инициализирует) FS и выполняет базовый сценарий.
+7) Интеграционный тест парой реальных Redis (локально / CI) *(✅ выполнено – `TestRedisSplitIntegration_BasicRouting`)*
+    - Реализация: `pkg/meta/redis_split_integration_test.go` использует реальные master/replica клиенты, подключает go-redis hooks и проверяет, что write-путь (`Mkdir`) уходит на master, а `GetAttr` читается с replica.
+    - Эндпоинты по умолчанию: `redis://100.123.245.11:6379/1` (master) и `redis://100.93.213.27:16379/1` (replica); их можно переопределить через переменные окружения `JFS_REDIS_SPLIT_MASTER` / `JFS_REDIS_SPLIT_REPLICA`.
+    - Запуск: тест автоматически пропускается, если подключение к указанным Redis недоступно. Для ручного прогона:
+       ```pwsh
+       go test ./pkg/meta -run TestRedisSplitIntegration -v
+       ```
+       При необходимости установите `JFS_REDIS_SPLIT_MASTER` и `JFS_REDIS_SPLIT_REPLICA` перед запуском.
+    - Acceptance: успешное завершение теста подтверждает базовый сценарий FR1–FR4 с реальным master / replica.
 
 8) Фейлы и откат: тесты перехода на мастер при недоступной реплике
    - Тест: `TestReplicaUnavailable_FallbackToMaster` (интеграционный / e2e).
