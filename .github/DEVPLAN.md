@@ -51,13 +51,13 @@
      - `TestChooseClient_LockOpsToMaster` — lock-related ops -> master.
    - Реализация: добавить helper `isWriteOp(op)` or explicit switch; покрыть тестами edge-cases.
 
-5) Тест для txn() — гарантия что транзакции идут на мастер
+5) Тест для txn() — гарантия что транзакции идут на мастер *(✅ выполнено – `TestTxnUsesMaster`, перехват `trackingClient`)*
    - Тест: `TestTxnUsesMaster`.
      - Контекст: создать fake `master` и `replica` клиенты, которые инкрементируют счетчик вызовов; вызвать `m.txn(ctx, func(tx *redis.Tx) error { return nil }, keys...)` через новый движок.
      - Ожидаемое: только master получил транзакцию.
    - Реализация: модифицировать/скопировать существующую `txn()` логику из `pkg/meta/redis.go` в `redis_split.go`, но вызов `m.master` вместо `m.rdb`.
 
-6) Покрыть unit-тестами реальные маршруты в минимальных методах
+6) Покрыть unit-тестами реальные маршруты в минимальных методах *(✅ выполнено – `TestDoGetAttr_RoutesToReplica`, `TestDoMknod_RoutesToMaster`, переопределение `doGetAttr` для чтений)*
    - Тесты:
      - `TestDoGetAttr_RoutesToReplica` — вызвать public/internal `doGetAttr` (или вынести маршрутизацию в testable helper) и проверить, что read-клиент использован.
      - `TestDoMknod_RoutesToMaster` — для создания inode — используется master.

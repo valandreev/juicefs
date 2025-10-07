@@ -1,7 +1,10 @@
 package meta
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"syscall"
 	"testing"
 
 	"github.com/redis/go-redis/v9"
@@ -178,6 +181,24 @@ func TestNewRedisSplitMeta_InvalidURI(t *testing.T) {
 	}
 }
 
+func TestTxnUsesMaster(t *testing.T) {
+	conf := &Config{}
+	split, master, replica := newTrackingRedisSplit(t, conf)
+	ctx := Background().WithValue(txMethodKey{}, "txn")
+	if err := split.txn(ctx, func(tx *redis.Tx) error { return nil }, "k1"); err != nil {
+		t.Fatalf("txn returned error: %v", err)
+	}
+	if master.watchCalls != 1 {
+		t.Fatalf("expected master Watch calls = 1, got %d", master.watchCalls)
+	}
+	if len(master.lastKeys) != 1 || master.lastKeys[0] != "k1" {
+		t.Fatalf("unexpected master keys: %v", master.lastKeys)
+	}
+	if replica.watchCalls != 0 {
+		t.Fatalf("replica should not receive Watch calls, got %d", replica.watchCalls)
+	}
+}
+
 func TestChooseClient_ReadOpsToReplica(t *testing.T) {
 	split, _, replica := newTestRedisSplit(t, &Config{})
 	ctx := Background()
@@ -217,6 +238,62 @@ func TestChooseClient_LockOpsToMaster(t *testing.T) {
 		if reason != routeReasonLock {
 			t.Fatalf("op %s: expected reason %q, got %q", op, routeReasonLock, reason)
 		}
+	}
+}
+
+func TestDoGetAttr_RoutesToReplica(t *testing.T) {
+	ctx := Background()
+	replica := &fakeRedisClient{}
+	master := &fakeRedisClient{}
+	split := newWrappedRedisSplit(t, master, replica)
+	expected := &Attr{
+		Typ:    TypeFile,
+		Mode:   0644,
+		Length: 123,
+		Parent: 7,
+	}
+	replica.getFn = func(ctx context.Context, key string) *redis.StringCmd {
+		cmd := redis.NewStringCmd(ctx)
+		cmd.SetVal(string(split.marshal(expected)))
+		return cmd
+	}
+
+	attr := &Attr{}
+	if st := split.doGetAttr(ctx, 1, attr); st != 0 {
+		t.Fatalf("unexpected status: %d", st)
+	}
+	if replica.getCalls != 1 || master.getCalls != 0 {
+		t.Fatalf("expected replica getCalls=1, master=0; got %d and %d", replica.getCalls, master.getCalls)
+	}
+	if !attr.Full || attr.Mode != expected.Mode || attr.Typ != expected.Typ || attr.Length != expected.Length || attr.Parent != expected.Parent {
+		t.Fatalf("unexpected attr: %+v", attr)
+	}
+}
+
+func TestDoMknod_RoutesToMaster(t *testing.T) {
+	ctx := Background()
+	master := &fakeRedisClient{}
+	replica := &fakeRedisClient{}
+	replica.watchFn = func(context.Context, func(*redis.Tx) error, ...string) error {
+		t.Fatalf("replica Watch should not be called")
+		return nil
+	}
+	split := newWrappedRedisSplit(t, master, replica)
+	master.watchFn = func(ctx context.Context, fn func(*redis.Tx) error, keys ...string) error {
+		return syscall.ENOTDIR
+	}
+
+	var ino Ino
+	attr := &Attr{}
+	st := split.doMknod(ctx, 1, "child", TypeFile, 0644, 0, "", &ino, attr)
+	if st != syscall.ENOTDIR {
+		t.Fatalf("expected status ENOTDIR, got %v", st)
+	}
+	if master.watchCalls != 1 {
+		t.Fatalf("expected master watchCalls=1, got %d", master.watchCalls)
+	}
+	if replica.watchCalls != 0 {
+		t.Fatalf("expected replica watchCalls=0, got %d", replica.watchCalls)
 	}
 }
 
@@ -265,4 +342,102 @@ func newTestRedisSplit(t *testing.T, conf *Config) (*redisSplitMeta, redis.Unive
 		t.Fatalf("expected *redisSplitMeta, got %T", meta)
 	}
 	return split, fakeMaster, fakeReplica
+}
+
+type trackingClient struct {
+	redis.UniversalClient
+	watchCalls int
+	lastKeys   []string
+}
+
+func (c *trackingClient) Watch(ctx context.Context, fn func(*redis.Tx) error, keys ...string) error {
+	c.watchCalls++
+	c.lastKeys = append([]string(nil), keys...)
+	if fn != nil {
+		return fn(&redis.Tx{})
+	}
+	return nil
+}
+
+func (c *trackingClient) Close() error { return nil }
+
+func newTrackingRedisSplit(t *testing.T, conf *Config) (*redisSplitMeta, *trackingClient, *trackingClient) {
+	if conf == nil {
+		conf = &Config{}
+	}
+	master := &trackingClient{}
+	replica := &trackingClient{}
+	stubRedisSplitFactories(t, func(driver, addr string, conf *Config) (Meta, error) {
+		rm := &redisMeta{
+			baseMeta: newBaseMeta(addr, conf),
+			rdb:      master,
+		}
+		rm.en = rm
+		return rm, nil
+	}, func(uri string, conf *Config) (redis.UniversalClient, error) {
+		return replica, nil
+	})
+	meta, err := newRedisSplitMeta("redis-split", "redis://10.0.0.1:6379/0?replica=redis://10.0.0.2:6380/0", conf)
+	if err != nil {
+		t.Fatalf("unexpected error creating redis-split meta: %v", err)
+	}
+	split, ok := meta.(*redisSplitMeta)
+	if !ok {
+		t.Fatalf("expected *redisSplitMeta, got %T", meta)
+	}
+	return split, master, replica
+}
+
+type fakeRedisClient struct {
+	redis.UniversalClient
+	getFn         func(context.Context, string) *redis.StringCmd
+	getCalls      int
+	watchFn       func(context.Context, func(*redis.Tx) error, ...string) error
+	watchCalls    int
+	lastWatchKeys []string
+}
+
+func (c *fakeRedisClient) Get(ctx context.Context, key string) *redis.StringCmd {
+	c.getCalls++
+	if c.getFn != nil {
+		return c.getFn(ctx, key)
+	}
+	cmd := redis.NewStringCmd(ctx)
+	cmd.SetErr(errors.New("not implemented"))
+	return cmd
+}
+
+func (c *fakeRedisClient) Watch(ctx context.Context, fn func(*redis.Tx) error, keys ...string) error {
+	c.watchCalls++
+	c.lastWatchKeys = append([]string(nil), keys...)
+	if c.watchFn != nil {
+		return c.watchFn(ctx, fn, keys...)
+	}
+	return errors.New("watch not implemented")
+}
+
+func (c *fakeRedisClient) Close() error { return nil }
+
+func newWrappedRedisSplit(t *testing.T, master redis.UniversalClient, replica redis.UniversalClient) *redisSplitMeta {
+	stubRedisSplitFactories(t, func(driver, addr string, conf *Config) (Meta, error) {
+		rm := &redisMeta{
+			baseMeta: newBaseMeta(addr, conf),
+			rdb:      master,
+		}
+		rm.en = rm
+		return rm, nil
+	}, func(uri string, conf *Config) (redis.UniversalClient, error) {
+		return replica, nil
+	})
+	meta, err := newRedisSplitMeta("redis-split", "redis://10.0.0.1:6379/0?replica=redis://10.0.0.2:6380/0", &Config{})
+	if err != nil {
+		t.Fatalf("unexpected error creating redis-split meta: %v", err)
+	}
+	split, ok := meta.(*redisSplitMeta)
+	if !ok {
+		t.Fatalf("expected *redisSplitMeta, got %T", meta)
+	}
+	split.master = master
+	split.replica = replica
+	return split
 }

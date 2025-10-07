@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"unicode"
 
 	"github.com/redis/go-redis/v9"
@@ -205,6 +206,17 @@ func (m *redisSplitMeta) chooseClientForOp(op string, ctx Context) (redis.Univer
 	return m.master, routeReasonDefault
 }
 
+func (m *redisSplitMeta) clientForOp(op string, ctx Context) redis.UniversalClient {
+	client, _ := m.chooseClientForOp(op, ctx)
+	if client != nil {
+		return client
+	}
+	if m.master != nil {
+		return m.master
+	}
+	return nil
+}
+
 func normalizeOpName(op string) string {
 	op = strings.TrimSpace(op)
 	if idx := strings.Index(op, ":"); idx >= 0 {
@@ -217,4 +229,16 @@ func normalizeOpName(op string) string {
 
 func (m *redisSplitMeta) Name() string {
 	return "redis-split"
+}
+
+func (m *redisSplitMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+	client := m.clientForOp("doGetAttr", ctx)
+	if client == nil {
+		return syscall.EIO
+	}
+	data, err := client.Get(ctx, m.inodeKey(inode)).Bytes()
+	if err == nil {
+		m.parseAttr(data, attr)
+	}
+	return errno(err)
 }
