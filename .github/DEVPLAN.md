@@ -21,7 +21,7 @@
 
 Пошаговый TDD-план (маленькие итерации):
 
-1) Подготовка: парсинг URL
+1) Подготовка: парсинг URL *(✅ выполнено  – `TestParseRedisSplitURL`, `parseRedisSplitURL`)*
    - Тесты:
      - `TestParseRedisSplitURL` в `pkg/meta/redis_split_test.go`.
        - Ввод: `redis-split://redis://10.0.0.1:6379/1?replica=redis://10.0.0.2:16379/1`
@@ -30,13 +30,13 @@
    - Реализация: добавить функцию `parseRedisSplitURL(uri string) (master string, replica string, err error)` и простые unit-тесты.
    - Acceptance: тесты проходят.
 
-2) Скелет движка: регистрация и конструктор
+2) Скелет движка: регистрация и конструктор *(✅ выполнено – `TestRegisterRedisSplit`, `newRedisSplitMeta`, `redisSplitMeta`)*
    - Тесты:
      - `TestRegisterRedisSplit` (в `pkg/meta/redis_split_test.go`): вызов `newRedisSplitMeta("redis-split", <uri>, conf)` возвращает Meta без паники/с ошибкой при недопустимом URI.
    - Реализация: в `pkg/meta/redis_split.go` добавить `newRedisSplitMeta(driver, addr string, conf *Config) (Meta, error)` минимального возврата `&redisSplitMeta{}` и `Register("redis-split", newRedisSplitMeta)` в `init()`.
    - Acceptance: тест проходит (можно возвращать заглушку, пока не подключены real clients).
 
-3) Подключение клиентов (мастер + реплика) — мокируемая обвязка
+3) Подключение клиентов (мастер + реплика) — мокируемая обвязка *(✅ выполнено – `TestNewRedisSplitClients`, `TestNewRedisSplitClients_InvalidReplica`, фабрики `redisSplitMasterFactory`/`redisSplitReplicaFactory`)*
    - Тесты:
      - `TestNewRedisSplitClients` — проверяет, что при корректном URI создаются два redis.UniversalClient или их обёртки.
      - `TestNewRedisSplitClients_InvalidURI` — некорректный URI возвращает ошибку.
