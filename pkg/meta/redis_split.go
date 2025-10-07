@@ -1,12 +1,16 @@
 package meta
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unicode"
 
 	"github.com/redis/go-redis/v9"
@@ -18,10 +22,14 @@ func init() {
 
 type redisSplitMeta struct {
 	*redisMeta
-	masterURI  string
-	replicaURI string
-	master     redis.UniversalClient
-	replica    redis.UniversalClient
+	masterURI           string
+	replicaURI          string
+	master              redis.UniversalClient
+	replica             redis.UniversalClient
+	replicaHealthy      atomic.Bool
+	nextReplicaProbe    int64
+	replicaProbeMu      sync.Mutex
+	healthCheckInterval time.Duration
 }
 
 var _ Meta = (*redisSplitMeta)(nil)
@@ -151,11 +159,15 @@ func newRedisSplitMeta(driver, addr string, conf *Config) (Meta, error) {
 		return nil, err
 	}
 	split := &redisSplitMeta{
-		redisMeta:  rm,
-		masterURI:  masterURI,
-		replicaURI: replicaURI,
-		master:     rm.rdb,
-		replica:    replicaClient,
+		redisMeta:           rm,
+		masterURI:           masterURI,
+		replicaURI:          replicaURI,
+		master:              rm.rdb,
+		replica:             replicaClient,
+		healthCheckInterval: 5 * time.Second,
+	}
+	if replicaClient != nil {
+		split.replicaHealthy.Store(true)
 	}
 	split.en = split
 	return split, nil
@@ -188,15 +200,11 @@ func (m *redisSplitMeta) chooseClientForOp(op string, ctx Context) (redis.Univer
 	if normalized == "" {
 		normalized = "unknown"
 	}
-	if _, ok := lockOps[normalized]; ok {
-		return m.master, routeReasonLock
-	}
-	if _, ok := writeOps[normalized]; ok {
-		return m.master, routeReasonWrite
-	}
 	if _, ok := readOps[normalized]; ok {
 		if m.replica != nil {
-			return m.replica, routeReasonRead
+			if m.replicaHealthy.Load() || m.attemptProbeReplica() {
+				return m.replica, routeReasonRead
+			}
 		}
 		return m.master, routeReasonReplicaUnavailable
 	}
@@ -204,17 +212,6 @@ func (m *redisSplitMeta) chooseClientForOp(op string, ctx Context) (redis.Univer
 		return m.master, routeReasonReplicaUnavailable
 	}
 	return m.master, routeReasonDefault
-}
-
-func (m *redisSplitMeta) clientForOp(op string, ctx Context) redis.UniversalClient {
-	client, _ := m.chooseClientForOp(op, ctx)
-	if client != nil {
-		return client
-	}
-	if m.master != nil {
-		return m.master
-	}
-	return nil
 }
 
 func normalizeOpName(op string) string {
@@ -232,13 +229,88 @@ func (m *redisSplitMeta) Name() string {
 }
 
 func (m *redisSplitMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
-	client := m.clientForOp("doGetAttr", ctx)
+	client, usedReplica := m.clientForOp("doGetAttr", ctx)
 	if client == nil {
 		return syscall.EIO
 	}
 	data, err := client.Get(ctx, m.inodeKey(inode)).Bytes()
+	if usedReplica && m.shouldFallbackToMaster(err) {
+		m.markReplicaFailed(err)
+		client = m.master
+		data, err = client.Get(ctx, m.inodeKey(inode)).Bytes()
+		usedReplica = false
+	} else if usedReplica && err == nil {
+		m.onReplicaSuccess()
+	}
 	if err == nil {
 		m.parseAttr(data, attr)
 	}
 	return errno(err)
+}
+
+func (m *redisSplitMeta) clientForOp(op string, ctx Context) (redis.UniversalClient, bool) {
+	client, _ := m.chooseClientForOp(op, ctx)
+	return client, client != nil && client == m.replica
+}
+
+func (m *redisSplitMeta) shouldFallbackToMaster(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err != redis.Nil
+}
+
+func (m *redisSplitMeta) markReplicaFailed(err error) {
+	if m.replica == nil {
+		return
+	}
+	now := time.Now()
+	atomic.StoreInt64(&m.nextReplicaProbe, now.Add(m.healthCheckInterval).UnixNano())
+	if m.replicaHealthy.Swap(false) {
+		logger.Warnf("redis-split: replica %s unavailable: %v; routing reads to master", m.replicaURI, err)
+	}
+}
+
+func (m *redisSplitMeta) onReplicaSuccess() {
+	if m.replica == nil {
+		return
+	}
+	if !m.replicaHealthy.Load() {
+		m.replicaHealthy.Store(true)
+		atomic.StoreInt64(&m.nextReplicaProbe, time.Now().Add(m.healthCheckInterval).UnixNano())
+		logger.Infof("redis-split: replica %s recovered; routing reads back to replica", m.replicaURI)
+	}
+}
+
+func (m *redisSplitMeta) attemptProbeReplica() bool {
+	if m.replica == nil {
+		return false
+	}
+	if m.replicaHealthy.Load() {
+		return true
+	}
+	now := time.Now()
+	next := atomic.LoadInt64(&m.nextReplicaProbe)
+	if next != 0 && now.UnixNano() < next {
+		return false
+	}
+	m.replicaProbeMu.Lock()
+	defer m.replicaProbeMu.Unlock()
+	if m.replicaHealthy.Load() {
+		return true
+	}
+	next = atomic.LoadInt64(&m.nextReplicaProbe)
+	if next != 0 && now.UnixNano() < next {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := m.replica.Ping(ctx).Err(); err == nil {
+		m.replicaHealthy.Store(true)
+		atomic.StoreInt64(&m.nextReplicaProbe, now.Add(m.healthCheckInterval).UnixNano())
+		logger.Infof("redis-split: replica %s ping succeeded; resuming read routing", m.replicaURI)
+		return true
+	}
+	atomic.StoreInt64(&m.nextReplicaProbe, now.Add(m.healthCheckInterval).UnixNano())
+	return false
 }

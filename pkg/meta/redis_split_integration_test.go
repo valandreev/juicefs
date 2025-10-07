@@ -70,6 +70,9 @@ func TestRedisSplitIntegration_BasicRouting(t *testing.T) {
 	}
 	split.master = masterClient
 	split.replica = replicaClient
+	if replicaClient != nil {
+		split.replicaHealthy.Store(true)
+	}
 	defer func() {
 		_ = split.Reset()
 		_ = split.Shutdown()
@@ -175,24 +178,24 @@ func newCountingHook() *countingHook {
 	return &countingHook{counts: make(map[string]int)}
 }
 
-func (h *countingHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
-	h.add(cmd.Name())
-	return ctx, nil
+func (h *countingHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
 }
 
-func (h *countingHook) AfterProcess(ctx context.Context, cmd redis.Cmder) error {
-	return nil
-}
-
-func (h *countingHook) BeforeProcessPipeline(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
-	for _, cmd := range cmds {
+func (h *countingHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
 		h.add(cmd.Name())
+		return next(ctx, cmd)
 	}
-	return ctx, nil
 }
 
-func (h *countingHook) AfterProcessPipeline(ctx context.Context, cmds []redis.Cmder) error {
-	return nil
+func (h *countingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		for _, cmd := range cmds {
+			h.add(cmd.Name())
+		}
+		return next(ctx, cmds)
+	}
 }
 
 func (h *countingHook) add(name string) {

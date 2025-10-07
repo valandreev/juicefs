@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -297,6 +299,65 @@ func TestDoMknod_RoutesToMaster(t *testing.T) {
 	}
 }
 
+func TestReplicaUnavailable_FallbackToMaster(t *testing.T) {
+	ctx := Background()
+	master := &fakeRedisClient{}
+	replica := &fakeRedisClient{}
+	split := newWrappedRedisSplit(t, master, replica)
+	split.healthCheckInterval = time.Millisecond * 10
+
+	expected := &Attr{Typ: TypeDirectory, Mode: 0755, Parent: RootInode}
+	master.getFn = func(ctx context.Context, key string) *redis.StringCmd {
+		cmd := redis.NewStringCmd(ctx)
+		cmd.SetVal(string(split.marshal(expected)))
+		return cmd
+	}
+	replica.getFn = func(ctx context.Context, key string) *redis.StringCmd {
+		cmd := redis.NewStringCmd(ctx)
+		cmd.SetErr(errors.New("dial error"))
+		return cmd
+	}
+
+	attr := &Attr{}
+	if st := split.doGetAttr(ctx, RootInode, attr); st != 0 {
+		t.Fatalf("doGetAttr fallback unexpected status: %v", st)
+	}
+	if master.getCalls != 1 || replica.getCalls != 1 {
+		t.Fatalf("expected master=1 replica=1 calls, got master=%d replica=%d", master.getCalls, replica.getCalls)
+	}
+	if split.replicaHealthy.Load() {
+		t.Fatalf("replica should be marked unhealthy after failure")
+	}
+
+	replica.getFn = func(ctx context.Context, key string) *redis.StringCmd {
+		cmd := redis.NewStringCmd(ctx)
+		cmd.SetVal(string(split.marshal(expected)))
+		return cmd
+	}
+	replica.pingFn = func(ctx context.Context) *redis.StatusCmd {
+		cmd := redis.NewStatusCmd(ctx)
+		cmd.SetVal("PONG")
+		return cmd
+	}
+	atomic.StoreInt64(&split.nextReplicaProbe, time.Now().Add(-time.Millisecond).UnixNano())
+
+	master.getCalls = 0
+	replica.getCalls = 0
+
+	if st := split.doGetAttr(ctx, RootInode, attr); st != 0 {
+		t.Fatalf("doGetAttr after recovery unexpected status: %v", st)
+	}
+	if replica.getCalls == 0 {
+		t.Fatalf("expected replica to serve read after recovery")
+	}
+	if master.getCalls != 0 {
+		t.Fatalf("expected master not to be used after replica recovery, got %d", master.getCalls)
+	}
+	if !split.replicaHealthy.Load() {
+		t.Fatalf("replica should be healthy after successful ping")
+	}
+}
+
 func stubRedisSplitFactories(t *testing.T, master func(string, string, *Config) (Meta, error), replica func(string, *Config) (redis.UniversalClient, error)) {
 	oldMaster := redisSplitMasterFactory
 	oldReplica := redisSplitReplicaFactory
@@ -348,6 +409,7 @@ type trackingClient struct {
 	redis.UniversalClient
 	watchCalls int
 	lastKeys   []string
+	pingFn     func(context.Context) *redis.StatusCmd
 }
 
 func (c *trackingClient) Watch(ctx context.Context, fn func(*redis.Tx) error, keys ...string) error {
@@ -360,6 +422,15 @@ func (c *trackingClient) Watch(ctx context.Context, fn func(*redis.Tx) error, ke
 }
 
 func (c *trackingClient) Close() error { return nil }
+
+func (c *trackingClient) Ping(ctx context.Context) *redis.StatusCmd {
+	if c.pingFn != nil {
+		return c.pingFn(ctx)
+	}
+	cmd := redis.NewStatusCmd(ctx)
+	cmd.SetVal("PONG")
+	return cmd
+}
 
 func newTrackingRedisSplit(t *testing.T, conf *Config) (*redisSplitMeta, *trackingClient, *trackingClient) {
 	if conf == nil {
@@ -395,6 +466,8 @@ type fakeRedisClient struct {
 	watchFn       func(context.Context, func(*redis.Tx) error, ...string) error
 	watchCalls    int
 	lastWatchKeys []string
+	pingFn        func(context.Context) *redis.StatusCmd
+	pingCalls     int
 }
 
 func (c *fakeRedisClient) Get(ctx context.Context, key string) *redis.StringCmd {
@@ -418,6 +491,16 @@ func (c *fakeRedisClient) Watch(ctx context.Context, fn func(*redis.Tx) error, k
 
 func (c *fakeRedisClient) Close() error { return nil }
 
+func (c *fakeRedisClient) Ping(ctx context.Context) *redis.StatusCmd {
+	c.pingCalls++
+	if c.pingFn != nil {
+		return c.pingFn(ctx)
+	}
+	cmd := redis.NewStatusCmd(ctx)
+	cmd.SetErr(errors.New("ping not implemented"))
+	return cmd
+}
+
 func newWrappedRedisSplit(t *testing.T, master redis.UniversalClient, replica redis.UniversalClient) *redisSplitMeta {
 	stubRedisSplitFactories(t, func(driver, addr string, conf *Config) (Meta, error) {
 		rm := &redisMeta{
@@ -439,5 +522,8 @@ func newWrappedRedisSplit(t *testing.T, master redis.UniversalClient, replica re
 	}
 	split.master = master
 	split.replica = replica
+	if replica != nil {
+		split.replicaHealthy.Store(true)
+	}
 	return split
 }

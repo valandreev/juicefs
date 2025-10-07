@@ -73,10 +73,14 @@
        При необходимости установите `JFS_REDIS_SPLIT_MASTER` и `JFS_REDIS_SPLIT_REPLICA` перед запуском.
     - Acceptance: успешное завершение теста подтверждает базовый сценарий FR1–FR4 с реальным master / replica.
 
-8) Фейлы и откат: тесты перехода на мастер при недоступной реплике
-   - Тест: `TestReplicaUnavailable_FallbackToMaster` (интеграционный / e2e).
-     - Отключить replica (или заставить ее отвергать запросы) и убедиться, что чтение происходит с master и записывается предупреждение в лог.
-   - Реализация: в `redis_split` implement periodic health check и логика fallback; покрыть тестом.
+8) Фейлы и откат: тесты перехода на мастер при недоступной реплике *(✅ выполнено – `TestReplicaUnavailable_FallbackToMaster`, фоновый health-check реплики)*
+    - Реализация: `redis_split.go` отслеживает состояние реплики, логирует первый сбой и переводит чтения на master до восстановления. Реализована периодическая попытка `PING` (по умолчанию каждые 5s) для автоматического возврата на replica.
+    - Юнит-тест `TestReplicaUnavailable_FallbackToMaster` (в `pkg/meta/redis_split_test.go`) эмулирует ошибку `GET` на реплике, проверяет fallback на master и последующее восстановление после успешного `PING`.
+    - Для ручного прогона (при необходимости настройки интервала):
+       ```pwsh
+       go test ./pkg/meta -run TestReplicaUnavailable_FallbackToMaster -v
+       ```
+       *(на Windows сборка пакета `pkg/meta` по-прежнему требует POSIX-констант из `syscall`; запускайте на Linux/macOS либо используйте флаги для исключения соответствующих тестов).* 
 
 9) Документация и конфигурация
    - Добавить `docs`/README-заметки: `docs/en/redis-split.md` или краткая секция в `docs`/`README.md`.
