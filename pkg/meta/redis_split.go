@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"unicode"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -47,6 +48,42 @@ var redisSplitReplicaFactory = func(uri string, conf *Config) (redis.UniversalCl
 	}
 	return redis.NewClient(opt), nil
 }
+
+const (
+	routeReasonRead               = "read-op"
+	routeReasonWrite              = "write-op"
+	routeReasonLock               = "lock-op"
+	routeReasonDefault            = "default-master"
+	routeReasonReplicaUnavailable = "replica-unavailable"
+)
+
+var (
+	readOps = map[string]struct{}{
+		"dogetattr":  {},
+		"doreaddir":  {},
+		"doreadlink": {},
+		"dostatfs":   {},
+		"doolookup":  {},
+	}
+	writeOps = map[string]struct{}{
+		"domknod":     {},
+		"dounlink":    {},
+		"dorename":    {},
+		"dormdir":     {},
+		"dosetattr":   {},
+		"dosetxattr":  {},
+		"dosymlink":   {},
+		"dolink":      {},
+		"dotruncate":  {},
+		"dofallocate": {},
+		"txn":         {},
+	}
+	lockOps = map[string]struct{}{
+		"flock": {},
+		"setlk": {},
+		"getlk": {},
+	}
+)
 
 func parseRedisSplitURL(raw string) (string, string, error) {
 	const scheme = "redis-split://"
@@ -134,6 +171,48 @@ func splitRedisURI(uri string) (string, string, error) {
 		return "", "", fmt.Errorf("empty redis addr: %s", uri)
 	}
 	return driver, addr, nil
+}
+
+func (m *redisSplitMeta) chooseClientForOp(op string, ctx Context) (redis.UniversalClient, string) {
+	rawOp := op
+	if ctx != nil {
+		if method, ok := ctx.Value(txMethodKey{}).(string); ok && method != "" {
+			rawOp = method
+		}
+	}
+	normalized := normalizeOpName(rawOp)
+	if normalized == "" {
+		normalized = normalizeOpName(op)
+	}
+	if normalized == "" {
+		normalized = "unknown"
+	}
+	if _, ok := lockOps[normalized]; ok {
+		return m.master, routeReasonLock
+	}
+	if _, ok := writeOps[normalized]; ok {
+		return m.master, routeReasonWrite
+	}
+	if _, ok := readOps[normalized]; ok {
+		if m.replica != nil {
+			return m.replica, routeReasonRead
+		}
+		return m.master, routeReasonReplicaUnavailable
+	}
+	if m.replica == nil {
+		return m.master, routeReasonReplicaUnavailable
+	}
+	return m.master, routeReasonDefault
+}
+
+func normalizeOpName(op string) string {
+	op = strings.TrimSpace(op)
+	if idx := strings.Index(op, ":"); idx >= 0 {
+		op = op[:idx]
+	}
+	op = strings.TrimRightFunc(op, func(r rune) bool { return unicode.IsDigit(r) })
+	op = strings.TrimSpace(op)
+	return strings.ToLower(op)
 }
 
 func (m *redisSplitMeta) Name() string {

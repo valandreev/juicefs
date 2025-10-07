@@ -178,6 +178,48 @@ func TestNewRedisSplitMeta_InvalidURI(t *testing.T) {
 	}
 }
 
+func TestChooseClient_ReadOpsToReplica(t *testing.T) {
+	split, _, replica := newTestRedisSplit(t, &Config{})
+	ctx := Background()
+	for _, op := range []string{"doGetAttr", "doReaddir", "doReadlink"} {
+		client, reason := split.chooseClientForOp(op, ctx)
+		if client != replica {
+			t.Fatalf("op %s: expected replica client", op)
+		}
+		if reason != routeReasonRead {
+			t.Fatalf("op %s: expected reason %q, got %q", op, routeReasonRead, reason)
+		}
+	}
+}
+
+func TestChooseClient_WriteOpsToMaster(t *testing.T) {
+	split, master, _ := newTestRedisSplit(t, &Config{})
+	ctx := Background()
+	for _, op := range []string{"doMknod", "doUnlink"} {
+		client, reason := split.chooseClientForOp(op, ctx)
+		if client != master {
+			t.Fatalf("op %s: expected master client", op)
+		}
+		if reason != routeReasonWrite {
+			t.Fatalf("op %s: expected reason %q, got %q", op, routeReasonWrite, reason)
+		}
+	}
+}
+
+func TestChooseClient_LockOpsToMaster(t *testing.T) {
+	split, master, _ := newTestRedisSplit(t, &Config{})
+	ctx := Background()
+	for _, op := range []string{"Setlk", "Flock"} {
+		client, reason := split.chooseClientForOp(op, ctx)
+		if client != master {
+			t.Fatalf("op %s: expected master client", op)
+		}
+		if reason != routeReasonLock {
+			t.Fatalf("op %s: expected reason %q, got %q", op, routeReasonLock, reason)
+		}
+	}
+}
+
 func stubRedisSplitFactories(t *testing.T, master func(string, string, *Config) (Meta, error), replica func(string, *Config) (redis.UniversalClient, error)) {
 	oldMaster := redisSplitMasterFactory
 	oldReplica := redisSplitReplicaFactory
@@ -191,4 +233,36 @@ func stubRedisSplitFactories(t *testing.T, master func(string, string, *Config) 
 		redisSplitMasterFactory = oldMaster
 		redisSplitReplicaFactory = oldReplica
 	})
+}
+
+func newTestRedisSplit(t *testing.T, conf *Config) (*redisSplitMeta, redis.UniversalClient, redis.UniversalClient) {
+	if conf == nil {
+		conf = &Config{}
+	}
+	conf.Retries = 1
+	fakeMaster := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6400"})
+	fakeReplica := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6401"})
+	stubRedisSplitFactories(t, func(driver, addr string, conf *Config) (Meta, error) {
+		rm := &redisMeta{
+			baseMeta: newBaseMeta(addr, conf),
+			rdb:      fakeMaster,
+		}
+		rm.en = rm
+		return rm, nil
+	}, func(uri string, conf *Config) (redis.UniversalClient, error) {
+		return fakeReplica, nil
+	})
+	t.Cleanup(func() {
+		_ = fakeMaster.Close()
+		_ = fakeReplica.Close()
+	})
+	meta, err := newRedisSplitMeta("redis-split", "redis://10.0.0.1:6379/0?replica=redis://10.0.0.2:6380/0", conf)
+	if err != nil {
+		t.Fatalf("unexpected error creating redis-split meta: %v", err)
+	}
+	split, ok := meta.(*redisSplitMeta)
+	if !ok {
+		t.Fatalf("expected *redisSplitMeta, got %T", meta)
+	}
+	return split, fakeMaster, fakeReplica
 }

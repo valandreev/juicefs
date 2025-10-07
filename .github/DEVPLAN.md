@@ -43,7 +43,7 @@
    - Реализация: использовать `redis.ParseURL` и `redis.NewClient` или `redis.NewFailoverClient` в конструкторе; сохранить в структуре поля `master redis.UniversalClient`, `replica redis.UniversalClient`.
    - Замечание: для тестов юнитов можно инжектировать интерфейс `type redisClient interface{ Do(...) }` и реализовать фейковый клиент.
 
-4) Выделить и протестировать логику маршрутизации команд
+4) Выделить и протестировать логику маршрутизации команд *(✅ выполнено – `chooseClientForOp`, `TestChooseClient_ReadOpsToReplica`, `TestChooseClient_WriteOpsToMaster`, `TestChooseClient_LockOpsToMaster`)*
    - Цель: разделить логику на читаемую функцию `chooseClientForOp(op string, ctx Context) (redis.UniversalClient, routeReason string)`.
    - Тесты (юниты):
      - `TestChooseClient_ReadOpsToReplica` — операции `doGetAttr`, `doReaddir`, `doReadlink` -> replica.
