@@ -39,18 +39,20 @@ Assumptions / open questions
 
 - ✅ **Shared redis-like harness.** Added `pkg/meta/redis_like_test.go` providing `forEachRedisLike` and swapped `TestRedisClient` plus `TestLoadDump` to consume it (skipping unsupported schemes for now). Lock tests now use portable `F_*` constants so they compile on Windows.
 - ✅ **Load/dump coverage.** `TestLoadDump` iterates over redis-like URIs, guaranteeing Rueidis will be exercised as soon as the driver registers.
-- ⏳ **Rueidis registration test.** Next step is to land a tiny `pkg/meta/rueidis_test.go` asserting `metaDrivers` exposes `rueidis` / `ruediss`—this will fail until Phase 1 wires the driver.
-- ⏳ **Driver smoke runs.** Once registration exists, expand the harness list (via `JFS_TEST_REDIS_URIS`) to include rueidis endpoints, keeping skips when backends are unavailable.
+- ✅ **Rueidis registration test.** `pkg/meta/rueidis_test.go` now asserts that both `rueidis` and `ruediss` appear in `metaDrivers`; this is the sentinel that keeps Phase 1 honest.
+- ⏳ **Driver smoke runs.** Pending: once a Rueidis-backed client is functional, extend `JFS_TEST_REDIS_URIS` defaults to add rueidis endpoints while gracefully skipping when the backend is offline.
 
 ### Phase 1 – Driver skeleton & connection plumbing
 
 1. **Implementation (minimal):**
-   - Copy `pkg/meta/redis.go` to `pkg/meta/rueidis.go`, adjust build tags (e.g., `//go:build !norueidis`) and rename types (`redisMeta` → `rueidisMeta`).
-   - Replace `redis.UniversalClient` usages with a thin interface satisfied by `rueidiscompat.Adapter` (`type redisCmdable interface {...}`) so the bulk of logic compiles.
-   - Register new drivers in `init(): Register("rueidis", newRueidisMeta)` and `Register("ruediss", newRueidisMeta)`.
-   - Minimal `newRueidisMeta` reuses query parsing logic but builds `rueidis.ClientOption` from URI. For TLS, use `MustParseURL` and set `TLSConfig.
-   - Keep auto-pipelining defaults (do not set `DisableAutoPipelining`). Configure connection pool similar to go-redis (matching `PoolSize`, etc.).
-2. **Tests:** rerun updated tests; they should now fail deeper because many methods still expect go-redis return types. Fix compilation/test failures iteratively while keeping tests red.
+   - ✅ `pkg/meta/rueidis.go` now defines a dedicated `rueidisMeta` wrapper that registers the Rueidis schemes, instantiates a Rueidis client via `rueidis.ParseURL` / `rueidis.NewClient`, and resets the embedded engine pointer so background jobs route through the new type.
+   - 🔜 Swap the temporary delegation to go-redis for Rueidis-backed command execution by introducing a compatibility layer (likely via helper interfaces mirroring the subset of go-redis we consume).
+   - ✅ A `rueidiscompat.NewAdapter` instance now hangs off `rueidisMeta`, wiring the first production calls (`doLoad`, `doDeleteSlice`, `getCounter`, `incrCounter`) through Rueidis while keeping unported paths on the embedded go-redis engine.
+   - Preserve uniform build tags (e.g., `//go:build !norueidis`) and align configuration parsing with the Redis driver so CLI/config UX stays identical. Extend parsing to honor Rueidis-specific knobs (auto-pipelining, cache sizing) once we expose them.
+   - For TLS, wire `ruediss` URIs to load a `tls.Config` via existing helpers.
+2. **Tests:**
+   - Keep `TestRueidisDriverRegistered` green after delegation (already passing) and add a smoke test that exercises `meta.NewClient("rueidis://...")` once we can spin against a running Redis instance.
+   - Add focused compile/run smoke tests for the Rueidis path as soon as the native client replaces the Redis delegate, expecting failures until command coverage is complete.
 
 ### Phase 2 – Command execution compatibility
 
@@ -119,6 +121,6 @@ Assumptions / open questions
 
 ## Next actions
 
-1. Land `pkg/meta/rueidis_test.go` asserting driver registration so Phase 0 ends with a deliberate red test.
-2. Extend `JFS_TEST_REDIS_URIS` defaults to list prospective Rueidis URIs once the driver skeleton exists, keeping skips for unavailable targets.
-3. Move into Phase 1 by scaffolding `pkg/meta/rueidis.go` and registering `rueidis` / `ruediss`, aiming to flip the new test green.
+1. Commit the initial Rueidis driver registration that delegates to the Redis engine, ensuring tests compile and the sentinel stays green.
+2. Begin carving out a dedicated `rueidisMeta` implementation that uses `rueidiscompat` for command coverage; swap the delegate once the skeleton compiles.
+3. Expand the redis-like harness defaults to include Rueidis endpoints (with skip guards) after the native Rueidis client can reach a test server.
