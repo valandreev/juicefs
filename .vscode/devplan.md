@@ -37,10 +37,10 @@ Assumptions / open questions
 
 ### Phase 0 – Test scaffolding bootstrap
 
-1. **Tests:**
-   - Extend `pkg/meta/load_dump_test.go` and other existing Redis-backed tests to accept a `metaDriver` parameter. Duplicate current Redis cases for `rueidis://` and `ruediss://` URIs (behind `t.Run("rueidis", ...)`). Expect initial failures because driver not registered yet.
-   - Add a lightweight unit test in a new `pkg/meta/rueidis_test.go` verifying `meta.NewClient("rueidis://...")` returns a `Meta` instance whose `Name()` is `"rueidis"`.
-2. **Support code:** introduce shared helper (e.g., `testRedisLike(t, scheme string)`) to reduce duplication between redis and rueidis test cases. Keep tests skipped when Redis not available (use existing `testTarget` detection).
+- ✅ **Shared redis-like harness.** Added `pkg/meta/redis_like_test.go` providing `forEachRedisLike` and swapped `TestRedisClient` plus `TestLoadDump` to consume it (skipping unsupported schemes for now). Lock tests now use portable `F_*` constants so they compile on Windows.
+- ✅ **Load/dump coverage.** `TestLoadDump` iterates over redis-like URIs, guaranteeing Rueidis will be exercised as soon as the driver registers.
+- ⏳ **Rueidis registration test.** Next step is to land a tiny `pkg/meta/rueidis_test.go` asserting `metaDrivers` exposes `rueidis` / `ruediss`—this will fail until Phase 1 wires the driver.
+- ⏳ **Driver smoke runs.** Once registration exists, expand the harness list (via `JFS_TEST_REDIS_URIS`) to include rueidis endpoints, keeping skips when backends are unavailable.
 
 ### Phase 1 – Driver skeleton & connection plumbing
 
@@ -119,6 +119,6 @@ Assumptions / open questions
 
 ## Next actions
 
-1. Confirm Redis version in CI supports tracking (otherwise, adjust caching plan).
-2. Introduce shared test harness for Redis-like backends (Phase 0).
-3. Execute TDD phases sequentially, ensuring green status before proceeding to next phase.
+1. Land `pkg/meta/rueidis_test.go` asserting driver registration so Phase 0 ends with a deliberate red test.
+2. Extend `JFS_TEST_REDIS_URIS` defaults to list prospective Rueidis URIs once the driver skeleton exists, keeping skips for unavailable targets.
+3. Move into Phase 1 by scaffolding `pkg/meta/rueidis.go` and registering `rueidis` / `ruediss`, aiming to flip the new test green.

@@ -40,3 +40,9 @@ pkg/meta/testdata
 /juicefsd.exe~
 /juicefs.lite
 dist/
+.vscode/devplan.md
+pkg/meta/jfs-load-dump/000001.vlog
+pkg/meta/jfs-load-dump/00002.mem
+pkg/meta/jfs-load-dump/DISCARD
+pkg/meta/jfs-load-dump/KEYREGISTRY
+pkg/meta/jfs-load-dump/MANIFEST
