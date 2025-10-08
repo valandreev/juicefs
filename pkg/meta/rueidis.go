@@ -4,7 +4,9 @@
 package meta
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -13,7 +15,7 @@ import (
 
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
-	errors "github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"github.com/redis/rueidis"
 	"github.com/redis/rueidis/rueidiscompat"
 )
@@ -163,18 +165,18 @@ func (m *rueidisMeta) doInit(format *Format, force bool) error {
 		}
 		if !old.DirStats && format.DirStats {
 			if err := m.compat.Del(ctx, m.dirUsedInodesKey(), m.dirUsedSpaceKey()).Err(); err != nil {
-				return errors.Wrap(err, "remove dir stats")
+				return pkgerrors.Wrap(err, "remove dir stats")
 			}
 		}
 		if !old.UserGroupQuota && format.UserGroupQuota {
 			if err := m.compat.Del(ctx,
 				m.userQuotaKey(), m.userQuotaUsedSpaceKey(), m.userQuotaUsedInodesKey(),
 				m.groupQuotaKey(), m.groupQuotaUsedSpaceKey(), m.groupQuotaUsedInodesKey()).Err(); err != nil {
-				return errors.Wrap(err, "remove user group quota")
+				return pkgerrors.Wrap(err, "remove user group quota")
 			}
 		}
 		if err = format.update(&old, force); err != nil {
-			return errors.Wrap(err, "update format")
+			return pkgerrors.Wrap(err, "update format")
 		}
 	}
 
@@ -420,6 +422,468 @@ func (m *rueidisMeta) cleanupLegacies() {
 			return
 		}
 	}
+}
+
+func (m *rueidisMeta) doFindDeletedFiles(ts int64, limit int) (map[Ino]uint64, error) {
+	if m.compat == nil {
+		return m.redisMeta.doFindDeletedFiles(ts, limit)
+	}
+
+	rng := rueidiscompat.ZRangeBy{
+		Min:   "-inf",
+		Max:   strconv.FormatInt(ts, 10),
+		Count: int64(limit),
+	}
+	vals, err := m.compat.ZRangeByScore(Background(), m.delfiles(), rng).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	files := make(map[Ino]uint64, len(vals))
+	for _, v := range vals {
+		ps := strings.Split(v, ":")
+		if len(ps) != 2 { // will be cleaned up as legacy
+			continue
+		}
+		inode, _ := strconv.ParseUint(ps[0], 10, 64)
+		length, _ := strconv.ParseUint(ps[1], 10, 64)
+		files[Ino(inode)] = length
+	}
+	return files, nil
+}
+
+func (m *rueidisMeta) doCleanupSlices(ctx Context) {
+	if m.compat == nil {
+		m.redisMeta.doCleanupSlices(ctx)
+		return
+	}
+
+	var (
+		cursor uint64
+		key    = m.sliceRefs()
+	)
+
+	for {
+		kvs, next, err := m.compat.HScan(ctx, key, cursor, "*", 10000).Result()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			logger.Warnf("HSCAN %s: %v", key, err)
+			return
+		}
+		for i := 0; i < len(kvs); i += 2 {
+			if ctx.Canceled() {
+				return
+			}
+			field, val := kvs[i], kvs[i+1]
+			if strings.HasPrefix(val, "-") {
+				parts := strings.Split(field, "_")
+				if len(parts) == 2 {
+					id, _ := strconv.ParseUint(parts[0][1:], 10, 64)
+					size, _ := strconv.ParseUint(parts[1], 10, 32)
+					if id > 0 && size > 0 {
+						m.deleteSlice(id, uint32(size))
+					}
+				}
+			} else if val == "0" {
+				m.cleanupZeroRef(field)
+			}
+		}
+		if next == 0 {
+			return
+		}
+		cursor = next
+	}
+}
+
+func (m *rueidisMeta) cleanupZeroRef(key string) {
+	if m.compat == nil {
+		m.redisMeta.cleanupZeroRef(key)
+		return
+	}
+
+	ctx := Background()
+	if err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		cmd := tx.HGet(ctx, m.sliceRefs(), key)
+		val, err := cmd.Int64()
+		if err != nil && err != rueidiscompat.Nil {
+			return err
+		}
+		if err == rueidiscompat.Nil {
+			val = 0
+		}
+		if val != 0 {
+			return syscall.EINVAL
+		}
+		_, err = tx.TxPipelined(ctx, func(p rueidiscompat.Pipeliner) error {
+			p.HDel(ctx, m.sliceRefs(), key)
+			return nil
+		})
+		return err
+	}, m.sliceRefs()); err != nil && !errors.Is(err, syscall.EINVAL) {
+		logger.Warnf("cleanupZeroRef %s: %v", key, err)
+	}
+}
+
+func (m *rueidisMeta) cleanupLeakedChunks(delete bool) {
+	if m.compat == nil {
+		m.redisMeta.cleanupLeakedChunks(delete)
+		return
+	}
+
+	ctx := Background()
+	prefix := len(m.prefix)
+	pattern := m.prefix + "c*"
+	var cursor uint64
+
+	for {
+		keys, next, err := m.compat.Scan(ctx, cursor, pattern, 10000).Result()
+		if err != nil {
+			logger.Warnf("scan %s: %v", pattern, err)
+			return
+		}
+		if len(keys) > 0 {
+			var (
+				chunkKeys []string
+				rs        []*rueidiscompat.IntCmd
+			)
+			pipe := m.compat.Pipeline()
+			for _, k := range keys {
+				parts := strings.Split(k, "_")
+				if len(parts) != 2 {
+					continue
+				}
+				if len(parts[0]) <= prefix {
+					continue
+				}
+				ino, _ := strconv.ParseUint(parts[0][prefix+1:], 10, 64)
+				chunkKeys = append(chunkKeys, k)
+				rs = append(rs, pipe.Exists(ctx, m.inodeKey(Ino(ino))))
+			}
+			if len(rs) > 0 {
+				cmds, err := pipe.Exec(ctx)
+				if err != nil {
+					for _, c := range cmds {
+						if execErr := c.Err(); execErr != nil {
+							logger.Errorf("check inode existence pipeline: %v", execErr)
+						}
+					}
+					continue
+				}
+				for i, rr := range rs {
+					if rr.Val() == 0 {
+						key := chunkKeys[i]
+						logger.Infof("found leaked chunk %s", key)
+						if delete {
+							parts := strings.Split(key, "_")
+							if len(parts) != 2 || len(parts[0]) <= prefix {
+								continue
+							}
+							ino, _ := strconv.ParseUint(parts[0][prefix+1:], 10, 64)
+							indx, _ := strconv.Atoi(parts[1])
+							_ = m.deleteChunk(Ino(ino), uint32(indx))
+						}
+					}
+				}
+			}
+		}
+		if next == 0 {
+			return
+		}
+		cursor = next
+	}
+}
+
+func (m *rueidisMeta) cleanupOldSliceRefs(delete bool) {
+	if m.compat == nil {
+		m.redisMeta.cleanupOldSliceRefs(delete)
+		return
+	}
+
+	ctx := Background()
+	pattern := m.prefix + "k*"
+	var cursor uint64
+
+	for {
+		keys, next, err := m.compat.Scan(ctx, cursor, pattern, 10000).Result()
+		if err != nil {
+			logger.Warnf("scan %s: %v", pattern, err)
+			return
+		}
+		if len(keys) > 0 {
+			vals, err := m.compat.MGet(ctx, keys...).Result()
+			if err != nil {
+				logger.Warnf("mget slices: %v", err)
+				continue
+			}
+			var todel []string
+			for i, raw := range vals {
+				if raw == nil {
+					continue
+				}
+				var val string
+				switch v := raw.(type) {
+				case string:
+					val = v
+				case []byte:
+					val = string(v)
+				default:
+					logger.Warnf("unexpected value type %T for key %s", raw, keys[i])
+					continue
+				}
+				if strings.HasPrefix(val, m.prefix+"-") || val == "0" {
+					todel = append(todel, keys[i])
+				} else {
+					vv, err := strconv.Atoi(val)
+					if err != nil {
+						logger.Warnf("invalid slice ref %s=%s", keys[i], val)
+						continue
+					}
+					if err := m.compat.HIncrBy(ctx, m.sliceRefs(), keys[i], int64(vv)).Err(); err != nil {
+						logger.Warnf("HIncrBy sliceRefs %s: %v", keys[i], err)
+						continue
+					}
+					if err := m.compat.DecrBy(ctx, keys[i], int64(vv)).Err(); err != nil {
+						logger.Warnf("DecrBy %s: %v", keys[i], err)
+					} else {
+						logger.Infof("move refs %d for slice %s", vv, keys[i])
+					}
+				}
+			}
+			if delete && len(todel) > 0 {
+				if err := m.compat.Del(ctx, todel...).Err(); err != nil {
+					logger.Warnf("Del old slice refs: %v", err)
+				}
+			}
+		}
+		if next == 0 {
+			return
+		}
+		cursor = next
+	}
+}
+
+func (m *rueidisMeta) cleanupLeakedInodes(delete bool) {
+	if m.compat == nil {
+		m.redisMeta.cleanupLeakedInodes(delete)
+		return
+	}
+
+	ctx := Background()
+	foundInodes := make(map[Ino]struct{})
+	foundInodes[RootInode] = struct{}{}
+	foundInodes[TrashInode] = struct{}{}
+	cutoff := time.Now().Add(-time.Hour)
+	prefix := len(m.prefix)
+
+	patternDirs := m.prefix + "d[0-9]*"
+	var cursor uint64
+	for {
+		keys, next, err := m.compat.Scan(ctx, cursor, patternDirs, 10000).Result()
+		if err != nil {
+			logger.Warnf("scan dirs %s: %v", patternDirs, err)
+			return
+		}
+		for _, key := range keys {
+			ino, err := strconv.Atoi(key[prefix+1:])
+			if err != nil {
+				continue
+			}
+			var entries []*Entry
+			if eno := m.doReaddir(ctx, Ino(ino), 0, &entries, 0); eno != syscall.ENOENT && eno != 0 {
+				logger.Errorf("readdir %d: %s", ino, eno)
+				return
+			}
+			for _, e := range entries {
+				foundInodes[e.Inode] = struct{}{}
+			}
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+
+	patternInodes := m.prefix + "i*"
+	cursor = 0
+	for {
+		keys, next, err := m.compat.Scan(ctx, cursor, patternInodes, 10000).Result()
+		if err != nil {
+			logger.Warnf("scan inodes %s: %v", patternInodes, err)
+			return
+		}
+		if len(keys) > 0 {
+			vals, err := m.compat.MGet(ctx, keys...).Result()
+			if err != nil {
+				logger.Warnf("mget inodes: %v", err)
+				continue
+			}
+			for i, raw := range vals {
+				if raw == nil {
+					continue
+				}
+				buf, ok := raw.(string)
+				if !ok {
+					if b, bOk := raw.([]byte); bOk {
+						buf = string(b)
+					} else {
+						logger.Warnf("unexpected inode value type %T for %s", raw, keys[i])
+						continue
+					}
+				}
+				var attr Attr
+				m.parseAttr([]byte(buf), &attr)
+				ino, err := strconv.Atoi(keys[i][prefix+1:])
+				if err != nil {
+					continue
+				}
+				if _, ok := foundInodes[Ino(ino)]; !ok && time.Unix(attr.Ctime, 0).Before(cutoff) {
+					logger.Infof("found dangling inode: %s %+v", keys[i], attr)
+					if delete {
+						if err := m.doDeleteSustainedInode(0, Ino(ino)); err != nil {
+							logger.Errorf("delete leaked inode %d : %v", ino, err)
+						}
+					}
+				}
+			}
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+}
+
+func (m *rueidisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doCleanupDetachedNode(ctx, ino)
+	}
+
+	exists, err := m.compat.Exists(ctx, m.inodeKey(ino)).Result()
+	if err != nil || exists == 0 {
+		return errno(err)
+	}
+
+	rmConcurrent := make(chan int, 10)
+	if eno := m.emptyDir(ctx, ino, true, nil, rmConcurrent); eno != 0 {
+		return eno
+	}
+
+	m.updateStats(-align4K(0), -1)
+
+	err = m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		_, e := tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Del(ctx, m.inodeKey(ino))
+			pipe.Del(ctx, m.xattrKey(ino))
+			pipe.DecrBy(ctx, m.usedSpaceKey(), align4K(0))
+			pipe.Decr(ctx, m.totalInodesKey())
+			field := ino.String()
+			pipe.HDel(ctx, m.dirUsedInodesKey(), field)
+			pipe.HDel(ctx, m.dirDataLengthKey(), field)
+			pipe.HDel(ctx, m.dirUsedSpaceKey(), field)
+			pipe.ZRem(ctx, m.detachedNodes(), field)
+			return nil
+		})
+		return e
+	}, m.inodeKey(ino), m.xattrKey(ino))
+
+	return errno(err)
+}
+
+func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
+	if m.compat == nil {
+		return m.redisMeta.doCleanupDelayedSlices(ctx, edge)
+	}
+
+	var (
+		count  int
+		ss     []Slice
+		rs     []*rueidiscompat.IntCmd
+		cursor uint64
+		delKey = m.delSlices()
+	)
+
+	for {
+		keys, next, err := m.compat.HScan(ctx, delKey, cursor, "*", 10000).Result()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
+			logger.Warnf("HSCAN %s: %v", delKey, err)
+			return count, err
+		}
+		if len(keys) > 0 {
+			for i := 0; i < len(keys); i += 2 {
+				if ctx.Canceled() {
+					return count, ctx.Err()
+				}
+				key := keys[i]
+				ps := strings.Split(key, "_")
+				if len(ps) != 2 {
+					logger.Warnf("Invalid key %s", key)
+					continue
+				}
+				ts, e := strconv.ParseUint(ps[1], 10, 64)
+				if e != nil {
+					logger.Warnf("Invalid key %s", key)
+					continue
+				}
+				if ts >= uint64(edge) {
+					continue
+				}
+
+				if err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+					ss = ss[:0]
+					rs = rs[:0]
+					val, e := tx.HGet(ctx, delKey, key).Result()
+					if e == rueidiscompat.Nil {
+						return nil
+					} else if e != nil {
+						return e
+					}
+					buf := []byte(val)
+					m.decodeDelayedSlices(buf, &ss)
+					if len(ss) == 0 {
+						return fmt.Errorf("invalid value for delSlices %s: %v", key, buf)
+					}
+					_, e = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+						for _, s := range ss {
+							rs = append(rs, pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), -1))
+						}
+						pipe.HDel(ctx, delKey, key)
+						return nil
+					})
+					return e
+				}, delKey); err != nil {
+					logger.Warnf("Cleanup delSlices %s: %v", key, err)
+					continue
+				}
+
+				for i, s := range ss {
+					if rs[i].Err() == nil && rs[i].Val() < 0 {
+						m.deleteSlice(s.Id, s.Size)
+						count++
+					}
+					if ctx.Canceled() {
+						return count, ctx.Err()
+					}
+				}
+			}
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return count, nil
+		}
+		return count, err
+	}
+	return count, nil
 }
 
 func (m *rueidisMeta) doCleanStaleSession(sid uint64) error {
