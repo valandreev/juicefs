@@ -19,7 +19,7 @@ cmd/cmd
 .DS_Store
 
 # ide
-.vscode
+# .vscode
 .idea
 
 # lang

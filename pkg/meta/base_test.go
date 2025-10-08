@@ -55,11 +55,18 @@ func testFormat() *Format {
 }
 
 func TestRedisClient(t *testing.T) {
-	m, err := newRedisMeta("redis", "127.0.0.1:6379/10", testConfig())
-	if err != nil || m.Name() != "redis" {
-		t.Fatalf("create meta: %s", err)
-	}
-	testMeta(t, m)
+	forEachRedisLike(t, "redis-client", func(t *testing.T, target redisLikeTarget) {
+		if target.Scheme != "redis" {
+			t.Skipf("driver %s not yet implemented", target.Scheme)
+			return
+		}
+		m := createMetaForTarget(t, target, nil)
+		if m == nil {
+			return
+		}
+		defer m.Shutdown()
+		testMeta(t, m)
+	})
 }
 
 func TestKeyDB(t *testing.T) { // skip mutate
@@ -1054,20 +1061,20 @@ func testListLocks(t *testing.T, m Meta) {
 
 	// flock
 	o1 := uint64(0xF000000000000001)
-	if st := m.Flock(ctx, inode, o1, syscall.F_WRLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_WRLCK, false); st != 0 {
 		t.Fatalf("flock wlock: %s", st)
 	}
 	if plocks, flocks, err := m.ListLocks(ctx, inode); err != nil || len(plocks) != 0 || len(flocks) != 1 {
 		t.Fatalf("list locks: %v %v %v", plocks, flocks, err)
 	}
-	if st := m.Flock(ctx, inode, o1, syscall.F_UNLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_UNLCK, false); st != 0 {
 		t.Fatalf("flock unlock: %s", st)
 	}
 	if plocks, flocks, err := m.ListLocks(ctx, inode); err != nil || len(plocks) != 0 || len(flocks) != 0 {
 		t.Fatalf("list locks: %v %v %v", plocks, flocks, err)
 	}
 	for i := 2; i < 10; i++ {
-		if st := m.Flock(ctx, inode, uint64(i), syscall.F_RDLCK, false); st != 0 {
+		if st := m.Flock(ctx, inode, uint64(i), F_RDLCK, false); st != 0 {
 			t.Fatalf("flock wlock: %s", st)
 		}
 	}
@@ -1075,7 +1082,7 @@ func testListLocks(t *testing.T, m Meta) {
 		t.Fatalf("list locks: %v %v %v", plocks, flocks, err)
 	}
 	for i := 2; i < 10; i++ {
-		if st := m.Flock(ctx, inode, uint64(i), syscall.F_UNLCK, false); st != 0 {
+		if st := m.Flock(ctx, inode, uint64(i), F_UNLCK, false); st != 0 {
 			t.Fatalf("flock unlock: %s", st)
 		}
 	}
@@ -1084,20 +1091,20 @@ func testListLocks(t *testing.T, m Meta) {
 	}
 
 	// plock
-	if st := m.Setlk(ctx, inode, o1, false, syscall.F_WRLCK, 0, 0xFFFF, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, o1, false, F_WRLCK, 0, 0xFFFF, 1); st != 0 {
 		t.Fatalf("plock rlock: %s", st)
 	}
 	if plocks, flocks, err := m.ListLocks(ctx, inode); err != nil || len(plocks) != 1 || len(flocks) != 0 {
 		t.Fatalf("list locks: %v %v %v", plocks, flocks, err)
 	}
-	if st := m.Setlk(ctx, inode, o1, false, syscall.F_UNLCK, 0, 0xFFFF, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, o1, false, F_UNLCK, 0, 0xFFFF, 1); st != 0 {
 		t.Fatalf("plock unlock: %s", st)
 	}
 	if plocks, flocks, err := m.ListLocks(ctx, inode); err != nil || len(plocks) != 0 || len(flocks) != 0 {
 		t.Fatalf("list locks: %v %v %v", plocks, flocks, err)
 	}
 	for i := 2; i < 10; i++ {
-		if st := m.Setlk(ctx, inode, uint64(i), false, syscall.F_RDLCK, 0, 0xFFFF, 1); st != 0 {
+		if st := m.Setlk(ctx, inode, uint64(i), false, F_RDLCK, 0, 0xFFFF, 1); st != 0 {
 			t.Fatalf("plock rlock: %s", st)
 		}
 	}
@@ -1105,7 +1112,7 @@ func testListLocks(t *testing.T, m Meta) {
 		t.Fatalf("list locks: %v %v %v", plocks, flocks, err)
 	}
 	for i := 2; i < 10; i++ {
-		if st := m.Setlk(ctx, inode, uint64(i), false, syscall.F_UNLCK, 0, 0xFFFF, 1); st != 0 {
+		if st := m.Setlk(ctx, inode, uint64(i), false, F_UNLCK, 0, 0xFFFF, 1); st != 0 {
 			t.Fatalf("plock unlock: %s", st)
 		}
 	}
@@ -1124,49 +1131,49 @@ func testLocks(t *testing.T, m Meta) {
 	}
 	// flock
 	o1 := uint64(0xF000000000000001)
-	if st := m.Flock(ctx, inode, o1, syscall.F_WRLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_WRLCK, false); st != 0 {
 		t.Fatalf("flock wlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, o1, syscall.F_WRLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_WRLCK, false); st != 0 {
 		t.Fatalf("flock wlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, o1, syscall.F_RDLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_RDLCK, false); st != 0 {
 		t.Fatalf("flock rlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, 2, syscall.F_RDLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, 2, F_RDLCK, false); st != 0 {
 		t.Fatalf("flock rlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, 2, syscall.F_UNLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, 2, F_UNLCK, false); st != 0 {
 		t.Fatalf("flock unlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, o1, syscall.F_WRLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_WRLCK, false); st != 0 {
 		t.Fatalf("flock wlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, o1, syscall.F_UNLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_UNLCK, false); st != 0 {
 		t.Fatalf("flock unlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, o1, syscall.F_RDLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_RDLCK, false); st != 0 {
 		t.Fatalf("flock rlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, 2, syscall.F_RDLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, 2, F_RDLCK, false); st != 0 {
 		t.Fatalf("flock rlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, o1, syscall.F_WRLCK, false); st != syscall.EAGAIN {
+	if st := m.Flock(ctx, inode, o1, F_WRLCK, false); st != syscall.EAGAIN {
 		t.Fatalf("flock wlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, 2, syscall.F_UNLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, 2, F_UNLCK, false); st != 0 {
 		t.Fatalf("flock unlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, o1, syscall.F_WRLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_WRLCK, false); st != 0 {
 		t.Fatalf("flock wlock again: %s", st)
 	}
-	if st := m.Flock(ctx, inode, 2, syscall.F_WRLCK, false); st != syscall.EAGAIN {
+	if st := m.Flock(ctx, inode, 2, F_WRLCK, false); st != syscall.EAGAIN {
 		t.Fatalf("flock wlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, 2, syscall.F_RDLCK, false); st != syscall.EAGAIN {
+	if st := m.Flock(ctx, inode, 2, F_RDLCK, false); st != syscall.EAGAIN {
 		t.Fatalf("flock rlock: %s", st)
 	}
-	if st := m.Flock(ctx, inode, o1, syscall.F_UNLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, o1, F_UNLCK, false); st != 0 {
 		t.Fatalf("flock unlock: %s", st)
 	}
 	if r, ok := m.(*redisMeta); ok {
@@ -1180,47 +1187,47 @@ func testLocks(t *testing.T, m Meta) {
 	}
 
 	// POSIX locks
-	if st := m.Setlk(ctx, inode, o1, false, syscall.F_UNLCK, 0, 0xFFFF, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, o1, false, F_UNLCK, 0, 0xFFFF, 1); st != 0 {
 		t.Fatalf("plock unlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, o1, false, syscall.F_RDLCK, 0, 0xFFFF, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, o1, false, F_RDLCK, 0, 0xFFFF, 1); st != 0 {
 		t.Fatalf("plock rlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, o1, false, syscall.F_RDLCK, 0, 0xFFFF, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, o1, false, F_RDLCK, 0, 0xFFFF, 1); st != 0 {
 		t.Fatalf("plock rlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, 2, false, syscall.F_RDLCK, 0, 0x2FFFF, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, 2, false, F_RDLCK, 0, 0x2FFFF, 1); st != 0 {
 		t.Fatalf("plock rlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, 2, false, syscall.F_WRLCK, 0, 0xFFFF, 1); st != syscall.EAGAIN {
+	if st := m.Setlk(ctx, inode, 2, false, F_WRLCK, 0, 0xFFFF, 1); st != syscall.EAGAIN {
 		t.Fatalf("plock wlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, 2, false, syscall.F_WRLCK, 0x10000, 0x20000, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, 2, false, F_WRLCK, 0x10000, 0x20000, 1); st != 0 {
 		t.Fatalf("plock wlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, o1, false, syscall.F_UNLCK, 0, 0x20000, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, o1, false, F_UNLCK, 0, 0x20000, 1); st != 0 {
 		t.Fatalf("plock unlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, 2, false, syscall.F_WRLCK, 0, 0xFFFF, 10); st != 0 {
+	if st := m.Setlk(ctx, inode, 2, false, F_WRLCK, 0, 0xFFFF, 10); st != 0 {
 		t.Fatalf("plock wlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, 2, false, syscall.F_WRLCK, 0x2000, 0xFFFF, 20); st != 0 {
+	if st := m.Setlk(ctx, inode, 2, false, F_WRLCK, 0x2000, 0xFFFF, 20); st != 0 {
 		t.Fatalf("plock wlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, o1, false, syscall.F_WRLCK, 0, 0xFFFF, 1); st != syscall.EAGAIN {
+	if st := m.Setlk(ctx, inode, o1, false, F_WRLCK, 0, 0xFFFF, 1); st != syscall.EAGAIN {
 		t.Fatalf("plock rlock: %s", st)
 	}
-	var ltype, pid uint32 = syscall.F_WRLCK, 1
+	var ltype, pid uint32 = F_WRLCK, 1
 	var start, end uint64 = 0x2000, 0xFFFF
-	if st := m.Getlk(ctx, inode, o1, &ltype, &start, &end, &pid); st != 0 || ltype != syscall.F_WRLCK || pid != 20 || start != 0x2000 || end != 0xFFFF {
+	if st := m.Getlk(ctx, inode, o1, &ltype, &start, &end, &pid); st != 0 || ltype != F_WRLCK || pid != 20 || start != 0x2000 || end != 0xFFFF {
 		t.Fatalf("plock get rlock: %s, %d %d %x %x", st, ltype, pid, start, end)
 	}
-	if st := m.Setlk(ctx, inode, 2, false, syscall.F_UNLCK, 0, 0x2FFFF, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, 2, false, F_UNLCK, 0, 0x2FFFF, 1); st != 0 {
 		t.Fatalf("plock unlock: %s", st)
 	}
-	ltype = syscall.F_WRLCK
+	ltype = F_WRLCK
 	start, end = 0, 0xFFFFFF
-	if st := m.Getlk(ctx, inode, o1, &ltype, &start, &end, &pid); st != 0 || ltype != syscall.F_UNLCK || pid != 0 || start != 0 || end != 0 {
+	if st := m.Getlk(ctx, inode, o1, &ltype, &start, &end, &pid); st != 0 || ltype != F_UNLCK || pid != 0 || start != 0 || end != 0 {
 		t.Fatalf("plock get rlock: %s, %d %d %x %x", st, ltype, pid, start, end)
 	}
 
@@ -1232,7 +1239,7 @@ func testLocks(t *testing.T, m Meta) {
 		g.Add(1)
 		go func(i int) {
 			defer g.Done()
-			if st := m.Setlk(ctx, inode, uint64(i), true, syscall.F_WRLCK, 0, 0xFFFF, uint32(i)); st != 0 {
+			if st := m.Setlk(ctx, inode, uint64(i), true, F_WRLCK, 0, 0xFFFF, uint32(i)); st != 0 {
 				err = st
 			}
 			count++
@@ -1241,7 +1248,7 @@ func testLocks(t *testing.T, m Meta) {
 			if count > 0 {
 				panic(fmt.Errorf("count should be zero but got %d", count))
 			}
-			if st := m.Setlk(ctx, inode, uint64(i), false, syscall.F_UNLCK, 0, 0xFFFF, uint32(i)); st != 0 {
+			if st := m.Setlk(ctx, inode, uint64(i), false, F_UNLCK, 0, 0xFFFF, uint32(i)); st != 0 {
 				panic(fmt.Errorf("plock unlock: %s", st))
 			}
 		}(i)
@@ -1971,10 +1978,10 @@ func testCloseSession(t *testing.T, m Meta) {
 	if st := m.Create(ctx, 1, "f", 0644, 022, 0, &inode, attr); st != 0 {
 		t.Fatalf("create f: %s", st)
 	}
-	if st := m.Flock(ctx, inode, 1, syscall.F_WRLCK, false); st != 0 {
+	if st := m.Flock(ctx, inode, 1, F_WRLCK, false); st != 0 {
 		t.Fatalf("flock wlock: %s", st)
 	}
-	if st := m.Setlk(ctx, inode, 1, false, syscall.F_WRLCK, 0x10000, 0x20000, 1); st != 0 {
+	if st := m.Setlk(ctx, inode, 1, false, F_WRLCK, 0x10000, 0x20000, 1); st != 0 {
 		t.Fatalf("plock wlock: %s", st)
 	}
 	if st := m.Open(ctx, inode, syscall.O_RDWR, attr); st != 0 {
