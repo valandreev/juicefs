@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	pkgerrors "github.com/pkg/errors"
 	"github.com/redis/rueidis"
 	"github.com/redis/rueidis/rueidiscompat"
+	"golang.org/x/sync/errgroup"
 )
 
 type rueidisMeta struct {
@@ -1279,4 +1282,177 @@ func (m *rueidisMeta) doCleanStaleSession(sid uint64) error {
 		return nil
 	}
 	return m.compat.ZRem(ctx, legacySessions, ssid).Err()
+}
+
+func (m *rueidisMeta) newDirHandler(inode Ino, plus bool, entries []*Entry) DirHandler {
+	if m.compat == nil {
+		return m.redisMeta.newDirHandler(inode, plus, entries)
+	}
+	return &rueidisDirHandler{
+		en:          m,
+		inode:       inode,
+		plus:        plus,
+		initEntries: entries,
+		batchNum:    DirBatchNum["redis"],
+	}
+}
+
+type rueidisDirHandler struct {
+	sync.Mutex
+	inode       Ino
+	plus        bool
+	en          *rueidisMeta
+	initEntries []*Entry
+	entries     []*Entry
+	indexes     map[string]int
+	readOff     int
+	batchNum    int
+}
+
+func (s *rueidisDirHandler) Close() {
+	s.Lock()
+	s.entries = nil
+	s.readOff = 0
+	s.Unlock()
+}
+
+func (s *rueidisDirHandler) Delete(name string) {
+	s.Lock()
+	defer s.Unlock()
+
+	if len(s.entries) == 0 {
+		return
+	}
+
+	if idx, ok := s.indexes[name]; ok && idx >= s.readOff {
+		delete(s.indexes, name)
+		n := len(s.entries)
+		if idx < n-1 {
+			// TODO: sorted
+			s.entries[idx] = s.entries[n-1]
+			s.indexes[string(s.entries[idx].Name)] = idx
+		}
+		s.entries = s.entries[:n-1]
+	}
+}
+
+func (s *rueidisDirHandler) Insert(inode Ino, name string, attr *Attr) {
+	s.Lock()
+	defer s.Unlock()
+
+	if len(s.entries) == 0 {
+		return
+	}
+
+	// TODO: sorted
+	s.entries = append(s.entries, &Entry{Inode: inode, Name: []byte(name), Attr: attr})
+	s.indexes[name] = len(s.entries) - 1
+}
+
+func (s *rueidisDirHandler) List(ctx Context, offset int) ([]*Entry, syscall.Errno) {
+	var prefix []*Entry
+	if offset < len(s.initEntries) {
+		prefix = s.initEntries[offset:]
+		offset = 0
+	} else {
+		offset -= len(s.initEntries)
+	}
+
+	s.Lock()
+	defer s.Unlock()
+	if s.entries == nil {
+		entries, err := s.loadEntries(ctx)
+		if err != nil {
+			return nil, errno(err)
+		}
+		s.entries = entries
+		indexes := make(map[string]int, len(entries))
+		for i, e := range entries {
+			indexes[string(e.Name)] = i
+		}
+		s.indexes = indexes
+	}
+
+	size := len(s.entries) - offset
+	if size > s.batchNum {
+		size = s.batchNum
+	}
+	s.readOff = offset + size
+	entries := s.entries[offset : offset+size]
+	if len(prefix) > 0 {
+		entries = append(prefix, entries...)
+	}
+	return entries, 0
+}
+
+func (s *rueidisDirHandler) Read(offset int) {
+	s.readOff = offset - len(s.initEntries)
+}
+
+func (s *rueidisDirHandler) loadEntries(ctx Context) ([]*Entry, error) {
+	var (
+		entries []*Entry
+		cursor  uint64
+		key     = s.en.entryKey(s.inode)
+	)
+
+	for {
+		kvs, next, err := s.en.compat.HScan(ctx, key, cursor, "*", 10000).Result()
+		if err != nil {
+			return nil, err
+		}
+		if len(kvs) > 0 {
+			newEntries := make([]Entry, len(kvs)/2)
+			newAttrs := make([]Attr, len(kvs)/2)
+			for i := 0; i < len(kvs); i += 2 {
+				typ, ino := s.en.parseEntry([]byte(kvs[i+1]))
+				if kvs[i] == "" {
+					logger.Errorf("Corrupt entry with empty name: inode %d parent %d", ino, s.inode)
+					continue
+				}
+				ent := &newEntries[i/2]
+				ent.Inode = ino
+				ent.Name = []byte(kvs[i])
+				ent.Attr = &newAttrs[i/2]
+				ent.Attr.Typ = typ
+				entries = append(entries, ent)
+			}
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+
+	if s.en.conf.SortDir {
+		sort.Slice(entries, func(i, j int) bool {
+			return string(entries[i].Name) < string(entries[j].Name)
+		})
+	}
+	if s.plus {
+		nEntries := len(entries)
+		var err error
+		if nEntries <= s.batchNum {
+			err = s.en.fillAttr(ctx, entries)
+		} else {
+			eg := errgroup.Group{}
+			eg.SetLimit(2)
+			for i := 0; i < nEntries; i += s.batchNum {
+				var es []*Entry
+				if i+s.batchNum > nEntries {
+					es = entries[i:]
+				} else {
+					es = entries[i : i+s.batchNum]
+				}
+				eg.Go(func() error {
+					return s.en.fillAttr(ctx, es)
+				})
+			}
+			err = eg.Wait()
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
 }
