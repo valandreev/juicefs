@@ -1284,6 +1284,114 @@ func (m *rueidisMeta) doCleanStaleSession(sid uint64) error {
 	return m.compat.ZRem(ctx, legacySessions, ssid).Err()
 }
 
+func (m *rueidisMeta) fillAttr(ctx Context, es []*Entry) error {
+	if m.compat == nil {
+		return m.redisMeta.fillAttr(ctx, es)
+	}
+	if len(es) == 0 {
+		return nil
+	}
+	keys := make([]string, len(es))
+	for i, e := range es {
+		keys[i] = m.inodeKey(e.Inode)
+	}
+	vals, err := m.compat.MGet(ctx, keys...).Result()
+	if err != nil {
+		return err
+	}
+	for j, v := range vals {
+		if v == nil {
+			continue
+		}
+		var data []byte
+		switch vv := v.(type) {
+		case string:
+			data = []byte(vv)
+		case []byte:
+			data = vv
+		default:
+			logger.Warnf("unexpected value type %T for inode %s", v, keys[j])
+			continue
+		}
+		m.parseAttr(data, es[j].Attr)
+		m.of.Update(es[j].Inode, es[j].Attr)
+	}
+	return nil
+}
+
+func (m *rueidisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry, limit int) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doReaddir(ctx, inode, plus, entries, limit)
+	}
+
+	var (
+		cursor  uint64
+		reached bool
+		key     = m.entryKey(inode)
+	)
+
+	for {
+		kvs, next, err := m.compat.HScan(ctx, key, cursor, "*", 10000).Result()
+		if err != nil {
+			return errno(err)
+		}
+		if len(kvs) > 0 {
+			newEntries := make([]Entry, len(kvs)/2)
+			newAttrs := make([]Attr, len(kvs)/2)
+			for i := 0; i < len(kvs); i += 2 {
+				name := kvs[i]
+				typ, ino := m.parseEntry([]byte(kvs[i+1]))
+				if name == "" {
+					logger.Errorf("Corrupt entry with empty name: inode %d parent %d", ino, inode)
+					continue
+				}
+				ent := &newEntries[i/2]
+				ent.Inode = ino
+				ent.Name = []byte(name)
+				ent.Attr = &newAttrs[i/2]
+				ent.Attr.Typ = typ
+				*entries = append(*entries, ent)
+				if limit > 0 && len(*entries) >= limit {
+					reached = true
+					break
+				}
+			}
+		}
+		if reached || next == 0 {
+			break
+		}
+		cursor = next
+	}
+
+	if plus != 0 && len(*entries) != 0 {
+		const batchSize = 4096
+		nEntries := len(*entries)
+		if nEntries <= batchSize {
+			if err := m.fillAttr(ctx, *entries); err != nil {
+				return errno(err)
+			}
+		} else {
+			var eg errgroup.Group
+			eg.SetLimit(2)
+			for i := 0; i < nEntries; i += batchSize {
+				start := i
+				end := i + batchSize
+				if end > nEntries {
+					end = nEntries
+				}
+				es := (*entries)[start:end]
+				eg.Go(func() error {
+					return m.fillAttr(ctx, es)
+				})
+			}
+			if err := eg.Wait(); err != nil {
+				return errno(err)
+			}
+		}
+	}
+	return 0
+}
+
 func (m *rueidisMeta) newDirHandler(inode Ino, plus bool, entries []*Entry) DirHandler {
 	if m.compat == nil {
 		return m.redisMeta.newDirHandler(inode, plus, entries)
