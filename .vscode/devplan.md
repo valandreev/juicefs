@@ -47,7 +47,7 @@ Assumptions / open questions
 1. **Implementation (minimal):**
    - ✅ `pkg/meta/rueidis.go` now defines a dedicated `rueidisMeta` wrapper that registers the Rueidis schemes, instantiates a Rueidis client via `rueidis.ParseURL` / `rueidis.NewClient`, and resets the embedded engine pointer so background jobs route through the new type.
    - 🔜 Swap the temporary delegation to go-redis for Rueidis-backed command execution by introducing a compatibility layer (likely via helper interfaces mirroring the subset of go-redis we consume).
-   - ✅ A `rueidiscompat.NewAdapter` instance now hangs off `rueidisMeta`, wiring the first production calls (`doLoad`, `doDeleteSlice`, `getCounter`, `incrCounter`) through Rueidis while keeping unported paths on the embedded go-redis engine.
+   - ✅ A `rueidiscompat.NewAdapter` instance now hangs off `rueidisMeta`, wiring the first production calls (`doLoad`, `doDeleteSlice`, `doInit`, `cacheACLs`, `getSession`, `GetSession`, `ListSessions`, `doNewSession`, `cleanupLegacies`, `doCleanStaleSession`, `getCounter`, `incrCounter`) through Rueidis while keeping unported paths on the embedded go-redis engine.
    - Preserve uniform build tags (e.g., `//go:build !norueidis`) and align configuration parsing with the Redis driver so CLI/config UX stays identical. Extend parsing to honor Rueidis-specific knobs (auto-pipelining, cache sizing) once we expose them.
    - For TLS, wire `ruediss` URIs to load a `tls.Config` via existing helpers.
 2. **Tests:**
