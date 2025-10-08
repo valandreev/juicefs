@@ -868,6 +868,251 @@ func (m *rueidisMeta) doAttachDirNode(ctx Context, parent Ino, dstIno Ino, name 
 	return errno(err)
 }
 
+func (m *rueidisMeta) doTouchAtime(ctx Context, inode Ino, attr *Attr, now time.Time) (bool, error) {
+	if m.compat == nil {
+		return m.redisMeta.doTouchAtime(ctx, inode, attr, now)
+	}
+
+	var updated bool
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		cmd := tx.Get(ctx, m.inodeKey(inode))
+		data, err := cmd.Bytes()
+		if err != nil {
+			return err
+		}
+		m.parseAttr(data, attr)
+		if !m.atimeNeedsUpdate(attr, now) {
+			return nil
+		}
+		attr.Atime = now.Unix()
+		attr.Atimensec = uint32(now.Nanosecond())
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
+			return nil
+		})
+		if err == nil {
+			updated = true
+		}
+		return err
+	}, m.inodeKey(inode))
+	return updated, err
+}
+
+func (m *rueidisMeta) doSetFacl(ctx Context, ino Ino, aclType uint8, rule *aclAPI.Rule) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doSetFacl(ctx, ino, aclType, rule)
+	}
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		val, err := tx.Get(ctx, m.inodeKey(ino)).Bytes()
+		if err != nil {
+			return err
+		}
+		attr := &Attr{}
+		m.parseAttr(val, attr)
+
+		if ctx.Uid() != 0 && ctx.Uid() != attr.Uid {
+			return syscall.EPERM
+		}
+		if attr.Flags&FlagImmutable != 0 {
+			return syscall.EPERM
+		}
+
+		oriACL := getAttrACLId(attr, aclType)
+		oriMode := attr.Mode
+
+		if ctx.Uid() != 0 && !inGroup(ctx, attr.Gid) {
+			attr.Mode &= 05777
+		}
+
+		if rule.IsEmpty() {
+			setAttrACLId(attr, aclType, aclAPI.None)
+			attr.Mode &= 07000
+			attr.Mode |= ((rule.Owner & 7) << 6) | ((rule.Group & 7) << 3) | (rule.Other & 7)
+		} else if rule.IsMinimal() && aclType == aclAPI.TypeAccess {
+			setAttrACLId(attr, aclType, aclAPI.None)
+			attr.Mode &= 07000
+			attr.Mode |= ((rule.Owner & 7) << 6) | ((rule.Group & 7) << 3) | (rule.Other & 7)
+		} else {
+			rule.InheritPerms(attr.Mode)
+			aclId, err := m.insertACLCompat(ctx, tx, rule)
+			if err != nil {
+				return err
+			}
+			setAttrACLId(attr, aclType, aclId)
+			if aclType == aclAPI.TypeAccess {
+				attr.Mode &= 07000
+				attr.Mode |= ((rule.Owner & 7) << 6) | ((rule.Mask & 7) << 3) | (rule.Other & 7)
+			}
+		}
+
+		if oriACL != getAttrACLId(attr, aclType) || oriMode != attr.Mode {
+			now := time.Now()
+			attr.Ctime = now.Unix()
+			attr.Ctimensec = uint32(now.Nanosecond())
+			_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+				pipe.Set(ctx, m.inodeKey(ino), m.marshal(attr), 0)
+				return nil
+			})
+			return err
+		}
+		return nil
+	}, m.inodeKey(ino))
+
+	return errno(err)
+}
+
+func (m *rueidisMeta) tryLoadMissACLsCompat(ctx Context, tx rueidiscompat.Tx) error {
+	missIds := m.aclCache.GetMissIds()
+	if len(missIds) == 0 {
+		return nil
+	}
+	missKeys := make([]string, len(missIds))
+	for i, id := range missIds {
+		missKeys[i] = strconv.FormatUint(uint64(id), 10)
+	}
+
+	vals, err := tx.HMGet(ctx, m.aclKey(), missKeys...).Result()
+	if err != nil {
+		return err
+	}
+	for i, data := range vals {
+		var rule aclAPI.Rule
+		if data != nil {
+			switch v := data.(type) {
+			case string:
+				rule.Decode([]byte(v))
+			case []byte:
+				rule.Decode(v)
+			default:
+				logger.Warnf("unexpected ACL value type %T for %s", data, missKeys[i])
+			}
+		}
+		m.aclCache.Put(missIds[i], &rule)
+	}
+	return nil
+}
+
+func (m *rueidisMeta) insertACLCompat(ctx Context, tx rueidiscompat.Tx, rule *aclAPI.Rule) (uint32, error) {
+	if rule == nil || rule.IsEmpty() {
+		return aclAPI.None, nil
+	}
+
+	if err := m.tryLoadMissACLsCompat(ctx, tx); err != nil {
+		logger.Warnf("SetFacl: load miss acls error: %v", err)
+	}
+
+	if aclId := m.aclCache.GetId(rule); aclId != aclAPI.None {
+		return aclId, nil
+	}
+
+	newId, err := m.incrCounter(aclCounter, 1)
+	if err != nil {
+		return aclAPI.None, err
+	}
+	aclId := uint32(newId)
+
+	ok, err := tx.HSetNX(ctx, m.aclKey(), strconv.FormatUint(uint64(aclId), 10), rule.Encode()).Result()
+	if err != nil {
+		return aclAPI.None, err
+	}
+	if !ok {
+		return aclId, nil
+	}
+	m.aclCache.Put(aclId, rule)
+	return aclId, nil
+}
+
+func (m *rueidisMeta) getACLCompat(ctx Context, tx rueidiscompat.Tx, id uint32) (*aclAPI.Rule, error) {
+	if id == aclAPI.None {
+		return nil, nil
+	}
+	if cRule := m.aclCache.Get(id); cRule != nil {
+		return cRule, nil
+	}
+
+	key := strconv.FormatUint(uint64(id), 10)
+	var (
+		val []byte
+		err error
+	)
+	if tx != nil {
+		data, e := tx.HGet(ctx, m.aclKey(), key).Result()
+		if e != nil {
+			return nil, e
+		}
+		val = []byte(data)
+	} else {
+		val, err = m.compat.HGet(ctx, m.aclKey(), key).Bytes()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if val == nil {
+		return nil, syscall.EIO
+	}
+
+	rule := &aclAPI.Rule{}
+	rule.Decode(val)
+	m.aclCache.Put(id, rule)
+	return rule, nil
+}
+
+func (m *rueidisMeta) doGetFacl(ctx Context, ino Ino, aclType uint8, aclId uint32, rule *aclAPI.Rule) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doGetFacl(ctx, ino, aclType, aclId, rule)
+	}
+
+	if aclId == aclAPI.None {
+		val, err := m.compat.Get(ctx, m.inodeKey(ino)).Bytes()
+		if err != nil {
+			return errno(err)
+		}
+		attr := &Attr{}
+		m.parseAttr(val, attr)
+		m.of.Update(ino, attr)
+		aclId = getAttrACLId(attr, aclType)
+	}
+
+	a, err := m.getACLCompat(ctx, nil, aclId)
+	if err != nil {
+		return errno(err)
+	}
+	if a == nil {
+		return ENOATTR
+	}
+	*rule = *a
+	return 0
+}
+
+func (m *rueidisMeta) loadDumpedACLs(ctx Context) error {
+	if m.compat == nil {
+		return m.redisMeta.loadDumpedACLs(ctx)
+	}
+
+	id2Rule := m.aclCache.GetAll()
+	if len(id2Rule) == 0 {
+		return nil
+	}
+
+	return m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		maxId := uint32(0)
+		acls := make(map[string]interface{}, len(id2Rule))
+		for id, rule := range id2Rule {
+			if id > maxId {
+				maxId = id
+			}
+			acls[strconv.FormatUint(uint64(id), 10)] = rule.Encode()
+		}
+		if len(acls) > 0 {
+			if err := tx.HSet(ctx, m.aclKey(), acls).Err(); err != nil {
+				return err
+			}
+		}
+		return tx.Set(ctx, m.prefix+aclCounter, maxId, 0).Err()
+	}, m.aclKey())
+}
+
 func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 	if m.compat == nil {
 		return m.redisMeta.doCleanupDelayedSlices(ctx, edge)
