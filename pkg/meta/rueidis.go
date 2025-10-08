@@ -1392,6 +1392,38 @@ func (m *rueidisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*
 	return 0
 }
 
+func (m *rueidisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, attr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doLookup(ctx, parent, name, inode, attr)
+	}
+
+	entryKey := m.entryKey(parent)
+	buf, err := m.compat.HGet(ctx, entryKey, name).Bytes()
+	if err != nil {
+		return errno(err)
+	}
+
+	foundType, foundIno := m.parseEntry(buf)
+	encodedAttr, err := m.compat.Get(ctx, m.inodeKey(foundIno)).Bytes()
+	if err == nil {
+		if attr != nil {
+			m.parseAttr(encodedAttr, attr)
+			m.of.Update(foundIno, attr)
+		}
+	} else if err == rueidiscompat.Nil {
+		if attr != nil {
+			logger.Warnf("no attribute for inode %d (%d, %s)", foundIno, parent, name)
+			*attr = Attr{Typ: foundType}
+		}
+		err = nil
+	}
+
+	if inode != nil {
+		*inode = foundIno
+	}
+	return errno(err)
+}
+
 func (m *rueidisMeta) newDirHandler(inode Ino, plus bool, entries []*Entry) DirHandler {
 	if m.compat == nil {
 		return m.redisMeta.newDirHandler(inode, plus, entries)
