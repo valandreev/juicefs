@@ -39,6 +39,9 @@ Assumptions / open questions
 
  ✅ `doReadlink`
  ✅ `doTruncate`
+✅ `doFallocate`
+✅ `doMknod`
+✅ `doUnlink`
 
 ### Phase 1 – Driver skeleton & connection plumbing
 

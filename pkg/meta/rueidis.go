@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1581,6 +1582,358 @@ func (m *rueidisMeta) doReadlink(ctx Context, inode Ino, noatime bool) (int64, [
 	return atime, target, err
 }
 
+func (m *rueidisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, path string, inode *Ino, attr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doMknod(ctx, parent, name, _type, mode, cumask, path, inode, attr)
+	}
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		var pattr Attr
+		data, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
+		if err != nil {
+			return err
+		}
+		m.parseAttr(data, &pattr)
+		if pattr.Typ != TypeDirectory {
+			return syscall.ENOTDIR
+		}
+		if pattr.Parent > TrashInode {
+			return syscall.ENOENT
+		}
+		if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
+			return st
+		}
+		if (pattr.Flags & FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
+		if (pattr.Flags & FlagSkipTrash) != 0 {
+			attr.Flags |= FlagSkipTrash
+		}
+
+		entryKey := m.entryKey(parent)
+		bufCmd := tx.HGet(ctx, entryKey, name)
+		buf, err := bufCmd.Bytes()
+		if err != nil && err != rueidiscompat.Nil {
+			return err
+		}
+		var (
+			foundIno  Ino
+			foundType uint8
+		)
+		if err == nil {
+			foundType, foundIno = m.parseEntry(buf)
+		} else if m.conf.CaseInsensi {
+			if entry := m.resolveCase(ctx, parent, name); entry != nil {
+				foundType, foundIno = entry.Attr.Typ, entry.Inode
+			}
+		}
+		if foundIno != 0 {
+			if _type == TypeFile || _type == TypeDirectory {
+				val, e := tx.Get(ctx, m.inodeKey(foundIno)).Bytes()
+				if e == nil {
+					m.parseAttr(val, attr)
+				} else if e == rueidiscompat.Nil {
+					*attr = Attr{Typ: foundType, Parent: parent}
+					e = nil
+				} else {
+					return e
+				}
+				if inode != nil {
+					*inode = foundIno
+				}
+			}
+			return syscall.EEXIST
+		} else if parent == TrashInode {
+			next, e := tx.Incr(ctx, m.nextTrashKey()).Result()
+			if e != nil {
+				return e
+			}
+			if inode != nil {
+				*inode = TrashInode + Ino(next)
+			}
+		}
+
+		mode &= 07777
+		if pattr.DefaultACL != aclAPI.None && _type != TypeSymlink {
+			if _type == TypeDirectory {
+				attr.DefaultACL = pattr.DefaultACL
+			}
+			rule, e := m.getACLCompat(ctx, tx, pattr.DefaultACL)
+			if e != nil {
+				return e
+			}
+			if rule.IsMinimal() { // simple ACL
+				attr.Mode = mode & (0xFE00 | rule.GetMode())
+			} else {
+				cRule := rule.ChildAccessACL(mode)
+				id, e := m.insertACLCompat(ctx, tx, cRule)
+				if e != nil {
+					return e
+				}
+				attr.AccessACL = id
+				attr.Mode = (mode & 0xFE00) | cRule.GetMode()
+			}
+		} else {
+			attr.Mode = mode & ^cumask
+		}
+
+		var updateParent bool
+		now := time.Now()
+		if parent != TrashInode {
+			if _type == TypeDirectory {
+				pattr.Nlink++
+				updateParent = true
+			}
+			if updateParent || now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= m.conf.SkipDirMtime {
+				pattr.Mtime = now.Unix()
+				pattr.Mtimensec = uint32(now.Nanosecond())
+				pattr.Ctime = now.Unix()
+				pattr.Ctimensec = uint32(now.Nanosecond())
+				updateParent = true
+			}
+		}
+
+		attr.Atime = now.Unix()
+		attr.Atimensec = uint32(now.Nanosecond())
+		attr.Mtime = now.Unix()
+		attr.Mtimensec = uint32(now.Nanosecond())
+		attr.Ctime = now.Unix()
+		attr.Ctimensec = uint32(now.Nanosecond())
+
+		if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" {
+			attr.Gid = pattr.Gid
+		} else if runtime.GOOS == "linux" && pattr.Mode&02000 != 0 {
+			attr.Gid = pattr.Gid
+			if _type == TypeDirectory {
+				attr.Mode |= 02000
+			} else if attr.Mode&02010 == 02010 && ctx.Uid() != 0 {
+				var found bool
+				for _, gid := range ctx.Gids() {
+					if gid == pattr.Gid {
+						found = true
+						break
+					}
+				}
+				if !found {
+					attr.Mode &= ^uint16(02000)
+				}
+			}
+		}
+
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Set(ctx, m.inodeKey(*inode), m.marshal(attr), 0)
+			if updateParent {
+				pipe.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
+			}
+			if _type == TypeSymlink {
+				pipe.Set(ctx, m.symKey(*inode), path, 0)
+			}
+			pipe.HSet(ctx, entryKey, name, m.packEntry(_type, *inode))
+			if _type == TypeDirectory {
+				field := (*inode).String()
+				pipe.HSet(ctx, m.dirUsedInodesKey(), field, "0")
+				pipe.HSet(ctx, m.dirDataLengthKey(), field, "0")
+				pipe.HSet(ctx, m.dirUsedSpaceKey(), field, "0")
+			}
+			pipe.IncrBy(ctx, m.usedSpaceKey(), align4K(0))
+			pipe.Incr(ctx, m.totalInodesKey())
+			return nil
+		})
+		return err
+	}, m.inodeKey(parent), m.entryKey(parent))
+
+	return errno(err)
+}
+
+func (m *rueidisMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skipCheckTrash ...bool) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doUnlink(ctx, parent, name, attr, skipCheckTrash...)
+	}
+
+	var trash, inode Ino
+	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
+		if st := m.checkTrash(parent, &trash); st != 0 {
+			return st
+		}
+	}
+	if trash == 0 {
+		defer func() { m.of.InvalidateChunk(inode, invalidateAttrOnly) }()
+	}
+	if attr == nil {
+		attr = &Attr{}
+	}
+
+	var (
+		typ      uint8
+		opened   bool
+		newSpace int64
+		newInode int64
+	)
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		opened = false
+		*attr = Attr{}
+		newSpace, newInode = 0, 0
+
+		entryBuf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
+		if err == rueidiscompat.Nil && m.conf.CaseInsensi {
+			if e := m.resolveCase(ctx, parent, name); e != nil {
+				name = string(e.Name)
+				entryBuf = m.packEntry(e.Attr.Typ, e.Inode)
+				err = nil
+			}
+		}
+		if err != nil {
+			return err
+		}
+
+		typ, inode = m.parseEntry(entryBuf)
+		if typ == TypeDirectory {
+			return syscall.EPERM
+		}
+
+		if watchErr := tx.Watch(ctx, m.inodeKey(inode)).Err(); watchErr != nil {
+			return watchErr
+		}
+
+		rs, err := tx.MGet(ctx, m.inodeKey(parent), m.inodeKey(inode)).Result()
+		if err != nil {
+			return err
+		}
+		if len(rs) < 2 || rs[0] == nil {
+			return rueidiscompat.Nil
+		}
+
+		var pattr Attr
+		switch v := rs[0].(type) {
+		case string:
+			m.parseAttr([]byte(v), &pattr)
+		case []byte:
+			m.parseAttr(v, &pattr)
+		default:
+			return fmt.Errorf("unexpected parent attr type %T", rs[0])
+		}
+		if pattr.Typ != TypeDirectory {
+			return syscall.ENOTDIR
+		}
+		if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
+			return st
+		}
+		if (pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
+
+		var updateParent bool
+		now := time.Now()
+		if !parent.IsTrash() && now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= m.conf.SkipDirMtime {
+			pattr.Mtime = now.Unix()
+			pattr.Mtimensec = uint32(now.Nanosecond())
+			pattr.Ctime = now.Unix()
+			pattr.Ctimensec = uint32(now.Nanosecond())
+			updateParent = true
+		}
+
+		if rs[1] != nil {
+			switch v := rs[1].(type) {
+			case string:
+				m.parseAttr([]byte(v), attr)
+			case []byte:
+				m.parseAttr(v, attr)
+			default:
+				return fmt.Errorf("unexpected attr type %T", rs[1])
+			}
+			if ctx.Uid() != 0 && pattr.Mode&01000 != 0 && ctx.Uid() != pattr.Uid && ctx.Uid() != attr.Uid {
+				return syscall.EACCES
+			}
+			if (attr.Flags&FlagAppend) != 0 || (attr.Flags&FlagImmutable) != 0 {
+				return syscall.EPERM
+			}
+			if (attr.Flags&FlagSkipTrash) != 0 && trash > 0 {
+				trash = 0
+				defer func() { m.of.InvalidateChunk(inode, invalidateAttrOnly) }()
+			}
+			if trash > 0 && attr.Nlink > 1 {
+				exists, e := tx.HExists(ctx, m.entryKey(trash), m.trashEntry(parent, inode, name)).Result()
+				if e != nil {
+					return e
+				}
+				if exists {
+					trash = 0
+					defer func() { m.of.InvalidateChunk(inode, invalidateAttrOnly) }()
+				}
+			}
+			attr.Ctime = now.Unix()
+			attr.Ctimensec = uint32(now.Nanosecond())
+			if trash == 0 {
+				attr.Nlink--
+				if typ == TypeFile && attr.Nlink == 0 && m.sid > 0 {
+					opened = m.of.IsOpen(inode)
+				}
+			} else if attr.Parent > 0 {
+				attr.Parent = trash
+			}
+		} else {
+			logger.Warnf("no attribute for inode %d (%d, %s)", inode, parent, name)
+			trash = 0
+		}
+
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.HDel(ctx, m.entryKey(parent), name)
+			if updateParent {
+				pipe.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
+			}
+			if attr.Nlink > 0 {
+				pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
+				if trash > 0 {
+					pipe.HSet(ctx, m.entryKey(trash), m.trashEntry(parent, inode, name), entryBuf)
+					if attr.Parent == 0 {
+						pipe.HIncrBy(ctx, m.parentKey(inode), trash.String(), 1)
+					}
+				}
+				if attr.Parent == 0 {
+					pipe.HIncrBy(ctx, m.parentKey(inode), parent.String(), -1)
+				}
+			} else {
+				switch typ {
+				case TypeFile:
+					if opened {
+						pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
+						pipe.SAdd(ctx, m.sustained(m.sid), strconv.Itoa(int(inode)))
+					} else {
+						pipe.ZAdd(ctx, m.delfiles(), rueidiscompat.Z{Score: float64(now.Unix()), Member: m.toDelete(inode, attr.Length)})
+						pipe.Del(ctx, m.inodeKey(inode))
+						newSpace, newInode = -align4K(attr.Length), -1
+						pipe.IncrBy(ctx, m.usedSpaceKey(), newSpace)
+						pipe.Decr(ctx, m.totalInodesKey())
+					}
+				case TypeSymlink:
+					pipe.Del(ctx, m.symKey(inode))
+					fallthrough
+				default:
+					pipe.Del(ctx, m.inodeKey(inode))
+					newSpace, newInode = -align4K(0), -1
+					pipe.IncrBy(ctx, m.usedSpaceKey(), newSpace)
+					pipe.Decr(ctx, m.totalInodesKey())
+				}
+				pipe.Del(ctx, m.xattrKey(inode))
+				if attr.Parent == 0 {
+					pipe.Del(ctx, m.parentKey(inode))
+				}
+			}
+			return nil
+		})
+		return err
+	}, m.inodeKey(parent), m.entryKey(parent))
+
+	if err == nil && trash == 0 {
+		if typ == TypeFile && attr.Nlink == 0 {
+			m.fileDeleted(opened, parent.IsTrash(), inode, attr.Length)
+		}
+		m.updateStats(newSpace, newInode)
+	}
+	return errno(err)
+}
+
 func (m *rueidisMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uint64, delta *dirStat, attr *Attr, skipPermCheck bool) syscall.Errno {
 	if m.compat == nil {
 		return m.redisMeta.doTruncate(ctx, inode, flags, length, delta, attr, skipPermCheck)
@@ -1677,6 +2030,81 @@ func (m *rueidisMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uin
 				}
 			}
 			pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
+			return nil
+		})
+		if err == nil {
+			*attr = current
+		}
+		return err
+	}, m.inodeKey(inode))
+
+	return errno(err)
+}
+
+func (m *rueidisMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64, delta *dirStat, attr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doFallocate(ctx, inode, mode, off, size, delta, attr)
+	}
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		*delta = dirStat{}
+		var current Attr
+		val, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		if err != nil {
+			return err
+		}
+		m.parseAttr(val, &current)
+		if current.Typ == TypeFIFO {
+			return syscall.EPIPE
+		}
+		if current.Typ != TypeFile || (current.Flags&FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
+		if st := m.Access(ctx, inode, MODE_MASK_W, &current); st != 0 {
+			return st
+		}
+		if (current.Flags&FlagAppend) != 0 && (mode&^fallocKeepSize) != 0 {
+			return syscall.EPERM
+		}
+
+		length := current.Length
+		if off+size > current.Length && mode&fallocKeepSize == 0 {
+			length = off + size
+		}
+		old := current.Length
+		delta.length = int64(length) - int64(old)
+		delta.space = align4K(length) - align4K(old)
+		if err := m.checkQuota(ctx, delta.space, 0, m.getParentsCompat(ctx, tx, inode, current.Parent)...); err != 0 {
+			return err
+		}
+
+		current.Length = length
+		now := time.Now()
+		current.Mtime = now.Unix()
+		current.Mtimensec = uint32(now.Nanosecond())
+		current.Ctime = now.Unix()
+		current.Ctimensec = uint32(now.Nanosecond())
+
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(&current), 0)
+			if mode&(fallocZeroRange|fallocPunchHole) != 0 && off < old {
+				end := off + size
+				if end > old {
+					end = old
+				}
+				pos := off
+				for pos < end {
+					indx := uint32(pos / ChunkSize)
+					coff := pos % ChunkSize
+					l := end - pos
+					if coff+l > ChunkSize {
+						l = ChunkSize - coff
+					}
+					pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
+					pos += l
+				}
+			}
+			pipe.IncrBy(ctx, m.usedSpaceKey(), align4K(length)-align4K(old))
 			return nil
 		})
 		if err == nil {
