@@ -816,6 +816,58 @@ func (m *rueidisMeta) doFindDetachedNodes(t time.Time) []Ino {
 	return inodes
 }
 
+func (m *rueidisMeta) doAttachDirNode(ctx Context, parent Ino, dstIno Ino, name string) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doAttachDirNode(ctx, parent, dstIno, name)
+	}
+
+	var pattr Attr
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		cmd := tx.Get(ctx, m.inodeKey(parent))
+		data, err := cmd.Bytes()
+		if err != nil {
+			if err == rueidiscompat.Nil {
+				return syscall.ENOENT
+			}
+			return err
+		}
+		m.parseAttr(data, &pattr)
+		if pattr.Typ != TypeDirectory {
+			return syscall.ENOTDIR
+		}
+		if pattr.Parent > TrashInode {
+			return syscall.ENOENT
+		}
+		if (pattr.Flags & FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
+
+		exist, err := tx.HExists(ctx, m.entryKey(parent), name).Result()
+		if err != nil {
+			return err
+		}
+		if exist {
+			return syscall.EEXIST
+		}
+
+		_, err = tx.TxPipelined(ctx, func(p rueidiscompat.Pipeliner) error {
+			p.HSet(ctx, m.entryKey(parent), name, m.packEntry(TypeDirectory, dstIno))
+			pattr.Nlink++
+			now := time.Now()
+			pattr.Mtime = now.Unix()
+			pattr.Mtimensec = uint32(now.Nanosecond())
+			pattr.Ctime = now.Unix()
+			pattr.Ctimensec = uint32(now.Nanosecond())
+			p.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
+			p.ZRem(ctx, m.detachedNodes(), dstIno.String())
+			return nil
+		})
+		return err
+	}, m.inodeKey(parent), m.entryKey(parent))
+
+	return errno(err)
+}
+
 func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 	if m.compat == nil {
 		return m.redisMeta.doCleanupDelayedSlices(ctx, edge)
