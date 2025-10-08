@@ -1424,6 +1424,21 @@ func (m *rueidisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino,
 	return errno(err)
 }
 
+func (m *rueidisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doGetAttr(ctx, inode, attr)
+	}
+
+	data, err := m.compat.Get(ctx, m.inodeKey(inode)).Bytes()
+	if err != nil {
+		return errno(err)
+	}
+	if attr != nil {
+		m.parseAttr(data, attr)
+	}
+	return 0
+}
+
 func (m *rueidisMeta) newDirHandler(inode Ino, plus bool, entries []*Entry) DirHandler {
 	if m.compat == nil {
 		return m.redisMeta.newDirHandler(inode, plus, entries)
