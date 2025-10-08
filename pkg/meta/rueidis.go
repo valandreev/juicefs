@@ -791,6 +791,31 @@ func (m *rueidisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno 
 	return errno(err)
 }
 
+func (m *rueidisMeta) doFindDetachedNodes(t time.Time) []Ino {
+	if m.compat == nil {
+		return m.redisMeta.doFindDetachedNodes(t)
+	}
+
+	rng := rueidiscompat.ZRangeBy{
+		Min: "-inf",
+		Max: strconv.FormatInt(t.Unix(), 10),
+	}
+	vals, err := m.compat.ZRangeByScore(Background(), m.detachedNodes(), rng).Result()
+	if err != nil {
+		logger.Errorf("Scan detached nodes error: %v", err)
+		return nil
+	}
+	inodes := make([]Ino, 0, len(vals))
+	for _, node := range vals {
+		inode, err := strconv.ParseUint(node, 10, 64)
+		if err != nil {
+			continue
+		}
+		inodes = append(inodes, Ino(inode))
+	}
+	return inodes
+}
+
 func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 	if m.compat == nil {
 		return m.redisMeta.doCleanupDelayedSlices(ctx, edge)
