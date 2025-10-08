@@ -1061,6 +1061,25 @@ func (m *rueidisMeta) getACLCompat(ctx Context, tx rueidiscompat.Tx, id uint32) 
 	return rule, nil
 }
 
+func (m *rueidisMeta) getParentsCompat(ctx Context, tx rueidiscompat.Tx, inode, parent Ino) []Ino {
+	if parent > 0 {
+		return []Ino{parent}
+	}
+	vals, err := tx.HGetAll(ctx, m.parentKey(inode)).Result()
+	if err != nil {
+		logger.Warnf("Scan parent key of inode %d: %v", inode, err)
+		return nil
+	}
+	ps := make([]Ino, 0, len(vals))
+	for k, v := range vals {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			ino, _ := strconv.ParseUint(k, 10, 64)
+			ps = append(ps, Ino(ino))
+		}
+	}
+	return ps
+}
+
 func (m *rueidisMeta) doGetFacl(ctx Context, ino Ino, aclType uint8, aclId uint32, rule *aclAPI.Rule) syscall.Errno {
 	if m.compat == nil {
 		return m.redisMeta.doGetFacl(ctx, ino, aclType, aclId, rule)
@@ -1437,6 +1456,236 @@ func (m *rueidisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errn
 		m.parseAttr(data, attr)
 	}
 	return 0
+}
+
+func (m *rueidisMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode uint8, attr *Attr, oldAttr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doSetAttr(ctx, inode, set, sugidclearmode, attr, oldAttr)
+	}
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		var cur Attr
+		val, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		if err != nil {
+			return err
+		}
+		m.parseAttr(val, &cur)
+		if oldAttr != nil {
+			*oldAttr = cur
+		}
+		if cur.Parent > TrashInode {
+			return syscall.EPERM
+		}
+
+		now := time.Now()
+		rule, err := m.getACLCompat(ctx, tx, cur.AccessACL)
+		if err != nil {
+			return err
+		}
+		rule = rule.Dup()
+		dirtyAttr, st := m.mergeAttr(ctx, inode, set, &cur, attr, now, rule)
+		if st != 0 {
+			return st
+		}
+		if dirtyAttr == nil {
+			return nil
+		}
+
+		aclId, err := m.insertACLCompat(ctx, tx, rule)
+		if err != nil {
+			return err
+		}
+		dirtyAttr.AccessACL = aclId
+		dirtyAttr.Ctime = now.Unix()
+		dirtyAttr.Ctimensec = uint32(now.Nanosecond())
+
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(dirtyAttr), 0)
+			return nil
+		})
+		if err == nil {
+			*attr = *dirtyAttr
+		}
+		return err
+	}, m.inodeKey(inode))
+
+	return errno(err)
+}
+
+func (m *rueidisMeta) doReadlink(ctx Context, inode Ino, noatime bool) (int64, []byte, error) {
+	if m.compat == nil {
+		return m.redisMeta.doReadlink(ctx, inode, noatime)
+	}
+
+	if noatime {
+		target, err := m.compat.Get(ctx, m.symKey(inode)).Bytes()
+		if err == rueidiscompat.Nil {
+			err = nil
+		}
+		return 0, target, err
+	}
+
+	var (
+		atime  int64
+		target []byte
+	)
+	now := time.Now()
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		rs, err := tx.MGet(ctx, m.inodeKey(inode), m.symKey(inode)).Result()
+		if err != nil {
+			return err
+		}
+		if len(rs) != 2 || rs[0] == nil {
+			return syscall.ENOENT
+		}
+
+		var attr Attr
+		switch v := rs[0].(type) {
+		case string:
+			m.parseAttr([]byte(v), &attr)
+		case []byte:
+			m.parseAttr(v, &attr)
+		default:
+			return fmt.Errorf("unexpected attr value type %T", rs[0])
+		}
+		if attr.Typ != TypeSymlink {
+			return syscall.EINVAL
+		}
+		if rs[1] == nil {
+			return syscall.EIO
+		}
+		switch v := rs[1].(type) {
+		case string:
+			target = []byte(v)
+		case []byte:
+			target = v
+		default:
+			return fmt.Errorf("unexpected link value type %T", rs[1])
+		}
+
+		if !m.atimeNeedsUpdate(&attr, now) {
+			atime = attr.Atime*int64(time.Second) + int64(attr.Atimensec)
+			return nil
+		}
+
+		attr.Atime = now.Unix()
+		attr.Atimensec = uint32(now.Nanosecond())
+		atime = now.UnixNano()
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(&attr), 0)
+			return nil
+		})
+		return err
+	}, m.inodeKey(inode), m.symKey(inode))
+
+	return atime, target, err
+}
+
+func (m *rueidisMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uint64, delta *dirStat, attr *Attr, skipPermCheck bool) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doTruncate(ctx, inode, flags, length, delta, attr, skipPermCheck)
+	}
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		*delta = dirStat{}
+		var current Attr
+		data, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		if err != nil {
+			return err
+		}
+		m.parseAttr(data, &current)
+		if current.Typ != TypeFile || current.Flags&(FlagImmutable|FlagAppend) != 0 || (flags == 0 && current.Parent > TrashInode) {
+			return syscall.EPERM
+		}
+		if !skipPermCheck {
+			if st := m.Access(ctx, inode, MODE_MASK_W, &current); st != 0 {
+				return st
+			}
+		}
+		if length == current.Length {
+			*attr = current
+			return nil
+		}
+
+		left, right := current.Length, length
+		if left > right {
+			right, left = left, right
+		}
+		delta.length = int64(length) - int64(current.Length)
+		delta.space = align4K(length) - align4K(current.Length)
+		if err := m.checkQuota(ctx, delta.space, 0, m.getParentsCompat(ctx, tx, inode, current.Parent)...); err != 0 {
+			return err
+		}
+
+		var zeroChunks []uint32
+		if right > left {
+			if (right-left)/ChunkSize >= 10000 {
+				pattern := m.prefix + fmt.Sprintf("c%d_*", inode)
+				var cursor uint64
+				for {
+					keys, next, scanErr := tx.Scan(ctx, cursor, pattern, 10000).Result()
+					if scanErr != nil {
+						return scanErr
+					}
+					for _, key := range keys {
+						parts := strings.Split(key[len(m.prefix):], "_")
+						if len(parts) < 2 {
+							logger.Errorf("invalid chunk key %s", key)
+							continue
+						}
+						indx, convErr := strconv.Atoi(parts[1])
+						if convErr != nil {
+							logger.Errorf("parse %s: %v", key, convErr)
+							continue
+						}
+						if uint64(indx) > left/ChunkSize && uint64(indx) < right/ChunkSize {
+							zeroChunks = append(zeroChunks, uint32(indx))
+						}
+					}
+					if next == 0 {
+						break
+					}
+					cursor = next
+				}
+			} else {
+				for i := left/ChunkSize + 1; i < right/ChunkSize; i++ {
+					zeroChunks = append(zeroChunks, uint32(i))
+				}
+			}
+		}
+
+		current.Length = length
+		now := time.Now()
+		current.Mtime = now.Unix()
+		current.Mtimensec = uint32(now.Nanosecond())
+		current.Ctime = now.Unix()
+		current.Ctimensec = uint32(now.Nanosecond())
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(&current), 0)
+			if right > left {
+				l := uint32(right - left)
+				if right > (left/ChunkSize+1)*ChunkSize {
+					l = ChunkSize - uint32(left%ChunkSize)
+				}
+				pipe.RPush(ctx, m.chunkKey(inode, uint32(left/ChunkSize)), marshalSlice(uint32(left%ChunkSize), 0, 0, 0, l))
+				buf := marshalSlice(0, 0, 0, 0, ChunkSize)
+				for _, indx := range zeroChunks {
+					pipe.RPushX(ctx, m.chunkKey(inode, indx), buf)
+				}
+				if right > (left/ChunkSize+1)*ChunkSize && right%ChunkSize > 0 {
+					pipe.RPush(ctx, m.chunkKey(inode, uint32(right/ChunkSize)), marshalSlice(0, 0, 0, 0, uint32(right%ChunkSize)))
+				}
+			}
+			pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
+			return nil
+		})
+		if err == nil {
+			*attr = current
+		}
+		return err
+	}, m.inodeKey(inode))
+
+	return errno(err)
 }
 
 func (m *rueidisMeta) newDirHandler(inode Ino, plus bool, entries []*Entry) DirHandler {

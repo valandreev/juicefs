@@ -37,17 +37,15 @@ Assumptions / open questions
 
 ### Phase 0 – Test scaffolding bootstrap
 
-- ✅ **Shared redis-like harness.** Added `pkg/meta/redis_like_test.go` providing `forEachRedisLike` and swapped `TestRedisClient` plus `TestLoadDump` to consume it (skipping unsupported schemes for now). Lock tests now use portable `F_*` constants so they compile on Windows.
-- ✅ **Load/dump coverage.** `TestLoadDump` iterates over redis-like URIs, guaranteeing Rueidis will be exercised as soon as the driver registers.
-- ✅ **Rueidis registration test.** `pkg/meta/rueidis_test.go` now asserts that both `rueidis` and `ruediss` appear in `metaDrivers`; this is the sentinel that keeps Phase 1 honest.
-- ⏳ **Driver smoke runs.** Pending: once a Rueidis-backed client is functional, extend `JFS_TEST_REDIS_URIS` defaults to add rueidis endpoints while gracefully skipping when the backend is offline.
+ ✅ `doReadlink`
+ ✅ `doTruncate`
 
 ### Phase 1 – Driver skeleton & connection plumbing
 
 1. **Implementation (minimal):**
    - ✅ `pkg/meta/rueidis.go` now defines a dedicated `rueidisMeta` wrapper that registers the Rueidis schemes, instantiates a Rueidis client via `rueidis.ParseURL` / `rueidis.NewClient`, and resets the embedded engine pointer so background jobs route through the new type.
    - 🔜 Swap the temporary delegation to go-redis for Rueidis-backed command execution by introducing a compatibility layer (likely via helper interfaces mirroring the subset of go-redis we consume).
-   - ✅ A `rueidiscompat.NewAdapter` instance now hangs off `rueidisMeta`, wiring the first production calls (`doLoad`, `doDeleteSlice`, `doInit`, `cacheACLs`, `getSession`, `GetSession`, `ListSessions`, `doNewSession`, `cleanupLegacies`, `cleanupLeakedChunks`, `cleanupOldSliceRefs`, `cleanupLeakedInodes`, `doCleanupDetachedNode`, `doFindDetachedNodes`, `doAttachDirNode`, `doTouchAtime`, `doSetFacl`, `doGetFacl`, `loadDumpedACLs`, `doFindDeletedFiles`, `doCleanupDelayedSlices`, `doCleanupSlices`, `doCleanStaleSession`, `fillAttr`, `doReaddir`, `doLookup`, `doGetAttr`, `getCounter`, `incrCounter`, `newDirHandler`) through Rueidis while keeping unported paths on the embedded go-redis engine.
+   - ✅ A `rueidiscompat.NewAdapter` instance now hangs off `rueidisMeta`, wiring the first production calls (`doLoad`, `doDeleteSlice`, `doInit`, `cacheACLs`, `getSession`, `GetSession`, `ListSessions`, `doNewSession`, `cleanupLegacies`, `cleanupLeakedChunks`, `cleanupOldSliceRefs`, `cleanupLeakedInodes`, `doCleanupDetachedNode`, `doFindDetachedNodes`, `doAttachDirNode`, `doTouchAtime`, `doSetFacl`, `doGetFacl`, `loadDumpedACLs`, `doFindDeletedFiles`, `doCleanupDelayedSlices`, `doCleanupSlices`, `doCleanStaleSession`, `fillAttr`, `doReaddir`, `doLookup`, `doGetAttr`, `doSetAttr`, `getCounter`, `incrCounter`, `newDirHandler`) through Rueidis while keeping unported paths on the embedded go-redis engine.
    - ✅ `doCleanupDelayedSlices` now uses Rueidis `Watch` + pipelined decrements, mirroring the Redis behaviour while respecting context deadlines.
    - ✅ `doCleanupSlices` now iterates via Rueidis `HSCAN`, deleting negative refs and invoking the Rueidis-backed `cleanupZeroRef`.
    - ✅ `cleanupLeakedChunks` now scans chunk keys via Rueidis `SCAN`, pipelining `EXISTS` checks and deleting orphaned chunks when requested.
