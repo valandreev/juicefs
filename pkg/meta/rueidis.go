@@ -265,6 +265,23 @@ func (m *rueidisMeta) cacheACLs(ctx Context) error {
 	return nil
 }
 
+func (m *rueidisMeta) Reset() error {
+	if m.compat == nil {
+		return m.redisMeta.Reset()
+	}
+
+	ctx := Background()
+	if m.prefix != "" {
+		return m.scan(ctx, "*", func(keys []string) error {
+			if len(keys) == 0 {
+				return nil
+			}
+			return m.compat.Del(ctx, keys...).Err()
+		})
+	}
+	return m.compat.FlushDB(ctx).Err()
+}
+
 func (m *rueidisMeta) getSession(sid string, detail bool) (*Session, error) {
 	if m.compat == nil {
 		return m.redisMeta.getSession(sid, detail)
