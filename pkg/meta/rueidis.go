@@ -1934,6 +1934,616 @@ func (m *rueidisMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr,
 	return errno(err)
 }
 
+func (m *rueidisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode, tInode *Ino, attr, tAttr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doRename(ctx, parentSrc, nameSrc, parentDst, nameDst, flags, inode, tInode, attr, tAttr)
+	}
+
+	exchange := flags == RenameExchange
+	var opened bool
+	var trash, dino Ino
+	var dtyp uint8
+	var tattr Attr
+	var newSpace, newInode int64
+	keys := []string{m.inodeKey(parentSrc), m.entryKey(parentSrc), m.inodeKey(parentDst), m.entryKey(parentDst)}
+	if parentSrc.IsTrash() {
+		keys[0], keys[2] = keys[2], keys[0]
+	}
+
+	var ino Ino
+	var typ uint8
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		opened = false
+		dino, dtyp = 0, 0
+		tattr = Attr{}
+		newSpace, newInode = 0, 0
+
+		buf, err := tx.HGet(ctx, m.entryKey(parentSrc), nameSrc).Bytes()
+		if err == rueidiscompat.Nil && m.conf.CaseInsensi {
+			if e := m.resolveCase(ctx, parentSrc, nameSrc); e != nil {
+				nameSrc = string(e.Name)
+				buf = m.packEntry(e.Attr.Typ, e.Inode)
+				err = nil
+			}
+		}
+		if err != nil {
+			return err
+		}
+
+		typ, ino = m.parseEntry(buf)
+		if parentSrc == parentDst && nameSrc == nameDst {
+			if inode != nil {
+				*inode = ino
+			}
+			return nil
+		}
+
+		watchKeys := []string{m.inodeKey(ino)}
+		dbuf, err := tx.HGet(ctx, m.entryKey(parentDst), nameDst).Bytes()
+		if err == rueidiscompat.Nil && m.conf.CaseInsensi {
+			if e := m.resolveCase(ctx, parentDst, nameDst); e != nil {
+				if nameSrc != string(e.Name) || parentDst != parentSrc {
+					nameDst = string(e.Name)
+					dbuf = m.packEntry(e.Attr.Typ, e.Inode)
+					err = nil
+				}
+			}
+		}
+		if err != nil && err != rueidiscompat.Nil {
+			return err
+		}
+		if err == nil {
+			if flags&RenameNoReplace != 0 {
+				return syscall.EEXIST
+			}
+			dtyp, dino = m.parseEntry(dbuf)
+			watchKeys = append(watchKeys, m.inodeKey(dino))
+			if dtyp == TypeDirectory {
+				watchKeys = append(watchKeys, m.entryKey(dino))
+			}
+			if !exchange {
+				if st := m.checkTrash(parentDst, &trash); st != 0 {
+					return st
+				}
+			}
+		}
+		if watchErr := tx.Watch(ctx, watchKeys...).Err(); watchErr != nil {
+			return watchErr
+		}
+		if dino > 0 {
+			if ino == dino {
+				return nil
+			}
+			if exchange {
+			} else if typ == TypeDirectory && dtyp != TypeDirectory {
+				return syscall.ENOTDIR
+			} else if typ != TypeDirectory && dtyp == TypeDirectory {
+				return syscall.EISDIR
+			}
+		}
+
+		attrKeys := []string{m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino)}
+		if dino > 0 {
+			attrKeys = append(attrKeys, m.inodeKey(dino))
+		}
+		rs, err := tx.MGet(ctx, attrKeys...).Result()
+		if err != nil {
+			return err
+		}
+		if len(rs) < 3 || rs[0] == nil || rs[1] == nil || rs[2] == nil {
+			return rueidiscompat.Nil
+		}
+
+		var sattr, dattr, iattr Attr
+		switch v := rs[0].(type) {
+		case string:
+			m.parseAttr([]byte(v), &sattr)
+		case []byte:
+			m.parseAttr(v, &sattr)
+		default:
+			return fmt.Errorf("unexpected source parent attr type %T", rs[0])
+		}
+		if sattr.Typ != TypeDirectory {
+			return syscall.ENOTDIR
+		}
+		if st := m.Access(ctx, parentSrc, MODE_MASK_W|MODE_MASK_X, &sattr); st != 0 {
+			return st
+		}
+		switch v := rs[1].(type) {
+		case string:
+			m.parseAttr([]byte(v), &dattr)
+		case []byte:
+			m.parseAttr(v, &dattr)
+		default:
+			return fmt.Errorf("unexpected dest parent attr type %T", rs[1])
+		}
+		if dattr.Typ != TypeDirectory {
+			return syscall.ENOTDIR
+		}
+		if flags&RenameRestore == 0 && dattr.Parent > TrashInode {
+			return syscall.ENOENT
+		}
+		if st := m.Access(ctx, parentDst, MODE_MASK_W|MODE_MASK_X, &dattr); st != 0 {
+			return st
+		}
+		if ino == parentDst || ino == dattr.Parent {
+			return syscall.EPERM
+		}
+		switch v := rs[2].(type) {
+		case string:
+			m.parseAttr([]byte(v), &iattr)
+		case []byte:
+			m.parseAttr(v, &iattr)
+		default:
+			return fmt.Errorf("unexpected inode attr type %T", rs[2])
+		}
+		if (sattr.Flags&FlagAppend) != 0 || (sattr.Flags&FlagImmutable) != 0 || (dattr.Flags&FlagImmutable) != 0 || (iattr.Flags&FlagAppend) != 0 || (iattr.Flags&FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
+		if parentSrc != parentDst && sattr.Mode&0o1000 != 0 && ctx.Uid() != 0 &&
+			ctx.Uid() != iattr.Uid && (ctx.Uid() != sattr.Uid || iattr.Typ == TypeDirectory) {
+			return syscall.EACCES
+		}
+
+		var supdate, dupdate bool
+		now := time.Now()
+		if dino > 0 {
+			if len(rs) < 4 || rs[3] == nil {
+				logger.Warnf("no attribute for inode %d (%d, %s)", dino, parentDst, nameDst)
+				trash = 0
+			} else {
+				switch v := rs[3].(type) {
+				case string:
+					m.parseAttr([]byte(v), &tattr)
+				case []byte:
+					m.parseAttr(v, &tattr)
+				default:
+					return fmt.Errorf("unexpected target attr type %T", rs[3])
+				}
+			}
+			if (tattr.Flags&FlagAppend) != 0 || (tattr.Flags&FlagImmutable) != 0 {
+				return syscall.EPERM
+			}
+			if (tattr.Flags & FlagSkipTrash) != 0 {
+				trash = 0
+			}
+			tattr.Ctime = now.Unix()
+			tattr.Ctimensec = uint32(now.Nanosecond())
+			if exchange {
+				if parentSrc != parentDst {
+					if dtyp == TypeDirectory {
+						tattr.Parent = parentSrc
+						dattr.Nlink--
+						sattr.Nlink++
+						supdate, dupdate = true, true
+					} else if tattr.Parent > 0 {
+						tattr.Parent = parentSrc
+					}
+				}
+			} else {
+				if dtyp == TypeDirectory {
+					cnt, err := tx.HLen(ctx, m.entryKey(dino)).Result()
+					if err != nil {
+						return err
+					}
+					if cnt != 0 {
+						return syscall.ENOTEMPTY
+					}
+					dattr.Nlink--
+					dupdate = true
+					if trash > 0 {
+						tattr.Parent = trash
+					}
+				} else {
+					if trash == 0 {
+						tattr.Nlink--
+						if dtyp == TypeFile && tattr.Nlink == 0 {
+							opened = m.of.IsOpen(dino)
+						}
+						defer func() { m.of.InvalidateChunk(dino, invalidateAttrOnly) }()
+					} else if tattr.Parent > 0 {
+						tattr.Parent = trash
+					}
+				}
+			}
+			if ctx.Uid() != 0 && dattr.Mode&01000 != 0 && ctx.Uid() != dattr.Uid && ctx.Uid() != tattr.Uid {
+				return syscall.EACCES
+			}
+		} else if exchange {
+			return syscall.ENOENT
+		}
+		if ctx.Uid() != 0 && sattr.Mode&01000 != 0 && ctx.Uid() != sattr.Uid && ctx.Uid() != iattr.Uid {
+			return syscall.EACCES
+		}
+
+		if parentSrc != parentDst {
+			if typ == TypeDirectory {
+				iattr.Parent = parentDst
+				sattr.Nlink--
+				dattr.Nlink++
+				supdate, dupdate = true, true
+			} else if iattr.Parent > 0 {
+				iattr.Parent = parentDst
+			}
+		}
+		if supdate || now.Sub(time.Unix(sattr.Mtime, int64(sattr.Mtimensec))) >= m.conf.SkipDirMtime {
+			sattr.Mtime = now.Unix()
+			sattr.Mtimensec = uint32(now.Nanosecond())
+			sattr.Ctime = now.Unix()
+			sattr.Ctimensec = uint32(now.Nanosecond())
+			supdate = true
+		}
+		if dupdate || now.Sub(time.Unix(dattr.Mtime, int64(dattr.Mtimensec))) >= m.conf.SkipDirMtime {
+			dattr.Mtime = now.Unix()
+			dattr.Mtimensec = uint32(now.Nanosecond())
+			dattr.Ctime = now.Unix()
+			dattr.Ctimensec = uint32(now.Nanosecond())
+			dupdate = true
+		}
+		iattr.Ctime = now.Unix()
+		iattr.Ctimensec = uint32(now.Nanosecond())
+		if inode != nil {
+			*inode = ino
+		}
+		if attr != nil {
+			*attr = iattr
+		}
+		if dino > 0 {
+			if tInode != nil {
+				*tInode = dino
+			}
+			if tAttr != nil {
+				*tAttr = tattr
+			}
+		}
+
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			if exchange {
+				pipe.Set(ctx, m.inodeKey(dino), m.marshal(&tattr), 0)
+				pipe.HSet(ctx, m.entryKey(parentSrc), nameSrc, dbuf)
+				if parentSrc != parentDst && tattr.Parent == 0 {
+					pipe.HIncrBy(ctx, m.parentKey(dino), parentSrc.String(), 1)
+					pipe.HIncrBy(ctx, m.parentKey(dino), parentDst.String(), -1)
+				}
+			} else {
+				pipe.HDel(ctx, m.entryKey(parentSrc), nameSrc)
+				if dino > 0 {
+					if trash > 0 {
+						pipe.Set(ctx, m.inodeKey(dino), m.marshal(&tattr), 0)
+						pipe.HSet(ctx, m.entryKey(trash), m.trashEntry(parentDst, dino, nameDst), dbuf)
+						if tattr.Parent == 0 {
+							pipe.HIncrBy(ctx, m.parentKey(dino), trash.String(), 1)
+							pipe.HIncrBy(ctx, m.parentKey(dino), parentDst.String(), -1)
+						}
+					} else if dtyp != TypeDirectory && tattr.Nlink > 0 {
+						pipe.Set(ctx, m.inodeKey(dino), m.marshal(&tattr), 0)
+						if tattr.Parent == 0 {
+							pipe.HIncrBy(ctx, m.parentKey(dino), parentDst.String(), -1)
+						}
+					} else {
+						if dtyp == TypeFile {
+							if opened {
+								pipe.Set(ctx, m.inodeKey(dino), m.marshal(&tattr), 0)
+								pipe.SAdd(ctx, m.sustained(m.sid), strconv.Itoa(int(dino)))
+							} else {
+								pipe.ZAdd(ctx, m.delfiles(), rueidiscompat.Z{Score: float64(now.Unix()), Member: m.toDelete(dino, tattr.Length)})
+								pipe.Del(ctx, m.inodeKey(dino))
+								newSpace, newInode = -align4K(tattr.Length), -1
+								pipe.IncrBy(ctx, m.usedSpaceKey(), newSpace)
+								pipe.Decr(ctx, m.totalInodesKey())
+							}
+						} else {
+							if dtyp == TypeSymlink {
+								pipe.Del(ctx, m.symKey(dino))
+							}
+							pipe.Del(ctx, m.inodeKey(dino))
+							newSpace, newInode = -align4K(0), -1
+							pipe.IncrBy(ctx, m.usedSpaceKey(), newSpace)
+							pipe.Decr(ctx, m.totalInodesKey())
+						}
+						pipe.Del(ctx, m.xattrKey(dino))
+						if tattr.Parent == 0 {
+							pipe.Del(ctx, m.parentKey(dino))
+						}
+					}
+					if dtyp == TypeDirectory {
+						field := dino.String()
+						pipe.HDel(ctx, m.dirQuotaKey(), field)
+						pipe.HDel(ctx, m.dirQuotaUsedSpaceKey(), field)
+						pipe.HDel(ctx, m.dirQuotaUsedInodesKey(), field)
+					}
+				}
+			}
+			if parentDst != parentSrc {
+				if !parentSrc.IsTrash() && supdate {
+					pipe.Set(ctx, m.inodeKey(parentSrc), m.marshal(&sattr), 0)
+				}
+				if iattr.Parent == 0 {
+					pipe.HIncrBy(ctx, m.parentKey(ino), parentDst.String(), 1)
+					pipe.HIncrBy(ctx, m.parentKey(ino), parentSrc.String(), -1)
+				}
+			}
+			pipe.Set(ctx, m.inodeKey(ino), m.marshal(&iattr), 0)
+			pipe.HSet(ctx, m.entryKey(parentDst), nameDst, buf)
+			if dupdate {
+				pipe.Set(ctx, m.inodeKey(parentDst), m.marshal(&dattr), 0)
+			}
+			return nil
+		})
+		return err
+	}, keys...)
+	if err == nil && !exchange && trash == 0 {
+		if dino > 0 && dtyp == TypeFile && tattr.Nlink == 0 {
+			m.fileDeleted(opened, false, dino, tattr.Length)
+		}
+		m.updateStats(newSpace, newInode)
+	}
+	return errno(err)
+}
+
+func (m *rueidisMeta) doLink(ctx Context, inode, parent Ino, name string, attr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doLink(ctx, inode, parent, name, attr)
+	}
+
+	var newSpace, newInode int64
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		newSpace, newInode = 0, 0
+
+		rs, err := tx.MGet(ctx, m.inodeKey(parent), m.inodeKey(inode)).Result()
+		if err != nil {
+			return err
+		}
+		if len(rs) < 2 || rs[0] == nil || rs[1] == nil {
+			return rueidiscompat.Nil
+		}
+
+		var pattr, iattr Attr
+		switch v := rs[0].(type) {
+		case string:
+			m.parseAttr([]byte(v), &pattr)
+		case []byte:
+			m.parseAttr(v, &pattr)
+		default:
+			return fmt.Errorf("unexpected parent attr type %T", rs[0])
+		}
+		if pattr.Typ != TypeDirectory {
+			return syscall.ENOTDIR
+		}
+		if pattr.Parent > TrashInode {
+			return syscall.ENOENT
+		}
+		if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
+			return st
+		}
+		if (pattr.Flags & FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
+
+		if err := tx.Watch(ctx, m.entryKey(parent)).Err(); err != nil {
+			return err
+		}
+
+		switch v := rs[1].(type) {
+		case string:
+			m.parseAttr([]byte(v), &iattr)
+		case []byte:
+			m.parseAttr(v, &iattr)
+		default:
+			return fmt.Errorf("unexpected inode attr type %T", rs[1])
+		}
+		if iattr.Typ == TypeDirectory {
+			return syscall.EPERM
+		}
+		if (iattr.Flags&FlagAppend) != 0 || (iattr.Flags&FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
+
+		now := time.Now()
+		var updateParent bool
+		if now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= m.conf.SkipDirMtime {
+			pattr.Mtime = now.Unix()
+			pattr.Mtimensec = uint32(now.Nanosecond())
+			pattr.Ctime = now.Unix()
+			pattr.Ctimensec = uint32(now.Nanosecond())
+			updateParent = true
+		}
+
+		oldParent := iattr.Parent
+		iattr.Parent = 0
+		iattr.Ctime = now.Unix()
+		iattr.Ctimensec = uint32(now.Nanosecond())
+		iattr.Nlink++
+
+		if err := tx.HGet(ctx, m.entryKey(parent), name).Err(); err != nil {
+			if err != rueidiscompat.Nil {
+				return err
+			}
+			if m.conf.CaseInsensi && m.resolveCase(ctx, parent, name) != nil {
+				return syscall.EEXIST
+			}
+		} else {
+			return syscall.EEXIST
+		}
+
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.HSet(ctx, m.entryKey(parent), name, m.packEntry(iattr.Typ, inode))
+			if updateParent {
+				pipe.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
+			}
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(&iattr), 0)
+			if oldParent > 0 {
+				pipe.HIncrBy(ctx, m.parentKey(inode), oldParent.String(), 1)
+			}
+			pipe.HIncrBy(ctx, m.parentKey(inode), parent.String(), 1)
+			return nil
+		})
+		if err == nil && attr != nil {
+			*attr = iattr
+		}
+		return err
+	}, m.inodeKey(parent), m.entryKey(parent), m.inodeKey(inode))
+
+	if err == nil {
+		m.updateStats(newSpace, newInode)
+	}
+	return errno(err)
+}
+
+func (m *rueidisMeta) doRead(ctx Context, inode Ino, indx uint32) ([]*slice, syscall.Errno) {
+	if m.compat == nil {
+		return m.redisMeta.doRead(ctx, inode, indx)
+	}
+
+	vals, err := m.compat.LRange(ctx, m.chunkKey(inode, indx), 0, -1).Result()
+	if err != nil {
+		return nil, errno(err)
+	}
+	return readSlices(vals), 0
+}
+
+func (m *rueidisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldAttr *Attr, skipCheckTrash ...bool) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doRmdir(ctx, parent, name, pinode, oldAttr, skipCheckTrash...)
+	}
+
+	var trash Ino
+	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
+		if st := m.checkTrash(parent, &trash); st != 0 {
+			return st
+		}
+	}
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		entryBuf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
+		if err == rueidiscompat.Nil && m.conf.CaseInsensi {
+			if e := m.resolveCase(ctx, parent, name); e != nil {
+				name = string(e.Name)
+				entryBuf = m.packEntry(e.Attr.Typ, e.Inode)
+				err = nil
+			}
+		}
+		if err != nil {
+			return err
+		}
+
+		typ, inode := m.parseEntry(entryBuf)
+		if typ != TypeDirectory {
+			return syscall.ENOTDIR
+		}
+		if pinode != nil {
+			*pinode = inode
+		}
+		if watchErr := tx.Watch(ctx, m.inodeKey(inode), m.entryKey(inode)).Err(); watchErr != nil {
+			return watchErr
+		}
+
+		rs, err := tx.MGet(ctx, m.inodeKey(parent), m.inodeKey(inode)).Result()
+		if err != nil {
+			return err
+		}
+		if len(rs) < 2 || rs[0] == nil {
+			return rueidiscompat.Nil
+		}
+
+		var pattr Attr
+		switch v := rs[0].(type) {
+		case string:
+			m.parseAttr([]byte(v), &pattr)
+		case []byte:
+			m.parseAttr(v, &pattr)
+		default:
+			return fmt.Errorf("unexpected parent attr type %T", rs[0])
+		}
+		if pattr.Typ != TypeDirectory {
+			return syscall.ENOTDIR
+		}
+		if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
+			return st
+		}
+		if (pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
+
+		now := time.Now()
+		pattr.Nlink--
+		pattr.Mtime = now.Unix()
+		pattr.Mtimensec = uint32(now.Nanosecond())
+		pattr.Ctime = now.Unix()
+		pattr.Ctimensec = uint32(now.Nanosecond())
+
+		cnt, err := tx.HLen(ctx, m.entryKey(inode)).Result()
+		if err != nil {
+			return err
+		}
+		if cnt > 0 {
+			return syscall.ENOTEMPTY
+		}
+
+		var attr Attr
+		if rs[1] != nil {
+			switch v := rs[1].(type) {
+			case string:
+				m.parseAttr([]byte(v), &attr)
+			case []byte:
+				m.parseAttr(v, &attr)
+			default:
+				return fmt.Errorf("unexpected attr type %T", rs[1])
+			}
+			if oldAttr != nil {
+				*oldAttr = attr
+			}
+			if ctx.Uid() != 0 && pattr.Mode&01000 != 0 && ctx.Uid() != pattr.Uid && ctx.Uid() != attr.Uid {
+				return syscall.EACCES
+			}
+			if (attr.Flags & FlagSkipTrash) != 0 {
+				trash = 0
+			}
+			if trash > 0 {
+				attr.Ctime = now.Unix()
+				attr.Ctimensec = uint32(now.Nanosecond())
+				attr.Parent = trash
+			}
+		} else {
+			logger.Warnf("no attribute for inode %d (%d, %s)", inode, parent, name)
+			trash = 0
+		}
+
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.HDel(ctx, m.entryKey(parent), name)
+			if !parent.IsTrash() {
+				pipe.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
+			}
+			if trash > 0 {
+				pipe.Set(ctx, m.inodeKey(inode), m.marshal(&attr), 0)
+				pipe.HSet(ctx, m.entryKey(trash), m.trashEntry(parent, inode, name), entryBuf)
+			} else {
+				pipe.Del(ctx, m.inodeKey(inode))
+				pipe.Del(ctx, m.xattrKey(inode))
+				pipe.IncrBy(ctx, m.usedSpaceKey(), -align4K(0))
+				pipe.Decr(ctx, m.totalInodesKey())
+			}
+
+			field := inode.String()
+			pipe.HDel(ctx, m.dirDataLengthKey(), field)
+			pipe.HDel(ctx, m.dirUsedSpaceKey(), field)
+			pipe.HDel(ctx, m.dirUsedInodesKey(), field)
+			pipe.HDel(ctx, m.dirQuotaKey(), field)
+			pipe.HDel(ctx, m.dirQuotaUsedSpaceKey(), field)
+			pipe.HDel(ctx, m.dirQuotaUsedInodesKey(), field)
+			return nil
+		})
+		return err
+	}, m.inodeKey(parent), m.entryKey(parent))
+
+	if err == nil && trash == 0 {
+		m.updateStats(-align4K(0), -1)
+	}
+	return errno(err)
+}
+
 func (m *rueidisMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uint64, delta *dirStat, attr *Attr, skipPermCheck bool) syscall.Errno {
 	if m.compat == nil {
 		return m.redisMeta.doTruncate(ctx, inode, flags, length, delta, attr, skipPermCheck)

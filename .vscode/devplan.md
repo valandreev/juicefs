@@ -42,6 +42,10 @@ Assumptions / open questions
 ✅ `doFallocate`
 ✅ `doMknod`
 ✅ `doUnlink`
+✅ `doRmdir`
+✅ `doRename`
+✅ `doLink`
+✅ `doRead`
 
 ### Phase 1 – Driver skeleton & connection plumbing
 
