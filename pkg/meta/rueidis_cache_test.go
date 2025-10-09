@@ -13,8 +13,26 @@ func TestRueidisDefaultCacheTTL(t *testing.T) {
 	}
 
 	rm := m.(*rueidisMeta)
-	if rm.cacheTTL != 100*time.Millisecond {
-		t.Errorf("Expected default cache TTL to be 100ms, got %v", rm.cacheTTL)
+	expectedTTL := 14 * 24 * time.Hour // 2 weeks
+	if rm.cacheTTL != expectedTTL {
+		t.Errorf("Expected default cache TTL to be 2 weeks (%v), got %v", expectedTTL, rm.cacheTTL)
+	}
+
+	// Verify broadcast mode is enabled
+	if len(rm.option.ClientTrackingOptions) == 0 {
+		t.Error("Expected ClientTrackingOptions to be configured for broadcast mode")
+	}
+
+	// Check for BCAST option
+	hasBcast := false
+	for _, opt := range rm.option.ClientTrackingOptions {
+		if opt == "BCAST" {
+			hasBcast = true
+			break
+		}
+	}
+	if !hasBcast {
+		t.Error("Expected BCAST option in ClientTrackingOptions")
 	}
 }
 
@@ -28,5 +46,17 @@ func TestRueidisCustomCacheTTL(t *testing.T) {
 	rm := m.(*rueidisMeta)
 	if rm.cacheTTL != 5*time.Second {
 		t.Errorf("Expected cache TTL to be 5s, got %v", rm.cacheTTL)
+	}
+
+	// Broadcast mode should still be enabled even with custom TTL
+	hasBcast := false
+	for _, opt := range rm.option.ClientTrackingOptions {
+		if opt == "BCAST" {
+			hasBcast = true
+			break
+		}
+	}
+	if !hasBcast {
+		t.Error("Expected BCAST option in ClientTrackingOptions even with custom TTL")
 	}
 }

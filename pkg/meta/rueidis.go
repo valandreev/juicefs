@@ -52,7 +52,8 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	uri := canonical + "://" + addr
 
 	// Parse and extract cache-ttl query parameter before passing to rueidis.ParseURL
-	cacheTTL := 100 * time.Millisecond
+	// Default: 2 weeks (effectively infinite with server-assisted invalidation)
+	cacheTTL := 14 * 24 * time.Hour
 	cleanAddr := addr
 	if u, err := url.Parse(uri); err == nil {
 		if ttlStr := u.Query().Get("cache-ttl"); ttlStr != "" {
@@ -85,6 +86,23 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	base, ok := delegate.(*redisMeta)
 	if !ok {
 		return nil, fmt.Errorf("unexpected meta implementation %T", delegate)
+	}
+
+	// Enable server-assisted client-side caching with broadcast mode
+	// This enables automatic cache invalidation when keys change on the server
+	// We track all keys with the metadata prefix to ensure proper invalidation
+	prefix := base.prefix
+	if prefix == "" {
+		prefix = "jfs"
+	}
+	opt.ClientTrackingOptions = []string{
+		"PREFIX", prefix + "i", // inode keys
+		"PREFIX", prefix + "d", // directory entry keys
+		"PREFIX", prefix + "c", // chunk keys
+		"PREFIX", prefix + "x", // xattr keys
+		"PREFIX", prefix + "p", // parent keys
+		"PREFIX", prefix + "s", // symlink keys
+		"BCAST", // broadcast mode - automatic invalidation notifications
 	}
 
 	client, err := rueidis.NewClient(opt)
