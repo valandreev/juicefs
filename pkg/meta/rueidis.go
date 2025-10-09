@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
 	pkgerrors "github.com/pkg/errors"
@@ -98,6 +99,109 @@ func (m *rueidisMeta) Shutdown() error {
 		m.client.Close()
 	}
 	return m.redisMeta.Shutdown()
+}
+
+func (m *rueidisMeta) doFlushStats() {}
+
+func (m *rueidisMeta) doSyncVolumeStat(ctx Context) error {
+	if m.compat == nil {
+		return m.redisMeta.doSyncVolumeStat(ctx)
+	}
+
+	if m.conf.ReadOnly {
+		return syscall.EROFS
+	}
+
+	var used, inodes int64
+	if err := m.hscan(ctx, m.dirUsedSpaceKey(), func(keys []string) error {
+		for i := 0; i < len(keys); i += 2 {
+			v, err := strconv.ParseInt(keys[i+1], 10, 64)
+			if err != nil {
+				logger.Warnf("invalid used space: %s->%s", keys[i], keys[i+1])
+				continue
+			}
+			used += v
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := m.hscan(ctx, m.dirUsedInodesKey(), func(keys []string) error {
+		for i := 0; i < len(keys); i += 2 {
+			v, err := strconv.ParseInt(keys[i+1], 10, 64)
+			if err != nil {
+				logger.Warnf("invalid used inode: %s->%s", keys[i], keys[i+1])
+				continue
+			}
+			inodes += v
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	var inoKeys []string
+	if err := m.scan(ctx, m.prefix+"session*", func(keys []string) error {
+		for i := 0; i < len(keys); i += 2 {
+			key := keys[i]
+			if key == "sessions" {
+				continue
+			}
+
+			sustInodes, err := m.compat.SMembers(ctx, key).Result()
+			if err != nil {
+				logger.Warnf("SMembers %s: %v", key, err)
+				continue
+			}
+			for _, sinode := range sustInodes {
+				ino, err := strconv.ParseInt(sinode, 10, 64)
+				if err != nil {
+					logger.Warnf("invalid sustained: %s->%s", key, sinode)
+					continue
+				}
+				inoKeys = append(inoKeys, m.inodeKey(Ino(ino)))
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	batch := 1000
+	for i := 0; i < len(inoKeys); i += batch {
+		end := i + batch
+		if end > len(inoKeys) {
+			end = len(inoKeys)
+		}
+		values, err := m.compat.MGet(ctx, inoKeys[i:end]...).Result()
+		if err != nil {
+			return err
+		}
+		var attr Attr
+		for _, v := range values {
+			if v != nil {
+				if s, ok := v.(string); ok {
+					m.parseAttr([]byte(s), &attr)
+					used += align4K(attr.Length)
+					inodes += 1
+				}
+			}
+		}
+	}
+
+	if err := m.scanTrashEntry(ctx, func(_ Ino, length uint64) {
+		used += align4K(length)
+		inodes += 1
+	}); err != nil {
+		return err
+	}
+
+	logger.Debugf("Used space: %s, inodes: %d", humanize.IBytes(uint64(used)), inodes)
+	if err := m.compat.Set(ctx, m.totalInodesKey(), strconv.FormatInt(inodes, 10), 0).Err(); err != nil {
+		return fmt.Errorf("set total inodes: %w", err)
+	}
+	return m.compat.Set(ctx, m.usedSpaceKey(), strconv.FormatInt(used, 10), 0).Err()
 }
 
 func (m *rueidisMeta) doDeleteSlice(id uint64, size uint32) error {
@@ -1209,6 +1313,137 @@ func (m *rueidisMeta) scanPendingFiles(ctx Context, scan pendingFileScan) error 
 	}
 
 	return nil
+}
+
+func (m *rueidisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, originAttr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doCloneEntry(ctx, srcIno, parent, name, ino, originAttr, cmode, cumask, top)
+	}
+
+	return errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		a, err := tx.Get(ctx, m.inodeKey(srcIno)).Bytes()
+		if err != nil {
+			return err
+		}
+		m.parseAttr(a, originAttr)
+		attr := *originAttr
+		if eno := m.Access(ctx, srcIno, MODE_MASK_R, &attr); eno != 0 {
+			return eno
+		}
+		attr.Parent = parent
+		now := time.Now()
+		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
+			attr.Uid = ctx.Uid()
+			attr.Gid = ctx.Gid()
+			attr.Mode &= ^cumask
+			attr.Atime = now.Unix()
+			attr.Mtime = now.Unix()
+			attr.Ctime = now.Unix()
+			attr.Atimensec = uint32(now.Nanosecond())
+			attr.Mtimensec = uint32(now.Nanosecond())
+			attr.Ctimensec = uint32(now.Nanosecond())
+		}
+		// TODO: preserve hardlink
+		if attr.Typ == TypeFile && attr.Nlink > 1 {
+			attr.Nlink = 1
+		}
+		srcXattr, err := tx.HGetAll(ctx, m.xattrKey(srcIno)).Result()
+		if err != nil {
+			return err
+		}
+
+		var pattr Attr
+		if top {
+			if a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes(); err != nil {
+				return err
+			} else {
+				m.parseAttr(a, &pattr)
+			}
+			if pattr.Typ != TypeDirectory {
+				return syscall.ENOTDIR
+			}
+			if (pattr.Flags & FlagImmutable) != 0 {
+				return syscall.EPERM
+			}
+			if exist, err := tx.HExists(ctx, m.entryKey(parent), name).Result(); err != nil {
+				return err
+			} else if exist {
+				return syscall.EEXIST
+			}
+			if eno := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); eno != 0 {
+				return eno
+			}
+		}
+
+		_, err = tx.TxPipelined(ctx, func(p rueidiscompat.Pipeliner) error {
+			p.Set(ctx, m.inodeKey(ino), m.marshal(&attr), 0)
+			p.IncrBy(ctx, m.usedSpaceKey(), align4K(attr.Length))
+			p.Incr(ctx, m.totalInodesKey())
+			if len(srcXattr) > 0 {
+				p.HMSet(ctx, m.xattrKey(ino), srcXattr)
+			}
+			if top && attr.Typ == TypeDirectory {
+				p.ZAdd(ctx, m.detachedNodes(), rueidiscompat.Z{Member: ino.String(), Score: float64(time.Now().Unix())})
+			} else {
+				p.HSet(ctx, m.entryKey(parent), name, m.packEntry(attr.Typ, ino))
+				if top {
+					now := time.Now()
+					pattr.Mtime = now.Unix()
+					pattr.Mtimensec = uint32(now.Nanosecond())
+					pattr.Ctime = now.Unix()
+					pattr.Ctimensec = uint32(now.Nanosecond())
+					p.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
+				}
+			}
+
+			switch attr.Typ {
+			case TypeDirectory:
+				sfield := srcIno.String()
+				field := ino.String()
+				if v, err := tx.HGet(ctx, m.dirUsedInodesKey(), sfield).Result(); err == nil {
+					p.HSet(ctx, m.dirUsedInodesKey(), field, v)
+					p.HSet(ctx, m.dirDataLengthKey(), field, tx.HGet(ctx, m.dirDataLengthKey(), sfield).Val())
+					p.HSet(ctx, m.dirUsedSpaceKey(), field, tx.HGet(ctx, m.dirUsedSpaceKey(), sfield).Val())
+				}
+			case TypeFile:
+				// copy chunks
+				if attr.Length != 0 {
+					var vals [][]string
+					for i := 0; i <= int(attr.Length/ChunkSize); i++ {
+						val, err := tx.LRange(ctx, m.chunkKey(srcIno, uint32(i)), 0, -1).Result()
+						if err != nil {
+							return err
+						}
+						vals = append(vals, val)
+					}
+
+					for i, sv := range vals {
+						if len(sv) == 0 {
+							continue
+						}
+						ss := readSlices(sv)
+						if ss == nil {
+							return syscall.EIO
+						}
+						p.RPush(ctx, m.chunkKey(ino, uint32(i)), sv)
+						for _, s := range ss {
+							if s.id > 0 {
+								p.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.id, s.size), 1)
+							}
+						}
+					}
+				}
+			case TypeSymlink:
+				path, err := tx.Get(ctx, m.symKey(srcIno)).Result()
+				if err != nil {
+					return err
+				}
+				p.Set(ctx, m.symKey(ino), path, 0)
+			}
+			return nil
+		})
+		return err
+	}, m.inodeKey(srcIno), m.xattrKey(srcIno)))
 }
 
 func (m *rueidisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
