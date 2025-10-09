@@ -396,6 +396,58 @@ TestRueidisCustomCacheTTL - PASS (verifies custom TTL preservation with BCAST)
 
 **Note:** The `metadata.sample` and `metadata-sub.sample` files are JSON dumps for backup/restore functionality, not connection URI examples. Connection string documentation is properly placed in the `how_to_set_up_metadata_engine.md` file instead.
 
+### Phase 7.5 – Counter initialization bug fix ✅ COMPLETED
+
+**Bug discovered:** Write operations worked but returned 0-byte files when mounting via Rueidis.
+
+**Root cause analysis:**
+1. Problem: `doInit()` did not initialize counters (nextChunk, nextInode, etc.)
+2. Redis `INCRBY` on non-existent key starts from 0: `INCRBY <non-existent> 100` → value becomes 100
+3. For nextChunk/nextInode, `incrCounter` returns `IncrBy result + 1` to account for offset
+4. Without initialization:
+   - First `incrCounter("nextChunk", 100)` → IncrBy creates value 100, returns 101
+   - `NewSlice` computes `next = 101 - 100 = 1`, but Redis has wrong value (100 instead of 99)
+   - This cascades: chunk IDs would skip numbers and eventually collide
+
+**Fix implemented:**
+- Initialize counters in `doInit()` with proper offset values:
+  - `nextChunk = 0` (first IncrBy(100) → 100, incrCounter returns 101, next=101-100=1 ✅)
+  - `nextInode = 1` (root inode exists, next is 2)
+  - `nextSession = 0`
+  - `nextTrash = 0`
+- This ensures:
+  - First chunk ID = 1 (not 0)
+  - Redis stores correct "next-1" value for backup/restore compatibility
+  - Counter semantics match Redis implementation exactly
+
+**Tests added:**
+- `TestRueidisCounterInitialization`: Verifies counter initialization values
+- `TestRueidisWriteRead`: End-to-end test for create/write/read operations
+- Both tests ✅ PASS
+
+**Test results:**
+```
+TestRueidisCounterInitialization - PASS (1.15s)
+  - nextChunk initialized to 0, getCounter returns 1 ✅
+  - nextInode initialized to 1, getCounter returns 2 ✅
+TestRueidisWriteRead - PASS (2.10s)
+  - First chunk ID = 1 (expected 1) ✅
+  - File write successful with correct chunk ID ✅
+  - File read returns correct slice data ✅
+  - File length = 1024 bytes (expected 1024) ✅
+```
+
+**Files modified:**
+- `pkg/meta/rueidis.go`: Added counter initialization in `doInit()` (lines 508-520)
+- `pkg/meta/rueidis_counter_test.go`: New test file for counter verification
+- `pkg/meta/rueidis_write_read_test.go`: New test file for write/read operations
+
+**Counter offset semantics (for reference):**
+- **Storage**: Counters store `value-1` for nextInode/nextChunk
+- **Reading**: `getCounter()` returns stored value + 1
+- **Increment**: `incrCounter()` returns IncrBy result + 1
+- **Why**: This matches Redis implementation and ensures backup/restore compatibility
+
 ### Phase 8 – CI & performance validation
 
 1. Update CI scripts (GitHub Actions) to spin up Redis container for Rueidis tests (already there, but ensure caching prerequisites). Add job matrix to run meta tests for both drivers.

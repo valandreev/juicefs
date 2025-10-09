@@ -510,6 +510,22 @@ func (m *rueidisMeta) doInit(format *Format, force bool) error {
 		return nil
 	}
 
+	// Initialize counters with proper offset values
+	// For nextInode and nextChunk, we store value-1 because incrCounter returns IncrBy+1
+	// Root inode (1) exists, so nextInode starts at 2, stored as 2-1=1
+	// First chunk should be ID 1, so after first IncrBy(100), we want value 100 stored (not 99)
+	// This means we initialize to 0 (not -1), so IncrBy(0+100)=100, incrCounter returns 101
+	// Then NewSlice: next = 101-100 = 1, maxid = 101
+	pipe := m.compat.Pipeline()
+	ctx2 := Background()
+	pipe.Set(ctx2, m.counterKey("nextInode"), 1, 0)   // Root inode (1) exists, next is 2
+	pipe.Set(ctx2, m.counterKey("nextChunk"), 0, 0)   // First chunk will be 1
+	pipe.Set(ctx2, m.counterKey("nextSession"), 0, 0) // No sessions yet
+	pipe.Set(ctx2, m.counterKey("nextTrash"), 0, 0)   // No trash entries yet
+	if _, err := pipe.Exec(ctx2); err != nil {
+		return err
+	}
+
 	// Create root inode
 	attr.Mode = 0777
 	return m.compat.Set(ctx, m.inodeKey(1), m.marshal(attr), 0).Err()

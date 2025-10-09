@@ -21,6 +21,8 @@ Target: help an AI coding agent be productive immediately when editing JuiceFS (
 
     This ensures the WinFsp fuse headers are found for cgo when compiling the Windows FUSE client.
 
+    NOTE (canonical): Always use the command above verbatim when compiling on Windows. Do not modify or reorder the parts of this command.
+
 - Project-specific conventions
   - Metadata engine implementations must satisfy the `Meta` interface from `pkg/meta/interface.go`. Look for `Init`, `Load`, `Reset`, session management, and background jobs.
   - Background jobs and long-running goroutines are common (e.g., sessions, cleanup). Respect `Config.NoBGJob` and heartbeat settings in `pkg/meta/config.go` when writing tests or background logic.
