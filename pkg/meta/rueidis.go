@@ -446,6 +446,28 @@ func (m *rueidisMeta) doFindStaleSessions(limit int) ([]uint64, error) {
 	return sids, nil
 }
 
+func (m *rueidisMeta) doRefreshSession() error {
+	if m.compat == nil {
+		return m.redisMeta.doRefreshSession()
+	}
+
+	ctx := Background()
+	ssid := strconv.FormatUint(m.sid, 10)
+	ok, err := m.compat.HExists(ctx, m.sessionInfos(), ssid).Result()
+	if err == nil && !ok {
+		logger.Warnf("Session %d was stale and cleaned up, but now it comes back again", m.sid)
+		err = m.compat.HSet(ctx, m.sessionInfos(), m.sid, m.newSessionInfo()).Err()
+	}
+	if err != nil {
+		return err
+	}
+
+	return m.compat.ZAdd(ctx, m.allSessions(), rueidiscompat.Z{
+		Score:  float64(m.expireTime()),
+		Member: ssid,
+	}).Err()
+}
+
 func (m *rueidisMeta) doNewSession(sinfo []byte, update bool) error {
 	if m.compat == nil {
 		return m.redisMeta.doNewSession(sinfo, update)

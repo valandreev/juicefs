@@ -72,6 +72,7 @@ Assumptions / open questions
 ✅ `setIfSmall`
 ✅ `doCleanStaleSession`
 ✅ `doFindStaleSessions`
+✅ `doRefreshSession`
 ✅ `doDeleteSustainedInode`
 
 ### Phase 1 – Driver skeleton & connection plumbing
