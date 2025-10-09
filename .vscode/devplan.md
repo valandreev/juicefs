@@ -55,6 +55,19 @@ Assumptions / open questions
 ✅ `doFindDeletedFiles`
 ✅ `deleteChunk`
 ✅ `doDeleteFileData`
+✅ `doCompactChunk`
+✅ `scanAllChunks`
+✅ `doRepair`
+✅ `GetXattr`
+✅ `ListXattr`
+✅ `doSetXattr`
+✅ `doRemoveXattr`
+✅ `doGetQuota`
+✅ `doSetQuota`
+✅ `doDelQuota`
+✅ `doLoadQuotas`
+✅ `doFlushQuotas`
+✅ `setIfSmall`
 
 ### Phase 1 – Driver skeleton & connection plumbing
 

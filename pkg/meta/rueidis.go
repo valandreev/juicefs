@@ -152,6 +152,35 @@ func (m *rueidisMeta) incrCounter(name string, value int64) (int64, error) {
 	return v, nil
 }
 
+func (m *rueidisMeta) setIfSmall(name string, value, diff int64) (bool, error) {
+	if m.compat == nil {
+		return m.redisMeta.setIfSmall(name, value, diff)
+	}
+
+	ctx := Background()
+	name = m.prefix + name
+	ctx = ctx.WithValue(txMethodKey{}, "setIfSmall:"+name)
+	var changed bool
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		changed = false
+		old, err := tx.Get(ctx, name).Int64()
+		if err != nil && err != rueidiscompat.Nil {
+			return err
+		}
+		if old > value-diff {
+			return nil
+		}
+		changed = true
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Set(ctx, name, value, 0)
+			return nil
+		})
+		return err
+	}, name)
+
+	return changed, err
+}
+
 func (m *rueidisMeta) doInit(format *Format, force bool) error {
 	if m.compat == nil {
 		return m.redisMeta.doInit(format, force)
@@ -1484,6 +1513,471 @@ func (m *rueidisMeta) doDeleteFileData_(inode Ino, length uint64, tracking strin
 	if err := m.compat.ZRem(ctx, m.delfiles(), tracking).Err(); err != nil && err != rueidiscompat.Nil {
 		logger.Warnf("ZRem %s %s: %v", m.delfiles(), tracking, err)
 	}
+}
+
+func (m *rueidisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doCompactChunk(inode, indx, origin, ss, skipped, pos, id, size, delayed)
+	}
+
+	var rs []*rueidiscompat.IntCmd
+	if delayed == nil {
+		rs = make([]*rueidiscompat.IntCmd, len(ss))
+	}
+	key := m.chunkKey(inode, indx)
+	ctx := Background()
+	st := errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		n := len(origin) / sliceBytes
+		vals2, err := tx.LRange(ctx, key, 0, int64(n-1)).Result()
+		if err != nil {
+			return err
+		}
+		if len(vals2) != n {
+			return syscall.EINVAL
+		}
+		for i, val := range vals2 {
+			if val != string(origin[i*sliceBytes:(i+1)*sliceBytes]) {
+				return syscall.EINVAL
+			}
+		}
+
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.LTrim(ctx, key, int64(n), -1)
+			pipe.LPush(ctx, key, string(marshalSlice(pos, id, size, 0, size)))
+			for i := skipped; i > 0; i-- {
+				pipe.LPush(ctx, key, string(origin[(i-1)*sliceBytes:i*sliceBytes]))
+			}
+			pipe.HSet(ctx, m.sliceRefs(), m.sliceKey(id, size), "0")
+			if delayed != nil {
+				if len(delayed) > 0 {
+					pipe.HSet(ctx, m.delSlices(), fmt.Sprintf("%d_%d", id, time.Now().Unix()), string(delayed))
+				}
+			} else {
+				for i, s := range ss {
+					if s.id > 0 {
+						rs[i] = pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.id, s.size), -1)
+					}
+				}
+			}
+			return nil
+		})
+		return err
+	}, key))
+
+	if st != 0 && st != syscall.EINVAL {
+		if err := m.compat.HGet(ctx, m.sliceRefs(), m.sliceKey(id, size)).Err(); err == nil {
+			st = 0
+		} else if err == rueidiscompat.Nil {
+			logger.Infof("compacted chunk %d was not used", id)
+			st = syscall.EINVAL
+		}
+	}
+
+	if st == syscall.EINVAL {
+		m.compat.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(id, size), -1)
+	} else if st == 0 {
+		m.cleanupZeroRef(m.sliceKey(id, size))
+		if delayed == nil {
+			for i, s := range ss {
+				if s.id > 0 && rs[i] != nil && rs[i].Err() == nil && rs[i].Val() < 0 {
+					m.deleteSlice(s.id, s.size)
+				}
+			}
+		}
+	}
+	return st
+}
+
+func (m *rueidisMeta) scanAllChunks(ctx Context, ch chan<- cchunk, bar *utils.Bar) error {
+	if m.compat == nil {
+		return m.redisMeta.scanAllChunks(ctx, ch, bar)
+	}
+
+	pattern := m.prefix + "c*_*"
+	var cursor uint64
+	for {
+		keys, next, err := m.compat.Scan(ctx, cursor, pattern, 10000).Result()
+		if err != nil {
+			logger.Warnf("scan %s: %v", pattern, err)
+			return err
+		}
+		if len(keys) > 0 {
+			pipe := m.compat.Pipeline()
+			cmds := make([]*rueidiscompat.IntCmd, len(keys))
+			for i, key := range keys {
+				cmds[i] = pipe.LLen(ctx, key)
+			}
+			execCmds, execErr := pipe.Exec(ctx)
+			if execErr != nil {
+				for _, c := range execCmds {
+					if err := c.Err(); err != nil {
+						logger.Warnf("scan chunks pipeline error: %v", err)
+					}
+				}
+				return execErr
+			}
+			for i, cmd := range cmds {
+				cnt := cmd.Val()
+				if cnt <= 1 {
+					continue
+				}
+				var inode uint64
+				var chunkIdx uint32
+				if _, err := fmt.Sscanf(keys[i], m.prefix+"c%d_%d", &inode, &chunkIdx); err == nil {
+					bar.IncrTotal(1)
+					ch <- cchunk{Ino(inode), chunkIdx, int(cnt)}
+				}
+			}
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+	return nil
+}
+
+func (m *rueidisMeta) doRepair(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doRepair(ctx, inode, attr)
+	}
+
+	return errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		attr.Nlink = 2
+		vals, err := tx.HGetAll(ctx, m.entryKey(inode)).Result()
+		if err != nil {
+			return err
+		}
+		for _, v := range vals {
+			typ, _ := m.parseEntry([]byte(v))
+			if typ == TypeDirectory {
+				attr.Nlink++
+			}
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Set(ctx, m.inodeKey(inode), string(m.marshal(attr)), 0)
+			return nil
+		})
+		return err
+	}, m.inodeKey(inode), m.entryKey(inode)))
+}
+
+func (m *rueidisMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.GetXattr(ctx, inode, name, vbuff)
+	}
+
+	defer m.timeit("GetXattr", time.Now())
+	inode = m.checkRoot(inode)
+	val, err := m.compat.HGet(ctx, m.xattrKey(inode), name).Bytes()
+	if err == rueidiscompat.Nil {
+		return ENOATTR
+	}
+	if err != nil {
+		return errno(err)
+	}
+	*vbuff = append((*vbuff)[:0], val...)
+	return 0
+}
+
+func (m *rueidisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.ListXattr(ctx, inode, names)
+	}
+
+	defer m.timeit("ListXattr", time.Now())
+	inode = m.checkRoot(inode)
+	vals, err := m.compat.HKeys(ctx, m.xattrKey(inode)).Result()
+	if err != nil {
+		return errno(err)
+	}
+	*names = (*names)[:0]
+	for _, name := range vals {
+		*names = append(*names, name...)
+		*names = append(*names, 0)
+	}
+
+	data, err := m.compat.Get(ctx, m.inodeKey(inode)).Bytes()
+	if err != nil {
+		return errno(err)
+	}
+	attr := &Attr{}
+	m.parseAttr(data, attr)
+	setXAttrACL(names, attr.AccessACL, attr.DefaultACL)
+	return 0
+}
+
+func (m *rueidisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doSetXattr(ctx, inode, name, value, flags)
+	}
+
+	key := m.xattrKey(inode)
+	return errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		switch flags {
+		case XattrCreate:
+			ok, err := tx.HSetNX(ctx, key, name, value).Result()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return syscall.EEXIST
+			}
+			return nil
+		case XattrReplace:
+			exists, err := tx.HExists(ctx, key, name).Result()
+			if err != nil {
+				return err
+			}
+			if !exists {
+				return ENOATTR
+			}
+			_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+				pipe.HSet(ctx, key, name, value)
+				return nil
+			})
+			return err
+		default:
+			_, err := tx.HSet(ctx, key, name, value).Result()
+			return err
+		}
+	}, key))
+}
+
+func (m *rueidisMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doRemoveXattr(ctx, inode, name)
+	}
+
+	n, err := m.compat.HDel(ctx, m.xattrKey(inode), name).Result()
+	if err != nil {
+		return errno(err)
+	}
+	if n == 0 {
+		return ENOATTR
+	}
+	return 0
+}
+
+func (m *rueidisMeta) doGetQuota(ctx Context, qtype uint32, key uint64) (*Quota, error) {
+	if m.compat == nil {
+		return m.redisMeta.doGetQuota(ctx, qtype, key)
+	}
+
+	config, err := m.redisMeta.getQuotaKeys(qtype)
+	if err != nil {
+		return nil, err
+	}
+
+	field := strconv.FormatUint(key, 10)
+	var (
+		quotaCmd      *rueidiscompat.StringCmd
+		usedSpaceCmd  *rueidiscompat.StringCmd
+		usedInodesCmd *rueidiscompat.StringCmd
+	)
+	_, err = m.compat.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+		quotaCmd = pipe.HGet(ctx, config.quotaKey, field)
+		usedSpaceCmd = pipe.HGet(ctx, config.usedSpaceKey, field)
+		usedInodesCmd = pipe.HGet(ctx, config.usedInodesKey, field)
+		return nil
+	})
+	if err == rueidiscompat.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	buf, err := quotaCmd.Bytes()
+	if err == rueidiscompat.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(buf) != 16 {
+		return nil, fmt.Errorf("invalid quota value: %v", buf)
+	}
+
+	var quota Quota
+	quota.MaxSpace, quota.MaxInodes = m.parseQuota(buf)
+	if quota.UsedSpace, err = usedSpaceCmd.Int64(); err != nil {
+		return nil, err
+	}
+	if quota.UsedInodes, err = usedInodesCmd.Int64(); err != nil {
+		return nil, err
+	}
+	return &quota, nil
+}
+
+func (m *rueidisMeta) doSetQuota(ctx Context, qtype uint32, key uint64, quota *Quota) (bool, error) {
+	if m.compat == nil {
+		return m.redisMeta.doSetQuota(ctx, qtype, key, quota)
+	}
+
+	config, err := m.redisMeta.getQuotaKeys(qtype)
+	if err != nil {
+		return false, err
+	}
+
+	var created bool
+	field := strconv.FormatUint(key, 10)
+	err = m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		origin := &Quota{MaxSpace: -1, MaxInodes: -1}
+		buf, e := tx.HGet(ctx, config.quotaKey, field).Bytes()
+		if e == nil {
+			created = false
+			origin.MaxSpace, origin.MaxInodes = m.parseQuota(buf)
+		} else if e == rueidiscompat.Nil {
+			created = true
+		} else {
+			return e
+		}
+
+		if quota.MaxSpace >= 0 {
+			origin.MaxSpace = quota.MaxSpace
+		}
+		if quota.MaxInodes >= 0 {
+			origin.MaxInodes = quota.MaxInodes
+		}
+
+		_, e = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.HSet(ctx, config.quotaKey, field, m.packQuota(origin.MaxSpace, origin.MaxInodes))
+			if quota.UsedSpace >= 0 {
+				pipe.HSet(ctx, config.usedSpaceKey, field, quota.UsedSpace)
+			} else if created {
+				pipe.HSet(ctx, config.usedSpaceKey, field, 0)
+			}
+			if quota.UsedInodes >= 0 {
+				pipe.HSet(ctx, config.usedInodesKey, field, quota.UsedInodes)
+			} else if created {
+				pipe.HSet(ctx, config.usedInodesKey, field, 0)
+			}
+			return nil
+		})
+		return e
+	}, m.inodeKey(Ino(key)))
+	return created, err
+}
+
+func (m *rueidisMeta) doDelQuota(ctx Context, qtype uint32, key uint64) error {
+	if m.compat == nil {
+		return m.redisMeta.doDelQuota(ctx, qtype, key)
+	}
+
+	config, err := m.redisMeta.getQuotaKeys(qtype)
+	if err != nil {
+		return err
+	}
+
+	field := strconv.FormatUint(key, 10)
+	_, err = m.compat.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+		if qtype == UserQuotaType || qtype == GroupQuotaType {
+			pipe.HSet(ctx, config.quotaKey, field, m.packQuota(-1, -1))
+		} else {
+			pipe.HDel(ctx, config.quotaKey, field)
+			pipe.HDel(ctx, config.usedSpaceKey, field)
+			pipe.HDel(ctx, config.usedInodesKey, field)
+		}
+		return nil
+	})
+	return err
+}
+
+func (m *rueidisMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Quota, map[uint64]*Quota, error) {
+	if m.compat == nil {
+		return m.redisMeta.doLoadQuotas(ctx)
+	}
+
+	quotaTypes := []struct {
+		qtype uint32
+		name  string
+	}{
+		{DirQuotaType, "dir"},
+		{UserQuotaType, "user"},
+		{GroupQuotaType, "group"},
+	}
+
+	quotaMaps := make([]map[uint64]*Quota, 3)
+	for i, qt := range quotaTypes {
+		config, err := m.redisMeta.getQuotaKeys(qt.qtype)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to load %s quotas: %w", qt.name, err)
+		}
+
+		quotas := make(map[uint64]*Quota)
+		var cursor uint64
+		for {
+			kvs, next, err := m.compat.HScan(ctx, config.quotaKey, cursor, "*", 10000).Result()
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			for j := 0; j < len(kvs); j += 2 {
+				keyStr := kvs[j]
+				val := []byte(kvs[j+1])
+				id, err := strconv.ParseUint(keyStr, 10, 64)
+				if err != nil {
+					logger.Errorf("invalid inode: %s", keyStr)
+					continue
+				}
+				if len(val) != 16 {
+					logger.Errorf("invalid quota: %s=%s", keyStr, val)
+					continue
+				}
+
+				maxSpace, maxInodes := m.parseQuota(val)
+				usedSpace, err := m.compat.HGet(ctx, config.usedSpaceKey, keyStr).Int64()
+				if err != nil && err != rueidiscompat.Nil {
+					return nil, nil, nil, err
+				}
+				if err == rueidiscompat.Nil {
+					usedSpace = 0
+				}
+				usedInodes, err := m.compat.HGet(ctx, config.usedInodesKey, keyStr).Int64()
+				if err != nil && err != rueidiscompat.Nil {
+					return nil, nil, nil, err
+				}
+				if err == rueidiscompat.Nil {
+					usedInodes = 0
+				}
+
+				quotas[id] = &Quota{
+					MaxSpace:   int64(maxSpace),
+					MaxInodes:  int64(maxInodes),
+					UsedSpace:  usedSpace,
+					UsedInodes: usedInodes,
+				}
+			}
+			if next == 0 {
+				break
+			}
+			cursor = next
+		}
+		quotaMaps[i] = quotas
+	}
+
+	return quotaMaps[0], quotaMaps[1], quotaMaps[2], nil
+}
+
+func (m *rueidisMeta) doFlushQuotas(ctx Context, quotas []*iQuota) error {
+	if m.compat == nil {
+		return m.redisMeta.doFlushQuotas(ctx, quotas)
+	}
+
+	_, err := m.compat.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+		for _, q := range quotas {
+			config, err := m.redisMeta.getQuotaKeys(q.qtype)
+			if err != nil {
+				return err
+			}
+
+			field := strconv.FormatUint(q.qkey, 10)
+			pipe.HIncrBy(ctx, config.usedSpaceKey, field, q.quota.newSpace)
+			pipe.HIncrBy(ctx, config.usedInodesKey, field, q.quota.newInodes)
+		}
+		return nil
+	})
+	return err
 }
 
 func (m *rueidisMeta) doCleanStaleSession(sid uint64) error {
