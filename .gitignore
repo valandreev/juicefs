@@ -14,6 +14,7 @@ docs/node_modules
 cmd/cmd
 .hypothesis
 /node_modules
+*.exe
 
 # os
 .DS_Store

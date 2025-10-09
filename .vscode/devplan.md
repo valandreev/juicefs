@@ -305,6 +305,51 @@ Assumptions / open questions
 
 **Remaining work:** Phase 6-8 (client-side caching, docs, CI integration).
 
+### Phase 6 – Client-side caching integration ✅ COMPLETED
+
+**Objective:** Enable server-assisted client-side caching for read-heavy operations, leveraging Rueidis's key advantage over go-redis.
+
+1. ✅ **Cache configuration:**
+   - Added `cacheTTL time.Duration` field to `rueidisMeta` struct
+   - Parse `cache-ttl` query parameter from URI (e.g., `rueidis://host:port/db?cache-ttl=1s`)
+   - Default: 100ms (balanced freshness/performance trade-off)
+   - Strip `cache-ttl` from query before passing to `rueidis.ParseURL` and `newRedisMeta`
+   - Implementation: lines 30, 51-78 in `rueidis.go`
+
+2. ✅ **Cached read operations:**
+   - **doGetAttr** (lines 3096-3114): Use `m.compat.Cache(m.cacheTTL).Get()` when cacheTTL > 0
+   - **doLookup** (lines 3020-3028): Cache inode attribute reads via `m.compat.Cache(m.cacheTTL).Get()`
+     - Note: Entry hash reads (`HGet`) are NOT cached (frequently modified)
+     - Only final inode attribute `Get()` is cached
+   - **fillAttr** (lines 2881-2929): Use native `rueidis.MGetCache()` for batch attribute reads
+     - Converts cached map results back to slice in key order
+     - Fallback to `m.compat.MGet()` when caching disabled
+   - Server-assisted caching: Redis 6+ tracking handles automatic invalidation
+
+3. ✅ **Test coverage:**
+   - Created `rueidis_cache_test.go` with 2 passing tests:
+     - `TestRueidisDefaultCacheTTL`: Verifies default 100ms TTL ✅ PASS
+     - `TestRueidisCustomCacheTTL`: Verifies custom 5s TTL via query param ✅ PASS
+   - Both tests use redis://100.121.51.13:6379 with databases 7 and 8
+
+**Deliverables:**
+- ✅ Client-side caching infrastructure with configurable TTL
+- ✅ Three read paths now leverage caching: GetAttr, Lookup (partial), Readdir (via fillAttr)
+- ✅ Proper query parameter handling (stripped before delegate calls)
+- ✅ Test coverage for cache TTL configuration
+
+**Key findings:**
+- `rueidiscompat.Cache(ttl)` works seamlessly for single-key operations
+- Batch operations require native `rueidis.MGetCache()` (no compat wrapper)
+- Redis tracking handles cache invalidation automatically - no manual invalidation needed
+- Caching can be disabled by setting `?cache-ttl=0` in URI
+
+**Remaining work (deferred):**
+- Phase 5 task: Add cache hit/miss metrics (optional, defer to Phase 7 or future work)
+- Performance benchmarking of cache effectiveness
+
+**Remaining work:** Phase 7-8 (docs, CI integration).
+
 ### Phase 6 – Client-side caching integration
 
 1. Introduce caching strategy:

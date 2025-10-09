@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math/rand"
+	"net/url"
 	"runtime"
 	"sort"
 	"strconv"
@@ -35,6 +36,7 @@ type rueidisMeta struct {
 	option    rueidis.ClientOption
 	client    rueidis.Client
 	compat    rueidiscompat.Cmdable
+	cacheTTL  time.Duration // client-side cache TTL for read operations
 }
 
 // Temporary Rueidis registration that delegates to the Redis implementation.
@@ -49,12 +51,33 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	canonical := mapRueidisScheme(driver)
 	uri := canonical + "://" + addr
 
-	opt, err := rueidis.ParseURL(uri)
-	if err != nil {
-		return nil, fmt.Errorf("rueidis parse %s: %w", uri, err)
+	// Parse and extract cache-ttl query parameter before passing to rueidis.ParseURL
+	cacheTTL := 100 * time.Millisecond
+	cleanAddr := addr
+	if u, err := url.Parse(uri); err == nil {
+		if ttlStr := u.Query().Get("cache-ttl"); ttlStr != "" {
+			if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed >= 0 {
+				cacheTTL = parsed
+			}
+			// Strip cache-ttl from query params for rueidis.ParseURL
+			q := u.Query()
+			q.Del("cache-ttl")
+			u.RawQuery = q.Encode()
+			// Extract just the address part (without scheme)
+			cleanAddr = u.Host + u.Path
+			if u.RawQuery != "" {
+				cleanAddr += "?" + u.RawQuery
+			}
+		}
 	}
 
-	delegate, err := newRedisMeta(canonical, addr, conf)
+	cleanURI := canonical + "://" + cleanAddr
+	opt, err := rueidis.ParseURL(cleanURI)
+	if err != nil {
+		return nil, fmt.Errorf("rueidis parse %s: %w", cleanURI, err)
+	}
+
+	delegate, err := newRedisMeta(canonical, cleanAddr, conf)
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +99,7 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		option:    opt,
 		client:    client,
 		compat:    rueidiscompat.NewAdapter(client),
+		cacheTTL:  cacheTTL,
 	}
 	m.redisMeta.en = m
 	return m, nil
@@ -2876,10 +2900,34 @@ func (m *rueidisMeta) fillAttr(ctx Context, es []*Entry) error {
 	for i, e := range es {
 		keys[i] = m.inodeKey(e.Inode)
 	}
-	vals, err := m.compat.MGet(ctx, keys...).Result()
-	if err != nil {
-		return err
+
+	var vals []interface{}
+	var err error
+
+	// Use native Rueidis MGetCache if caching is enabled
+	if m.cacheTTL > 0 {
+		cachedVals, cacheErr := rueidis.MGetCache(m.client, ctx, m.cacheTTL, keys)
+		if cacheErr != nil {
+			return cacheErr
+		}
+		// Convert map to slice in key order
+		vals = make([]interface{}, len(keys))
+		for i, key := range keys {
+			if result, ok := cachedVals[key]; ok {
+				if s, err := result.ToString(); err == nil {
+					vals[i] = s
+				} else if !rueidis.IsRedisNil(err) {
+					return err
+				}
+			}
+		}
+	} else {
+		vals, err = m.compat.MGet(ctx, keys...).Result()
+		if err != nil {
+			return err
+		}
 	}
+
 	for j, v := range vals {
 		if v == nil {
 			continue
@@ -3009,7 +3057,13 @@ func (m *rueidisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino,
 			return errno(e)
 		}
 		foundType, foundIno = m.parseEntry(buf)
-		encodedAttr, err = m.compat.Get(ctx, m.inodeKey(foundIno)).Bytes()
+
+		// Use client-side caching for inode attribute reads if cacheTTL > 0
+		if m.cacheTTL > 0 {
+			encodedAttr, err = m.compat.Cache(m.cacheTTL).Get(ctx, m.inodeKey(foundIno)).Bytes()
+		} else {
+			encodedAttr, err = m.compat.Get(ctx, m.inodeKey(foundIno)).Bytes()
+		}
 	} else {
 		err = nil
 	}
@@ -3073,7 +3127,15 @@ func (m *rueidisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errn
 		return m.redisMeta.doGetAttr(ctx, inode, attr)
 	}
 
-	data, err := m.compat.Get(ctx, m.inodeKey(inode)).Bytes()
+	// Use client-side caching for inode attribute reads if cacheTTL > 0
+	var data []byte
+	var err error
+	if m.cacheTTL > 0 {
+		data, err = m.compat.Cache(m.cacheTTL).Get(ctx, m.inodeKey(inode)).Bytes()
+	} else {
+		data, err = m.compat.Get(ctx, m.inodeKey(inode)).Bytes()
+	}
+
 	if err != nil {
 		return errno(err)
 	}
