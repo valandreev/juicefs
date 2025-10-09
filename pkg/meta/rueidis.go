@@ -405,6 +405,47 @@ func (m *rueidisMeta) ListSessions() ([]*Session, error) {
 	return sessions, nil
 }
 
+func (m *rueidisMeta) doFindStaleSessions(limit int) ([]uint64, error) {
+	if m.compat == nil {
+		return m.redisMeta.doFindStaleSessions(limit)
+	}
+
+	ctx := Background()
+	rng := rueidiscompat.ZRangeBy{
+		Min:   "-inf",
+		Max:   strconv.FormatInt(time.Now().Unix(), 10),
+		Count: int64(limit),
+	}
+	vals, err := m.compat.ZRangeByScore(ctx, m.allSessions(), rng).Result()
+	if err != nil {
+		return nil, err
+	}
+	sids := make([]uint64, len(vals))
+	for i, v := range vals {
+		sids[i], _ = strconv.ParseUint(v, 10, 64)
+	}
+	limit -= len(sids)
+	if limit <= 0 {
+		return sids, nil
+	}
+
+	legacyRange := rueidiscompat.ZRangeBy{
+		Min:   "-inf",
+		Max:   strconv.FormatInt(time.Now().Add(-5*time.Minute).Unix(), 10),
+		Count: int64(limit),
+	}
+	legacyVals, err := m.compat.ZRangeByScore(ctx, legacySessions, legacyRange).Result()
+	if err != nil {
+		logger.Errorf("Scan stale legacy sessions: %v", err)
+		return sids, nil
+	}
+	for _, v := range legacyVals {
+		sid, _ := strconv.ParseUint(v, 10, 64)
+		sids = append(sids, sid)
+	}
+	return sids, nil
+}
+
 func (m *rueidisMeta) doNewSession(sinfo []byte, update bool) error {
 	if m.compat == nil {
 		return m.redisMeta.doNewSession(sinfo, update)

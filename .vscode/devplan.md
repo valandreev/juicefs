@@ -71,6 +71,7 @@ Assumptions / open questions
 ✅ `Reset`
 ✅ `setIfSmall`
 ✅ `doCleanStaleSession`
+✅ `doFindStaleSessions`
 ✅ `doDeleteSustainedInode`
 
 ### Phase 1 – Driver skeleton & connection plumbing
@@ -81,6 +82,7 @@ Assumptions / open questions
    - ✅ A `rueidiscompat.NewAdapter` instance now hangs off `rueidisMeta`, wiring the first production calls (`doLoad`, `doDeleteSlice`, `doInit`, `cacheACLs`, `getSession`, `GetSession`, `ListSessions`, `doNewSession`, `cleanupLegacies`, `cleanupLeakedChunks`, `cleanupOldSliceRefs`, `cleanupLeakedInodes`, `doCleanupDetachedNode`, `doFindDetachedNodes`, `doAttachDirNode`, `doTouchAtime`, `doSetFacl`, `doGetFacl`, `loadDumpedACLs`, `doFindDeletedFiles`, `doCleanupDelayedSlices`, `doCleanupSlices`, `doCleanStaleSession`, `fillAttr`, `doReaddir`, `doLookup`, `doGetAttr`, `doSetAttr`, `getCounter`, `incrCounter`, `newDirHandler`) through Rueidis while keeping unported paths on the embedded go-redis engine.
    - ✅ `doCleanupDelayedSlices` now uses Rueidis `Watch` + pipelined decrements, mirroring the Redis behaviour while respecting context deadlines.
    - ✅ `doCleanupSlices` now iterates via Rueidis `HSCAN`, deleting negative refs and invoking the Rueidis-backed `cleanupZeroRef`.
+   - ✅ `doGetDirStat` now reads cached directory stats via Rueidis `HGET` and triggers `doSyncDirStat` when counters are missing or negative.
    - ✅ `cleanupLeakedChunks` now scans chunk keys via Rueidis `SCAN`, pipelining `EXISTS` checks and deleting orphaned chunks when requested.
    - ✅ `cleanupOldSliceRefs` now leverages Rueidis `SCAN` + `MGET` to migrate refcounts back into `sliceRefs` and optionally purge zero/legacy entries.
    - ✅ `cleanupLeakedInodes` now walks directories and inode hashes via Rueidis `SCAN`, reusing `doReaddir` and sustained-inode cleanup to cull stragglers.
