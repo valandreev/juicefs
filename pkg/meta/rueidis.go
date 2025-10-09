@@ -2549,15 +2549,43 @@ func (m *rueidisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino,
 	}
 
 	entryKey := m.entryKey(parent)
-	buf, err := m.compat.HGet(ctx, entryKey, name).Bytes()
-	if err != nil {
-		return errno(err)
+	var (
+		foundIno    Ino
+		foundType   uint8
+		encodedAttr []byte
+		err         error
+	)
+
+	if len(m.shaLookup) > 0 && attr != nil && !m.conf.CaseInsensi && m.prefix == "" {
+		cmd := m.compat.EvalSha(ctx, m.shaLookup, []string{entryKey, name})
+		res, evalErr := cmd.Result()
+		var (
+			returnedIno  int64
+			returnedAttr string
+		)
+		if st := m.handleLuaResult("lookup", res, evalErr, &returnedIno, &returnedAttr); st == 0 {
+			foundIno = Ino(returnedIno)
+			encodedAttr = []byte(returnedAttr)
+		} else if st == syscall.EAGAIN {
+			return m.doLookup(ctx, parent, name, inode, attr)
+		} else if st != syscall.ENOTSUP {
+			return st
+		}
 	}
 
-	foundType, foundIno := m.parseEntry(buf)
-	encodedAttr, err := m.compat.Get(ctx, m.inodeKey(foundIno)).Bytes()
+	if foundIno == 0 || len(encodedAttr) == 0 {
+		buf, e := m.compat.HGet(ctx, entryKey, name).Bytes()
+		if e != nil {
+			return errno(e)
+		}
+		foundType, foundIno = m.parseEntry(buf)
+		encodedAttr, err = m.compat.Get(ctx, m.inodeKey(foundIno)).Bytes()
+	} else {
+		err = nil
+	}
+
 	if err == nil {
-		if attr != nil {
+		if attr != nil && len(encodedAttr) > 0 {
 			m.parseAttr(encodedAttr, attr)
 			m.of.Update(foundIno, attr)
 		}
@@ -2573,6 +2601,41 @@ func (m *rueidisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino,
 		*inode = foundIno
 	}
 	return errno(err)
+}
+
+func (m *rueidisMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, attr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.Resolve(ctx, parent, path, inode, attr)
+	}
+
+	if len(m.shaResolve) == 0 || m.conf.CaseInsensi || m.prefix != "" {
+		return syscall.ENOTSUP
+	}
+
+	defer m.timeit("Resolve", time.Now())
+	parent = m.checkRoot(parent)
+	keys := []string{parent.String(), path, strconv.FormatUint(uint64(ctx.Uid()), 10)}
+	var args []interface{}
+	for _, gid := range ctx.Gids() {
+		args = append(args, strconv.FormatUint(uint64(gid), 10))
+	}
+
+	cmd := m.compat.EvalSha(ctx, m.shaResolve, keys, args...)
+	res, err := cmd.Result()
+	var (
+		returnedIno  int64
+		returnedAttr string
+	)
+	st := m.handleLuaResult("resolve", res, err, &returnedIno, &returnedAttr)
+	if st == 0 {
+		if inode != nil {
+			*inode = Ino(returnedIno)
+		}
+		m.parseAttr([]byte(returnedAttr), attr)
+	} else if st == syscall.EAGAIN {
+		return m.Resolve(ctx, parent, path, inode, attr)
+	}
+	return st
 }
 
 func (m *rueidisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {

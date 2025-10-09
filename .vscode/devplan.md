@@ -47,6 +47,7 @@ Assumptions / open questions
 ✅ `doLink`
 ✅ `doRead`
 ✅ `CopyFileRange`
+✅ `Resolve`
 ✅ `doWrite`
 ✅ `doGetParents`
 ✅ `doSyncDirStat`
@@ -83,6 +84,8 @@ Assumptions / open questions
    - ✅ `cleanupOldSliceRefs` now leverages Rueidis `SCAN` + `MGET` to migrate refcounts back into `sliceRefs` and optionally purge zero/legacy entries.
    - ✅ `cleanupLeakedInodes` now walks directories and inode hashes via Rueidis `SCAN`, reusing `doReaddir` and sustained-inode cleanup to cull stragglers.
    - ✅ Slice scanning routines (`scan`, `hscan`, `ListSlices`, `scanTrashSlices`, `scanPendingSlices`, `scanPendingFiles`) now use Rueidis pipelines/watchers, removing the go-redis dependency for slice maintenance commands.
+   - ✅ `Resolve` now executes the Lua path via Rueidis `EvalSha`, removing the go-redis script dependency.
+   - ✅ `doLookup` now attempts the Lua fast-path with Rueidis `EvalSha`, matching the go-redis implementation and falling back to standard lookups.
    - Preserve uniform build tags (e.g., `//go:build !norueidis`) and align configuration parsing with the Redis driver so CLI/config UX stays identical. Extend parsing to honor Rueidis-specific knobs (auto-pipelining, cache sizing) once we expose them.
    - For TLS, wire `ruediss` URIs to load a `tls.Config` via existing helpers.
 2. **Tests:**
