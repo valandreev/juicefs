@@ -46,6 +46,15 @@ Assumptions / open questions
 ✅ `doRename`
 ✅ `doLink`
 ✅ `doRead`
+✅ `CopyFileRange`
+✅ `doWrite`
+✅ `doGetParents`
+✅ `doSyncDirStat`
+✅ `doUpdateDirStat`
+✅ `doGetDirStat`
+✅ `doFindDeletedFiles`
+✅ `deleteChunk`
+✅ `doDeleteFileData`
 
 ### Phase 1 – Driver skeleton & connection plumbing
 

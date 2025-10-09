@@ -1081,6 +1081,155 @@ func (m *rueidisMeta) getParentsCompat(ctx Context, tx rueidiscompat.Tx, inode, 
 	return ps
 }
 
+func (m *rueidisMeta) doGetParents(ctx Context, inode Ino) map[Ino]int {
+	if m.compat == nil {
+		return m.redisMeta.doGetParents(ctx, inode)
+	}
+
+	vals, err := m.compat.HGetAll(ctx, m.parentKey(inode)).Result()
+	if err != nil {
+		logger.Warnf("Scan parent key of inode %d: %v", inode, err)
+		return nil
+	}
+	ps := make(map[Ino]int, len(vals))
+	for k, v := range vals {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			ino, _ := strconv.ParseUint(k, 10, 64)
+			ps[Ino(ino)] = n
+		}
+	}
+	return ps
+}
+
+func (m *rueidisMeta) doSyncDirStat(ctx Context, ino Ino) (*dirStat, syscall.Errno) {
+	if m.compat == nil {
+		return m.redisMeta.doSyncDirStat(ctx, ino)
+	}
+	if m.conf.ReadOnly {
+		return nil, syscall.EROFS
+	}
+
+	field := ino.String()
+	stat, st := m.calcDirStat(ctx, ino)
+	if st != 0 {
+		return nil, st
+	}
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		n, err := tx.Exists(ctx, m.inodeKey(ino)).Result()
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return syscall.ENOENT
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.HSet(ctx, m.dirDataLengthKey(), field, stat.length)
+			pipe.HSet(ctx, m.dirUsedSpaceKey(), field, stat.space)
+			pipe.HSet(ctx, m.dirUsedInodesKey(), field, stat.inodes)
+			return nil
+		})
+		return err
+	}, m.inodeKey(ino))
+
+	return stat, errno(err)
+}
+
+func (m *rueidisMeta) doUpdateDirStat(ctx Context, batch map[Ino]dirStat) error {
+	if m.compat == nil {
+		return m.redisMeta.doUpdateDirStat(ctx, batch)
+	}
+
+	spaceKey := m.dirUsedSpaceKey()
+	lengthKey := m.dirDataLengthKey()
+	inodesKey := m.dirUsedInodesKey()
+	nonexist := make(map[Ino]bool)
+	statList := make([]Ino, 0, len(batch))
+	pipe := m.compat.Pipeline()
+	for ino := range batch {
+		pipe.HExists(ctx, spaceKey, ino.String())
+		statList = append(statList, ino)
+	}
+	cmds, err := pipe.Exec(ctx)
+	if err != nil {
+		return err
+	}
+	for i, cmd := range cmds {
+		if cmd.Err() != nil {
+			return cmd.Err()
+		}
+		boolCmd, ok := cmd.(*rueidiscompat.BoolCmd)
+		if !ok {
+			return fmt.Errorf("unexpected pipeline result type %T", cmd)
+		}
+		if exist, _ := boolCmd.Result(); !exist {
+			nonexist[statList[i]] = true
+		}
+	}
+	if len(nonexist) > 0 {
+		wg := m.parallelSyncDirStat(ctx, nonexist)
+		defer wg.Wait()
+	}
+
+	for _, group := range m.groupBatch(batch, 1000) {
+		_, err := m.compat.Pipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			for _, ino := range group {
+				if nonexist[ino] {
+					continue
+				}
+				field := ino.String()
+				stat := batch[ino]
+				if stat.length != 0 {
+					pipe.HIncrBy(ctx, lengthKey, field, stat.length)
+				}
+				if stat.space != 0 {
+					pipe.HIncrBy(ctx, spaceKey, field, stat.space)
+				}
+				if stat.inodes != 0 {
+					pipe.HIncrBy(ctx, inodesKey, field, stat.inodes)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *rueidisMeta) doGetDirStat(ctx Context, ino Ino, trySync bool) (*dirStat, syscall.Errno) {
+	if m.compat == nil {
+		return m.redisMeta.doGetDirStat(ctx, ino, trySync)
+	}
+
+	field := ino.String()
+	dataLength, errLength := m.compat.HGet(ctx, m.dirDataLengthKey(), field).Int64()
+	if errLength != nil && errLength != rueidiscompat.Nil {
+		return nil, errno(errLength)
+	}
+	usedSpace, errSpace := m.compat.HGet(ctx, m.dirUsedSpaceKey(), field).Int64()
+	if errSpace != nil && errSpace != rueidiscompat.Nil {
+		return nil, errno(errSpace)
+	}
+	usedInodes, errInodes := m.compat.HGet(ctx, m.dirUsedInodesKey(), field).Int64()
+	if errInodes != nil && errInodes != rueidiscompat.Nil {
+		return nil, errno(errInodes)
+	}
+
+	if errLength != rueidiscompat.Nil && errSpace != rueidiscompat.Nil && errInodes != rueidiscompat.Nil {
+		if trySync && (dataLength < 0 || usedSpace < 0 || usedInodes < 0) {
+			return m.doSyncDirStat(ctx, ino)
+		}
+		return &dirStat{dataLength, usedSpace, usedInodes}, 0
+	}
+
+	if trySync {
+		return m.doSyncDirStat(ctx, ino)
+	}
+	return nil, 0
+}
+
 func (m *rueidisMeta) doGetFacl(ctx Context, ino Ino, aclType uint8, aclId uint32, rule *aclAPI.Rule) syscall.Errno {
 	if m.compat == nil {
 		return m.redisMeta.doGetFacl(ctx, ino, aclType, aclId, rule)
@@ -1229,6 +1378,112 @@ func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, erro
 		return count, err
 	}
 	return count, nil
+}
+
+func (m *rueidisMeta) deleteChunk(inode Ino, indx uint32) error {
+	if m.compat == nil {
+		return m.redisMeta.deleteChunk(inode, indx)
+	}
+
+	ctx := Background()
+	key := m.chunkKey(inode, indx)
+	var (
+		todel []*slice
+		rs    []*rueidiscompat.IntCmd
+	)
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		todel = todel[:0]
+		rs = rs[:0]
+		vals, err := tx.LRange(ctx, key, 0, -1).Result()
+		if err != nil || len(vals) == 0 {
+			return err
+		}
+		slices := readSlices(vals)
+		if slices == nil {
+			logger.Errorf("Corrupt value for inode %d chunk index %d, use `gc` to clean up leaked slices", inode, indx)
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			pipe.Del(ctx, key)
+			for _, s := range slices {
+				if s.id > 0 {
+					todel = append(todel, s)
+					rs = append(rs, pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.id, s.size), -1))
+				}
+			}
+			return nil
+		})
+		return err
+	}, key)
+	if err != nil {
+		return fmt.Errorf("delete slice from chunk %s fail: %v, retry later", key, err)
+	}
+	for i, s := range todel {
+		if rs[i].Err() == nil && rs[i].Val() < 0 {
+			m.deleteSlice(s.id, s.size)
+		}
+	}
+	return nil
+}
+
+func (m *rueidisMeta) doDeleteFileData(inode Ino, length uint64) {
+	if m.compat == nil {
+		m.redisMeta.doDeleteFileData(inode, length)
+		return
+	}
+	m.doDeleteFileData_(inode, length, "")
+}
+
+func (m *rueidisMeta) doDeleteFileData_(inode Ino, length uint64, tracking string) {
+	if m.compat == nil {
+		m.redisMeta.doDeleteFileData_(inode, length, tracking)
+		return
+	}
+
+	ctx := Background()
+	var indx uint32
+	for uint64(indx)*ChunkSize < length {
+		keys := make([]string, 0, 1000)
+		pipe := m.compat.Pipeline()
+		for i := 0; uint64(indx)*ChunkSize < length && i < 1000; i++ {
+			key := m.chunkKey(inode, indx)
+			keys = append(keys, key)
+			pipe.LLen(ctx, key)
+			indx++
+		}
+		cmds, err := pipe.Exec(ctx)
+		if err != nil {
+			logger.Warnf("delete chunks of inode %d: %v", inode, err)
+			return
+		}
+		for i, cmd := range cmds {
+			llenCmd, ok := cmd.(*rueidiscompat.IntCmd)
+			if !ok {
+				logger.Warnf("unexpected pipeline result type %T for chunk %s", cmd, keys[i])
+				continue
+			}
+			val, err := llenCmd.Result()
+			if err == rueidiscompat.Nil || val == 0 {
+				continue
+			}
+			parts := strings.Split(keys[i][len(m.prefix):], "_")
+			if len(parts) < 2 {
+				logger.Warnf("invalid chunk key format: %s", keys[i])
+				continue
+			}
+			idx, _ := strconv.Atoi(parts[1])
+			if e := m.deleteChunk(inode, uint32(idx)); e != nil {
+				logger.Warnf("delete chunk %s: %v", keys[i], e)
+				return
+			}
+		}
+	}
+	if tracking == "" {
+		tracking = inode.String() + ":" + strconv.FormatInt(int64(length), 10)
+	}
+	if err := m.compat.ZRem(ctx, m.delfiles(), tracking).Err(); err != nil && err != rueidiscompat.Nil {
+		logger.Warnf("ZRem %s %s: %v", m.delfiles(), tracking, err)
+	}
 }
 
 func (m *rueidisMeta) doCleanStaleSession(sid uint64) error {
@@ -2402,6 +2657,216 @@ func (m *rueidisMeta) doRead(ctx Context, inode Ino, indx uint32) ([]*slice, sys
 		return nil, errno(err)
 	}
 	return readSlices(vals), 0
+}
+
+func (m *rueidisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.CopyFileRange(ctx, fin, offIn, fout, offOut, size, flags, copied, outLength)
+	}
+
+	defer m.timeit("CopyFileRange", time.Now())
+	f := m.of.find(fout)
+	if f != nil {
+		f.Lock()
+		defer f.Unlock()
+	}
+	var newLength, newSpace int64
+	var sattr, attr Attr
+	defer func() { m.of.InvalidateChunk(fout, invalidateAllChunks) }()
+
+	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		newLength, newSpace = 0, 0
+		rs, err := tx.MGet(ctx, m.inodeKey(fin), m.inodeKey(fout)).Result()
+		if err != nil {
+			return err
+		}
+		if len(rs) < 2 || rs[0] == nil || rs[1] == nil {
+			return rueidiscompat.Nil
+		}
+
+		sattr = Attr{}
+		switch v := rs[0].(type) {
+		case string:
+			m.parseAttr([]byte(v), &sattr)
+		case []byte:
+			m.parseAttr(v, &sattr)
+		default:
+			return fmt.Errorf("unexpected source attr type %T", rs[0])
+		}
+		if sattr.Typ != TypeFile {
+			return syscall.EINVAL
+		}
+		if offIn >= sattr.Length {
+			if copied != nil {
+				*copied = 0
+			}
+			return nil
+		}
+
+		sizeToCopy := size
+		if offIn+sizeToCopy > sattr.Length {
+			sizeToCopy = sattr.Length - offIn
+		}
+
+		switch v := rs[1].(type) {
+		case string:
+			m.parseAttr([]byte(v), &attr)
+		case []byte:
+			m.parseAttr(v, &attr)
+		default:
+			return fmt.Errorf("unexpected dest attr type %T", rs[1])
+		}
+		if attr.Typ != TypeFile {
+			return syscall.EINVAL
+		}
+		if (attr.Flags&FlagImmutable) != 0 || (attr.Flags&FlagAppend) != 0 {
+			return syscall.EPERM
+		}
+
+		newLeng := offOut + sizeToCopy
+		if newLeng > attr.Length {
+			newLength = int64(newLeng - attr.Length)
+			newSpace = align4K(newLeng) - align4K(attr.Length)
+			attr.Length = newLeng
+		}
+		if err := m.checkQuota(ctx, newSpace, 0, m.getParentsCompat(ctx, tx, fout, attr.Parent)...); err != 0 {
+			return err
+		}
+
+		now := time.Now()
+		attr.Mtime = now.Unix()
+		attr.Mtimensec = uint32(now.Nanosecond())
+		attr.Ctime = now.Unix()
+		attr.Ctimensec = uint32(now.Nanosecond())
+		if outLength != nil {
+			*outLength = attr.Length
+		}
+
+		var vals [][]string
+		for i := offIn / ChunkSize; i <= (offIn+sizeToCopy)/ChunkSize; i++ {
+			list, e := tx.LRange(ctx, m.chunkKey(fin, uint32(i)), 0, -1).Result()
+			if e != nil {
+				return e
+			}
+			vals = append(vals, list)
+		}
+
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			coff := offIn / ChunkSize * ChunkSize
+			for _, sv := range vals {
+				slices := readSlices(sv)
+				if slices == nil {
+					return syscall.EIO
+				}
+				slices = append([]*slice{{len: ChunkSize}}, slices...)
+				cs := buildSlice(slices)
+				tpos := coff
+				for _, s := range cs {
+					pos := tpos
+					tpos += uint64(s.Len)
+					if pos < offIn+sizeToCopy && pos+uint64(s.Len) > offIn {
+						if pos < offIn {
+							dec := offIn - pos
+							s.Off += uint32(dec)
+							pos += dec
+							s.Len -= uint32(dec)
+						}
+						if pos+uint64(s.Len) > offIn+sizeToCopy {
+							dec := pos + uint64(s.Len) - (offIn + sizeToCopy)
+							s.Len -= uint32(dec)
+						}
+						doff := pos - offIn + offOut
+						indx := uint32(doff / ChunkSize)
+						dpos := uint32(doff % ChunkSize)
+						if dpos+s.Len > ChunkSize {
+							pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Id, s.Size, s.Off, ChunkSize-dpos))
+							if s.Id > 0 {
+								pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
+							}
+
+							skip := ChunkSize - dpos
+							pipe.RPush(ctx, m.chunkKey(fout, indx+1), marshalSlice(0, s.Id, s.Size, s.Off+skip, s.Len-skip))
+							if s.Id > 0 {
+								pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
+							}
+						} else {
+							pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Id, s.Size, s.Off, s.Len))
+							if s.Id > 0 {
+								pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
+							}
+						}
+					}
+				}
+				coff += ChunkSize
+			}
+			pipe.Set(ctx, m.inodeKey(fout), m.marshal(&attr), 0)
+			if newSpace > 0 {
+				pipe.IncrBy(ctx, m.usedSpaceKey(), newSpace)
+			}
+			return nil
+		})
+		if err == nil && copied != nil {
+			*copied = sizeToCopy
+		}
+		return err
+	}, m.inodeKey(fout), m.inodeKey(fin))
+	if err == nil {
+		m.updateParentStat(ctx, fout, attr.Parent, newLength, newSpace)
+	}
+	return errno(err)
+}
+
+func (m *rueidisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	if m.compat == nil {
+		return m.redisMeta.doWrite(ctx, inode, indx, off, slice, mtime, numSlices, delta, attr)
+	}
+
+	return errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		*delta = dirStat{}
+		*attr = Attr{}
+		data, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		if err != nil {
+			return err
+		}
+		m.parseAttr(data, attr)
+		if attr.Typ != TypeFile {
+			return syscall.EPERM
+		}
+
+		newLength := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
+		if newLength > attr.Length {
+			delta.length = int64(newLength - attr.Length)
+			delta.space = align4K(newLength) - align4K(attr.Length)
+			attr.Length = newLength
+		}
+		if err := m.checkQuota(ctx, delta.space, 0, m.getParentsCompat(ctx, tx, inode, attr.Parent)...); err != 0 {
+			return err
+		}
+
+		now := time.Now()
+		attr.Mtime = mtime.Unix()
+		attr.Mtimensec = uint32(mtime.Nanosecond())
+		attr.Ctime = now.Unix()
+		attr.Ctimensec = uint32(now.Nanosecond())
+
+		var rpush *rueidiscompat.IntCmd
+		_, err = tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
+			rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len))
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
+			if delta.space > 0 {
+				pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
+			}
+			return nil
+		})
+		if err == nil {
+			val, e := rpush.Result()
+			if e != nil {
+				return e
+			}
+			*numSlices = int(val)
+		}
+		return err
+	}, m.inodeKey(inode)))
 }
 
 func (m *rueidisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldAttr *Attr, skipCheckTrash ...bool) syscall.Errno {
