@@ -68,6 +68,8 @@ Assumptions / open questions
 ✅ `doLoadQuotas`
 ✅ `doFlushQuotas`
 ✅ `setIfSmall`
+✅ `doCleanStaleSession`
+✅ `doDeleteSustainedInode`
 
 ### Phase 1 – Driver skeleton & connection plumbing
 
@@ -80,6 +82,7 @@ Assumptions / open questions
    - ✅ `cleanupLeakedChunks` now scans chunk keys via Rueidis `SCAN`, pipelining `EXISTS` checks and deleting orphaned chunks when requested.
    - ✅ `cleanupOldSliceRefs` now leverages Rueidis `SCAN` + `MGET` to migrate refcounts back into `sliceRefs` and optionally purge zero/legacy entries.
    - ✅ `cleanupLeakedInodes` now walks directories and inode hashes via Rueidis `SCAN`, reusing `doReaddir` and sustained-inode cleanup to cull stragglers.
+   - ✅ Slice scanning routines (`scan`, `hscan`, `ListSlices`, `scanTrashSlices`, `scanPendingSlices`, `scanPendingFiles`) now use Rueidis pipelines/watchers, removing the go-redis dependency for slice maintenance commands.
    - Preserve uniform build tags (e.g., `//go:build !norueidis`) and align configuration parsing with the Redis driver so CLI/config UX stays identical. Extend parsing to honor Rueidis-specific knobs (auto-pipelining, cache sizing) once we expose them.
    - For TLS, wire `ruediss` URIs to load a `tls.Config` via existing helpers.
 2. **Tests:**
