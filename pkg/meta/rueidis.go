@@ -336,6 +336,10 @@ func (m *rueidisMeta) getCounter(name string) (int64, error) {
 	if err == rueidiscompat.Nil {
 		err = nil
 	}
+	// Rueidis stores nextInode/nextChunk as value-1, add 1 when reading
+	if name == "nextInode" || name == "nextChunk" {
+		return v + 1, err
+	}
 	return v, err
 }
 
