@@ -56,7 +56,7 @@ func testFormat() *Format {
 
 func TestRedisClient(t *testing.T) {
 	forEachRedisLike(t, "redis-client", func(t *testing.T, target redisLikeTarget) {
-		if target.Scheme != "redis" {
+		if target.Scheme != "redis" && target.Scheme != "rueidis" && target.Scheme != "ruediss" {
 			t.Skipf("driver %s not yet implemented", target.Scheme)
 			return
 		}
