@@ -124,7 +124,13 @@ func errno(err error) syscall.Errno {
 	if err == redis.Nil {
 		return syscall.ENOENT
 	}
-	if strings.HasPrefix(err.Error(), "OOM") {
+	// Handle rueidiscompat.Nil (which has error message "redis nil message")
+	// This check must come before the logger to avoid spurious error logs
+	errMsg := err.Error()
+	if errMsg == "redis nil message" || errMsg == "redis: nil" {
+		return syscall.ENOENT
+	}
+	if strings.HasPrefix(errMsg, "OOM") {
 		return syscall.ENOSPC
 	}
 	logger.Errorf("error: %s\n%s", err, debug.Stack())

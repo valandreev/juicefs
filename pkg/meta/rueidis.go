@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"math/rand"
 	"runtime"
 	"sort"
 	"strconv"
@@ -99,6 +101,106 @@ func (m *rueidisMeta) Shutdown() error {
 		m.client.Close()
 	}
 	return m.redisMeta.Shutdown()
+}
+
+// replaceErrnoCompat wraps a transaction function to convert syscall.Errno to errNo
+// for proper error handling in rueidiscompat Watch transactions
+func replaceErrnoCompat(txf func(tx rueidiscompat.Tx) error) func(tx rueidiscompat.Tx) error {
+	return func(tx rueidiscompat.Tx) error {
+		err := txf(tx)
+		if eno, ok := err.(syscall.Errno); ok {
+			err = errNo(eno)
+		}
+		return err
+	}
+}
+
+// txn wraps rueidiscompat.Watch with retry logic and pessimistic locking
+// to match redisMeta.txn behavior. This ensures transaction consistency
+// and handles optimistic lock failures (TxFailedErr) with exponential backoff.
+func (m *rueidisMeta) txn(ctx Context, txf func(tx rueidiscompat.Tx) error, keys ...string) error {
+	if m.compat == nil {
+		// If compat is not initialized, this is a critical error
+		// This should never happen in production as newRueidisMeta initializes compat
+		return fmt.Errorf("compat adapter not initialized in rueidisMeta.txn")
+	}
+
+	if m.conf.ReadOnly {
+		return syscall.EROFS
+	}
+
+	for _, k := range keys {
+		if !strings.HasPrefix(k, m.prefix) {
+			panic(fmt.Sprintf("Invalid key %s not starts with prefix %s", k, m.prefix))
+		}
+	}
+
+	var khash = fnv.New32()
+	_, _ = khash.Write([]byte(keys[0]))
+	h := uint(khash.Sum32())
+
+	start := time.Now()
+	defer func() { m.txDist.Observe(time.Since(start).Seconds()) }()
+
+	m.txLock(h)
+	defer m.txUnlock(h)
+
+	var (
+		retryOnFailure = false
+		lastErr        error
+		method         string
+	)
+
+	for i := 0; i < 50; i++ {
+		if ctx.Canceled() {
+			return syscall.EINTR
+		}
+
+		err := m.compat.Watch(ctx, replaceErrnoCompat(txf), keys...)
+
+		// Handle errNo type (internal error wrapper)
+		if eno, ok := err.(errNo); ok {
+			if eno == 0 {
+				err = nil
+			} else {
+				err = syscall.Errno(eno)
+			}
+		}
+
+		// rueidiscompat.TxFailedErr indicates optimistic lock failure - retry
+		if err == rueidiscompat.TxFailedErr {
+			if method == "" {
+				method = callerName(ctx)
+			}
+			m.txRestart.WithLabelValues(method).Add(1)
+			logger.Debugf("Transaction failed (optimistic lock), restart it (tried %d)", i+1)
+			lastErr = err
+			time.Sleep(time.Millisecond * time.Duration(rand.Int()%((i+1)*(i+1))))
+			continue
+		}
+
+		// Check if error should trigger retry
+		if err != nil && m.shouldRetry(err, retryOnFailure) {
+			if method == "" {
+				method = callerName(ctx)
+			}
+			m.txRestart.WithLabelValues(method).Add(1)
+			logger.Debugf("Transaction failed, restart it (tried %d): %s", i+1, err)
+			lastErr = err
+			time.Sleep(time.Millisecond * time.Duration(rand.Int()%((i+1)*(i+1))))
+			continue
+		}
+
+		if err == nil && i > 1 {
+			logger.Warnf("Transaction succeeded after %d tries (%s), keys: %v, method: %s, last error: %s",
+				i+1, time.Since(start), keys, method, lastErr)
+		}
+
+		return err
+	}
+
+	logger.Warnf("Already tried 50 times, returning: %s", lastErr)
+	return lastErr
 }
 
 func (m *rueidisMeta) doFlushStats() {}
@@ -265,7 +367,7 @@ func (m *rueidisMeta) setIfSmall(name string, value, diff int64) (bool, error) {
 	name = m.prefix + name
 	ctx = ctx.WithValue(txMethodKey{}, "setIfSmall:"+name)
 	var changed bool
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		changed = false
 		old, err := tx.Get(ctx, name).Int64()
 		if err != nil && err != rueidiscompat.Nil {
@@ -721,7 +823,7 @@ func (m *rueidisMeta) cleanupZeroRef(key string) {
 	}
 
 	ctx := Background()
-	if err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	if err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		cmd := tx.HGet(ctx, m.sliceRefs(), key)
 		val, err := cmd.Int64()
 		if err != nil && err != rueidiscompat.Nil {
@@ -1165,7 +1267,7 @@ func (m *rueidisMeta) scanTrashSlices(ctx Context, scan trashSliceScan) error {
 	var rs []*rueidiscompat.IntCmd
 	for key := range delKeys {
 		var clean bool
-		err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+		err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 			ss = ss[:0]
 			rs = rs[:0]
 			val, err := tx.HGet(ctx, m.delSlices(), key).Result()
@@ -1320,7 +1422,7 @@ func (m *rueidisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name str
 		return m.redisMeta.doCloneEntry(ctx, srcIno, parent, name, ino, originAttr, cmode, cumask, top)
 	}
 
-	return errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	return errno(m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		a, err := tx.Get(ctx, m.inodeKey(srcIno)).Bytes()
 		if err != nil {
 			return err
@@ -1463,7 +1565,7 @@ func (m *rueidisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno 
 
 	m.updateStats(-align4K(0), -1)
 
-	err = m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err = m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		_, e := tx.TxPipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
 			pipe.Del(ctx, m.inodeKey(ino))
 			pipe.Del(ctx, m.xattrKey(ino))
@@ -1513,7 +1615,7 @@ func (m *rueidisMeta) doAttachDirNode(ctx Context, parent Ino, dstIno Ino, name 
 	}
 
 	var pattr Attr
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		cmd := tx.Get(ctx, m.inodeKey(parent))
 		data, err := cmd.Bytes()
 		if err != nil {
@@ -1565,7 +1667,7 @@ func (m *rueidisMeta) doTouchAtime(ctx Context, inode Ino, attr *Attr, now time.
 	}
 
 	var updated bool
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		cmd := tx.Get(ctx, m.inodeKey(inode))
 		data, err := cmd.Bytes()
 		if err != nil {
@@ -1594,7 +1696,7 @@ func (m *rueidisMeta) doSetFacl(ctx Context, ino Ino, aclType uint8, rule *aclAP
 		return m.redisMeta.doSetFacl(ctx, ino, aclType, rule)
 	}
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		val, err := tx.Get(ctx, m.inodeKey(ino)).Bytes()
 		if err != nil {
 			return err
@@ -1802,7 +1904,7 @@ func (m *rueidisMeta) doSyncDirStat(ctx Context, ino Ino) (*dirStat, syscall.Err
 		return nil, st
 	}
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		n, err := tx.Exists(ctx, m.inodeKey(ino)).Result()
 		if err != nil {
 			return err
@@ -1954,7 +2056,7 @@ func (m *rueidisMeta) loadDumpedACLs(ctx Context) error {
 		return nil
 	}
 
-	return m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	return m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		maxId := uint32(0)
 		acls := make(map[string]interface{}, len(id2Rule))
 		for id, rule := range id2Rule {
@@ -2014,7 +2116,7 @@ func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, erro
 					continue
 				}
 
-				if err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+				if err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 					ss = ss[:0]
 					rs = rs[:0]
 					val, e := tx.HGet(ctx, delKey, key).Result()
@@ -2079,7 +2181,7 @@ func (m *rueidisMeta) deleteChunk(inode Ino, indx uint32) error {
 		rs    []*rueidiscompat.IntCmd
 	)
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		todel = todel[:0]
 		rs = rs[:0]
 		vals, err := tx.LRange(ctx, key, 0, -1).Result()
@@ -2184,7 +2286,7 @@ func (m *rueidisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss [
 	}
 	key := m.chunkKey(inode, indx)
 	ctx := Background()
-	st := errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	st := errno(m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		n := len(origin) / sliceBytes
 		vals2, err := tx.LRange(ctx, key, 0, int64(n-1)).Result()
 		if err != nil {
@@ -2300,7 +2402,7 @@ func (m *rueidisMeta) doRepair(ctx Context, inode Ino, attr *Attr) syscall.Errno
 		return m.redisMeta.doRepair(ctx, inode, attr)
 	}
 
-	return errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	return errno(m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		attr.Nlink = 2
 		vals, err := tx.HGetAll(ctx, m.entryKey(inode)).Result()
 		if err != nil {
@@ -2371,7 +2473,7 @@ func (m *rueidisMeta) doSetXattr(ctx Context, inode Ino, name string, value []by
 	}
 
 	key := m.xattrKey(inode)
-	return errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	return errno(m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		switch flags {
 		case XattrCreate:
 			ok, err := tx.HSetNX(ctx, key, name, value).Result()
@@ -2480,7 +2582,7 @@ func (m *rueidisMeta) doSetQuota(ctx Context, qtype uint32, key uint64, quota *Q
 
 	var created bool
 	field := strconv.FormatUint(key, 10)
-	err = m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err = m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		origin := &Quota{MaxSpace: -1, MaxInodes: -1}
 		buf, e := tx.HGet(ctx, config.quotaKey, field).Bytes()
 		if e == nil {
@@ -2648,7 +2750,7 @@ func (m *rueidisMeta) doDeleteSustainedInode(sid uint64, inode Ino) error {
 		newSpace int64
 	)
 	ctx := Background()
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		newSpace = 0
 		cmd := tx.Get(ctx, m.inodeKey(inode))
 		data, err := cmd.Bytes()
@@ -2973,7 +3075,7 @@ func (m *rueidisMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmo
 		return m.redisMeta.doSetAttr(ctx, inode, set, sugidclearmode, attr, oldAttr)
 	}
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		var cur Attr
 		val, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
 		if err != nil {
@@ -3040,7 +3142,7 @@ func (m *rueidisMeta) doReadlink(ctx Context, inode Ino, noatime bool) (int64, [
 		target []byte
 	)
 	now := time.Now()
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		rs, err := tx.MGet(ctx, m.inodeKey(inode), m.symKey(inode)).Result()
 		if err != nil {
 			return err
@@ -3096,12 +3198,30 @@ func (m *rueidisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8,
 		return m.redisMeta.doMknod(ctx, parent, name, _type, mode, cumask, path, inode, attr)
 	}
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	// DEBUG: Check if parent inode exists before starting transaction
+	parentKey := m.inodeKey(parent)
+	testData, testErr := m.compat.Get(ctx, parentKey).Bytes()
+	if testErr != nil {
+		logger.Warnf("doMknod: PRE-TRANSACTION: Failed to read parent inode %d key=%s: %v", parent, parentKey, testErr)
+	} else {
+		logger.Warnf("doMknod: PRE-TRANSACTION: Successfully read parent inode %d, data length=%d", parent, len(testData))
+	}
+
+	logger.Debugf("doMknod: Starting transaction for parent=%d name=%s", parent, name)
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		var pattr Attr
-		data, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
+		logger.Debugf("doMknod: Inside transaction callback, reading parent inode %d key=%s", parent, parentKey)
+		data, err := tx.Get(ctx, parentKey).Bytes()
 		if err != nil {
+			logger.Warnf("doMknod: IN-TRANSACTION: Failed to get parent inode %d: %v", parent, err)
+			// In rueidiscompat, we must explicitly check for Nil within transactions
+			// Unlike go-redis where errno() handles it, transactions need explicit handling
+			if err == rueidiscompat.Nil {
+				return syscall.ENOENT
+			}
 			return err
 		}
+		logger.Debugf("doMknod: Got parent inode data, length=%d", len(data))
 		m.parseAttr(data, &pattr)
 		if pattr.Typ != TypeDirectory {
 			return syscall.ENOTDIR
@@ -3279,7 +3399,7 @@ func (m *rueidisMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr,
 		newInode int64
 	)
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		opened = false
 		*attr = Attr{}
 		newSpace, newInode = 0, 0
@@ -3462,7 +3582,7 @@ func (m *rueidisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, paren
 	var ino Ino
 	var typ uint8
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		opened = false
 		dino, dtyp = 0, 0
 		tattr = Attr{}
@@ -3798,7 +3918,7 @@ func (m *rueidisMeta) doLink(ctx Context, inode, parent Ino, name string, attr *
 
 	var newSpace, newInode int64
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		newSpace, newInode = 0, 0
 
 		rs, err := tx.MGet(ctx, m.inodeKey(parent), m.inodeKey(inode)).Result()
@@ -3928,7 +4048,7 @@ func (m *rueidisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino
 	var sattr, attr Attr
 	defer func() { m.of.InvalidateChunk(fout, invalidateAllChunks) }()
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		newLength, newSpace = 0, 0
 		rs, err := tx.MGet(ctx, m.inodeKey(fin), m.inodeKey(fout)).Result()
 		if err != nil {
@@ -4075,7 +4195,7 @@ func (m *rueidisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, s
 		return m.redisMeta.doWrite(ctx, inode, indx, off, slice, mtime, numSlices, delta, attr)
 	}
 
-	return errno(m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	return errno(m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		*delta = dirStat{}
 		*attr = Attr{}
 		data, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
@@ -4135,7 +4255,7 @@ func (m *rueidisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino,
 		}
 	}
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		entryBuf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
 		if err == rueidiscompat.Nil && m.conf.CaseInsensi {
 			if e := m.resolveCase(ctx, parent, name); e != nil {
@@ -4268,7 +4388,7 @@ func (m *rueidisMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uin
 		return m.redisMeta.doTruncate(ctx, inode, flags, length, delta, attr, skipPermCheck)
 	}
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		*delta = dirStat{}
 		var current Attr
 		data, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
@@ -4375,7 +4495,7 @@ func (m *rueidisMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64
 		return m.redisMeta.doFallocate(ctx, inode, mode, off, size, delta, attr)
 	}
 
-	err := m.compat.Watch(ctx, func(tx rueidiscompat.Tx) error {
+	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		*delta = dirStat{}
 		var current Attr
 		val, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
