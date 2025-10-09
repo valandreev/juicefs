@@ -397,7 +397,15 @@ func (m *rueidisMeta) doInit(format *Format, force bool) error {
 	if err != nil && err != rueidiscompat.Nil {
 		return err
 	}
-	if err == nil {
+
+	// Check if format exists - must check err, not just body
+	// because empty []byte is not nil even when key doesn't exist
+	var formatExists bool
+	if err == nil && len(body) > 0 {
+		formatExists = true
+	}
+
+	if formatExists {
 		var old Format
 		if err = json.Unmarshal(body, &old); err != nil {
 			return fmt.Errorf("existing format is broken: %w", err)
@@ -443,10 +451,11 @@ func (m *rueidisMeta) doInit(format *Format, force bool) error {
 		return err
 	}
 	m.fmt = format
-	if body != nil {
+	if formatExists {
 		return nil
 	}
 
+	// Create root inode
 	attr.Mode = 0777
 	return m.compat.Set(ctx, m.inodeKey(1), m.marshal(attr), 0).Err()
 }
@@ -3198,22 +3207,11 @@ func (m *rueidisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8,
 		return m.redisMeta.doMknod(ctx, parent, name, _type, mode, cumask, path, inode, attr)
 	}
 
-	// DEBUG: Check if parent inode exists before starting transaction
-	parentKey := m.inodeKey(parent)
-	testData, testErr := m.compat.Get(ctx, parentKey).Bytes()
-	if testErr != nil {
-		logger.Warnf("doMknod: PRE-TRANSACTION: Failed to read parent inode %d key=%s: %v", parent, parentKey, testErr)
-	} else {
-		logger.Warnf("doMknod: PRE-TRANSACTION: Successfully read parent inode %d, data length=%d", parent, len(testData))
-	}
-
-	logger.Debugf("doMknod: Starting transaction for parent=%d name=%s", parent, name)
 	err := m.txn(ctx, func(tx rueidiscompat.Tx) error {
 		var pattr Attr
-		logger.Debugf("doMknod: Inside transaction callback, reading parent inode %d key=%s", parent, parentKey)
+		parentKey := m.inodeKey(parent)
 		data, err := tx.Get(ctx, parentKey).Bytes()
 		if err != nil {
-			logger.Warnf("doMknod: IN-TRANSACTION: Failed to get parent inode %d: %v", parent, err)
 			// In rueidiscompat, we must explicitly check for Nil within transactions
 			// Unlike go-redis where errno() handles it, transactions need explicit handling
 			if err == rueidiscompat.Nil {
@@ -3221,7 +3219,6 @@ func (m *rueidisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8,
 			}
 			return err
 		}
-		logger.Debugf("doMknod: Got parent inode data, length=%d", len(data))
 		m.parseAttr(data, &pattr)
 		if pattr.Typ != TypeDirectory {
 			return syscall.ENOTDIR
