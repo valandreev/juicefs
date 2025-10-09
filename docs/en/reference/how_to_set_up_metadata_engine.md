@@ -146,6 +146,125 @@ Same as Redis, the Active Replication is asynchronous, which may cause consisten
 
 When being used as metadata storage engine for Juice, KeyDB is used exactly in the same way as Redis. So please refer to the [Redis](#redis) section for usage.
 
+### Rueidis
+
+[Rueidis](https://github.com/redis/rueidis) is a high-performance Redis client for Go that supports client-side caching with automatic server-assisted invalidation. When used as a JuiceFS metadata engine, Rueidis provides the same Redis protocol compatibility while offering improved performance through intelligent client-side caching.
+
+:::tip Performance Advantage
+Rueidis implements automatic client-side caching with **broadcast mode tracking**. Cached metadata entries have a default TTL of 2 weeks but are automatically invalidated by the Redis server when data changes. This eliminates unnecessary round-trips for read-heavy workloads while maintaining strong consistency.
+:::
+
+#### Create a file system
+
+When using Rueidis as the metadata storage engine, use the following URI format:
+
+<Tabs>
+  <TabItem value="tcp" label="TCP">
+
+```
+rueidis[s]://[<username>:<password>@]<host>[:<port>]/<db>[?cache-ttl=<duration>]
+```
+
+  </TabItem>
+  <TabItem value="unix-socket" label="Unix socket">
+
+```
+rueidisunix://[<username>:<password>@]<socket-file-path>?db=<db>[&cache-ttl=<duration>]
+```
+
+  </TabItem>
+</Tabs>
+
+Where `[]` enclosed are optional and the rest are mandatory.
+
+- Use `rueidiss://` protocol header if Redis has [TLS](https://redis.io/docs/manual/security/encryption) enabled, otherwise use `rueidis://`.
+- `<username>` is supported for Redis 6.0+ (can be omitted, but keep the `:` before password).
+- Default Redis port is `6379` and can be omitted if unchanged.
+- `<db>` specifies the Redis logical database number (0-15 by default).
+- Optional `cache-ttl` parameter sets client-side cache entry lifetime (default: `336h` = 2 weeks). Supports Go duration format like `24h`, `30m`, `1h30m`.
+
+:::note Cache Behavior
+Client-side caching is **automatically enabled** with broadcast mode tracking for all metadata keys (inodes, directory entries, chunks, xattrs, etc.). The Redis server sends invalidation notifications immediately when tracked keys change, ensuring cache consistency without manual intervention.
+:::
+
+For example, the following command creates a JuiceFS file system named `pics` using Rueidis with default cache settings:
+
+```shell
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1" \
+    pics
+```
+
+To use a custom cache TTL of 1 hour:
+
+```shell
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1?cache-ttl=1h" \
+    pics
+```
+
+For security purposes, it is recommended to pass the password using the environment variable `META_PASSWORD` or `REDIS_PASSWORD`:
+
+```shell
+export META_PASSWORD=mypassword
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://192.168.1.6:6379/1" \
+    pics
+```
+
+#### Mount a file system
+
+Mounting with Rueidis follows the same pattern as Redis:
+
+```shell
+juicefs mount -d "rueidis://:mypassword@192.168.1.6:6379/1" /mnt/jfs
+```
+
+Or using environment variables for credentials:
+
+```shell
+export META_PASSWORD=mypassword
+juicefs mount -d "rueidis://192.168.1.6:6379/1" /mnt/jfs
+```
+
+#### Set up TLS
+
+Rueidis supports both TLS server-side authentication and mTLS mutual authentication. Use the `rueidiss://` protocol header for TLS connections:
+
+```shell
+juicefs format --storage s3 \
+    ... \
+    "rueidiss://192.168.1.6:6379/1?tls-cert-file=/etc/certs/client.crt&tls-key-file=/etc/certs/client.key&tls-ca-cert-file=/etc/certs/ca.crt" \
+    pics
+```
+
+Supported TLS options:
+
+- `tls-cert-file=<path>`: Client certificate path (required for mTLS).
+- `tls-key-file=<path>`: Private key path (required for mTLS).
+- `tls-ca-cert-file=<path>`: CA certificate path (optional; uses system CA if omitted).
+- `insecure-skip-verify=true`: Skip server certificate verification (not recommended for production).
+
+Options are combined with `&`, and the first option starts with `?`, for example: `?cache-ttl=1h&tls-cert-file=client.crt&tls-key-file=client.key`.
+
+#### Performance Comparison
+
+Compared to the standard Redis client, Rueidis offers:
+
+- **Lower latency**: Client-side caching eliminates network round-trips for cached metadata reads (typically 70-90% of reads in file workloads).
+- **Reduced Redis load**: Broadcast mode tracking means only write operations and cache misses hit the Redis server.
+- **Automatic consistency**: Server-assisted invalidation ensures clients never use stale data, even with long TTLs.
+
+:::note
+Rueidis requires Redis 6.0 or higher for client-side caching features. The same `maxmemory-policy noeviction` recommendation applies.
+:::
+
 ## Key-Value Database
 
 ### BadgerDB

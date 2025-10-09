@@ -1,3 +1,6 @@
+//go:build !norueidis
+// +build !norueidis
+
 package meta
 
 import (

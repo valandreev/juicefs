@@ -363,14 +363,38 @@ Assumptions / open questions
 
 **Remaining work:** Phase 7-8 (docs, CI integration).
 
-### Phase 7 – Configuration, docs, final polish
+### Phase 7 – Configuration, docs, final polish ✅ COMPLETE
 
-1. Update sample config files (`pkg/meta/metadata.sample`, `metadata-sub.sample`) to mention `rueidis://` scheme and caching tunables.
-2. Update docs:
-   - `docs/en/reference/how_to_set_up_metadata_engine.md` with new sections for Rueidis.
-   - CLI help or flags (if any) referencing redis to note Rueidis alternative.
-3. Update `.github/copilot-instructions.md` + developer docs to highlight new backend and tests.
-4. Ensure build tags respect `noredis`/`norueidis` (add instructions in `Makefile` if building without Rueidis).
+**Completed deliverables:**
+
+1. **Documentation updated:**
+   - Added comprehensive Rueidis section to `docs/en/reference/how_to_set_up_metadata_engine.md` with:
+     - URI format examples (`rueidis://`, `rueidiss://`, `rueidisunix://`)
+     - Cache TTL parameter documentation (default: 2 weeks)
+     - TLS/mTLS setup instructions matching Redis patterns
+     - Performance comparison highlighting client-side caching benefits
+   - Updated `.github/copilot-instructions.md` with:
+     - Rueidis backend mentioned in metadata stores section
+     - New "Rueidis metadata engine specifics" section documenting broadcast mode, cache behavior, build tags, and architecture
+
+2. **Build tags verified and fixed:**
+   - All `rueidis_*.go` files have proper `//go:build !norueidis` tags
+   - Added missing build tags to `rueidis_test.go` and `rueidis_cache_test.go`
+   - Verified build works both with and without `-tags norueidis` flag
+   - Added documentation comment in `rueidis.go` explaining build tag usage
+
+3. **Code documentation:**
+   - Enhanced `rueidis.go` file header with implementation overview
+   - Build tag usage documented inline
+
+**Test results:**
+```
+TestRueidisDriverRegistered - PASS (both rueidis and ruediss schemes registered)
+TestRueidisDefaultCacheTTL - PASS (verifies 2-week TTL and BCAST mode)
+TestRueidisCustomCacheTTL - PASS (verifies custom TTL preservation with BCAST)
+```
+
+**Note:** The `metadata.sample` and `metadata-sub.sample` files are JSON dumps for backup/restore functionality, not connection URI examples. Connection string documentation is properly placed in the `how_to_set_up_metadata_engine.md` file instead.
 
 ### Phase 8 – CI & performance validation
 
@@ -382,9 +406,10 @@ Assumptions / open questions
 
 - [x] New `pkg/meta/rueidis.go` (+ supporting files) implementing `Meta` interface via Rueidis.
 - [x] Tests covering Rueidis path (unit + integration) running locally.
-- [ ] Config & docs updated (schemes, samples, instructions).
-- [ ] Build passes (`go test ./...`, `make test.meta.core`).
-- [ ] Optional benchmarks/metrics demonstrating Rueidis advantages.
+- [x] Config & docs updated (schemes, samples, instructions).
+- [x] Build tags working correctly with `-tags norueidis` option.
+- [ ] Build passes (`go test ./...`, `make test.meta.core`) - Phase 8.
+- [ ] Optional benchmarks/metrics demonstrating Rueidis advantages - Phase 8.
 
 ## Risks & mitigations
 

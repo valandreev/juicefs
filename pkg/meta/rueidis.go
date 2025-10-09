@@ -1,6 +1,15 @@
 //go:build !norueidis
 // +build !norueidis
 
+// Rueidis metadata engine implementation.
+//
+// This file provides a high-performance Redis-compatible metadata engine using
+// the Rueidis client library. Rueidis offers automatic client-side caching with
+// broadcast mode tracking, providing better performance than the standard Redis
+// client for read-heavy workloads.
+//
+// Build tags: Compile with `-tags norueidis` to exclude this implementation.
+
 package meta
 
 import (

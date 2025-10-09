@@ -34,7 +34,7 @@ Target: help an AI coding agent be productive immediately when editing JuiceFS (
 
 - Integration points & externals
   - Object storage clients are used throughout `pkg/object` and storage-specific code (S3, GCS, Azure). See `go.mod` for supported SDKs (aws, gcs, azblob, minio, etc.).
-  - Metadata stores include Redis, SQL (MySQL/Postgres/SQLite), TiKV, Badger, FoundationDB; implementations live under `pkg/meta` (e.g., `redis.go`, `sql_*.go`, `tkv_*.go`).
+  - Metadata stores include Redis, Rueidis (high-performance Redis client with client-side caching), SQL (MySQL/Postgres/SQLite), TiKV, Badger, FoundationDB; implementations live under `pkg/meta` (e.g., `redis.go`, `rueidis.go`, `sql_*.go`, `tkv_*.go`).
   - Tests sometimes require external services (Redis, MinIO). Refer to `Makefile` test targets and `integration/` scripts for integration test env setup.
 
 - When editing code
@@ -47,9 +47,18 @@ Target: help an AI coding agent be productive immediately when editing JuiceFS (
   - `Makefile` — build/test targets and cross-build hints
   - `pkg/meta/interface.go` — metadata contract
   - `pkg/meta/config.go` — Format and config semantics
-  - `pkg/meta/redis.go`, `pkg/meta/sql_*.go`, `pkg/meta/tkv_*.go` — engine implementations
+  - `pkg/meta/redis.go`, `pkg/meta/rueidis.go`, `pkg/meta/sql_*.go`, `pkg/meta/tkv_*.go` — engine implementations
   - `pkg/object` — object storage upload/download patterns
   - `docs/en/reference/how_to_set_up_metadata_engine.md` — operational notes for metadata engines
+
+- Rueidis metadata engine specifics (for AI working on this implementation)
+  - `pkg/meta/rueidis.go` — Rueidis metadata driver with automatic client-side caching (broadcast mode)
+  - Default cache TTL: 2 weeks (effectively infinite with server-side invalidation)
+  - Automatic broadcast tracking for all metadata key prefixes (inodes, dirs, chunks, xattrs, parents, symlinks)
+  - Redis server sends invalidation notifications immediately on writes — no polling, no manual cache management
+  - Build tag: `norueidis` to exclude from build (see `rueidis_noimpl.go`)
+  - Tests: `rueidis_*_test.go` files verify caching behavior, transaction support, Lua scripts, locking
+  - Architecture: Delegates to `baseClient` (shared Redis command interface) after connection setup
 
 - Why this matters (developer intent)
   - JuiceFS separates fast metadata operations (in-memory or DB-backed) from large object storage. Changes that blur this separation (e.g., synchronous large-object ops in metadata paths) risk performance and must be benchmarked.
