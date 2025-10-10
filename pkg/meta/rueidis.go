@@ -4209,7 +4209,7 @@ func (m *rueidisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino
 			newSpace = align4K(newLeng) - align4K(attr.Length)
 			attr.Length = newLeng
 		}
-		if err := m.checkQuota(ctx, newSpace, 0, m.getParentsCompat(ctx, tx, fout, attr.Parent)...); err != 0 {
+		if err := m.checkQuota(ctx, newSpace, 0, attr.Uid, attr.Gid, m.getParentsCompat(ctx, tx, fout, attr.Parent)...); err != 0 {
 			return err
 		}
 
@@ -4319,7 +4319,7 @@ func (m *rueidisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, s
 			delta.space = align4K(newLength) - align4K(attr.Length)
 			attr.Length = newLength
 		}
-		if err := m.checkQuota(ctx, delta.space, 0, m.getParentsCompat(ctx, tx, inode, attr.Parent)...); err != 0 {
+		if err := m.checkQuota(ctx, delta.space, 0, attr.Uid, attr.Gid, m.getParentsCompat(ctx, tx, inode, attr.Parent)...); err != 0 {
 			return err
 		}
 
@@ -4521,7 +4521,7 @@ func (m *rueidisMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uin
 		}
 		delta.length = int64(length) - int64(current.Length)
 		delta.space = align4K(length) - align4K(current.Length)
-		if err := m.checkQuota(ctx, delta.space, 0, m.getParentsCompat(ctx, tx, inode, current.Parent)...); err != 0 {
+		if err := m.checkQuota(ctx, delta.space, 0, current.Uid, current.Gid, m.getParentsCompat(ctx, tx, inode, current.Parent)...); err != 0 {
 			return err
 		}
 
@@ -4629,7 +4629,7 @@ func (m *rueidisMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64
 		old := current.Length
 		delta.length = int64(length) - int64(old)
 		delta.space = align4K(length) - align4K(old)
-		if err := m.checkQuota(ctx, delta.space, 0, m.getParentsCompat(ctx, tx, inode, current.Parent)...); err != 0 {
+		if err := m.checkQuota(ctx, delta.space, 0, current.Uid, current.Gid, m.getParentsCompat(ctx, tx, inode, current.Parent)...); err != 0 {
 			return err
 		}
 
