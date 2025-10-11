@@ -61,8 +61,8 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	uri := canonical + "://" + addr
 
 	// Parse and extract cache-ttl query parameter before passing to rueidis.ParseURL
-	// Default: 5 seconds (useful for local testing to see invalidations quickly)
-	cacheTTL := 14 * 24 * time.Hour
+	// Default: 5 seconds (good default for most scenarios)
+	cacheTTL := 10 * time.Second
 	cleanAddr := addr
 	if u, err := url.Parse(uri); err == nil {
 		if ttlStr := u.Query().Get("cache-ttl"); ttlStr != "" {
