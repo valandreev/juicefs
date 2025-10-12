@@ -46,7 +46,11 @@ func (s *Semver) String() string {
 		pr = "-" + pr
 	}
 	if strings.Contains(s.build, "Format") {
-		s.build = "unknown"
+		// When build information wasn't substituted (the Makefile/git filters
+		// left the placeholder), show a readable identifier rather than
+		// "unknown". Use "+rueidis" to indicate this build includes the
+		// Rueidis client-side caching feature branch.
+		s.build = "rueidis"
 	}
 	return fmt.Sprintf("%d.%d.%d%s+%s", s.major, s.minor, s.patch, pr, s.build)
 }
