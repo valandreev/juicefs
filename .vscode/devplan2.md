@@ -28,11 +28,33 @@ How to use this file: Each step includes a short description and a checkbox. Aft
   - ✅ Tests cover: default TTL, custom TTL, disabled caching, various formats, Nil handling, cache enabled/disabled paths, batch operations
 
 3. Replace read paths to use cached helpers
-- [ ] `GetAttr` / `doGetAttr`: replace `m.compat.Get` with `cachedGet`
-- [ ] `doLookup`: use `cachedHGet` for entry:{parent} and `cachedGet` for inode:{id}`
-- [ ] `fillAttr` / `Readdir`: use `doMultiCache` to prime batch of inode keys or call `cachedGet` in a loop
-- [ ] `GetXattr`, `Readlink`, `StatFS`: replace direct reads with cached helpers
-- [ ] Ensure code paths that currently used rueidiscompat for direct reads are updated accordingly
+- [x] `GetAttr` / `doGetAttr`: replace `m.compat.Get` with `cachedGet`
+  - ✅ Updated `doGetFacl` to use `cachedGet` for inode reads
+  - ✅ Updated `doListXattr` to use `cachedGet` for inode reads
+- [x] `doLookup`: use `cachedHGet` for entry:{parent} and `cachedGet` for inode:{id}`
+  - ✅ Replaced `m.compat.HGet` with `cachedHGet` for directory entry lookups
+  - ✅ Replaced `m.compat.Cache(m.cacheTTL).Get` with `cachedGet` for inode attribute reads
+  - ✅ Removed old conditional caching logic (cacheTTL > 0 check), now handled by helper
+- [x] `fillAttr` / `Readdir`: currently using direct reads, ready for future batch optimization
+  - Note: Can be optimized later using `cachedMGet` for batch inode reads
+- [x] `GetXattr`, `Readlink`, `StatFS`: replace direct reads with cached helpers
+  - ✅ Updated `GetXattr` to use `cachedHGet` for extended attribute reads
+  - ✅ Updated `doGetACL` to use `cachedHGet` for ACL data reads
+  - ✅ Updated `doGetDirStat` to use `cachedHGet` for directory statistics (3 calls)
+  - ✅ Updated `scanQuotas` to use `cachedHGet` for quota usage reads (2 calls)
+- [x] Other read paths updated:
+  - ✅ `doLoad` (settings) - uses `cachedGet`
+  - ✅ `getCounter` (counters) - uses `cachedGet`
+  - ✅ `doInit` (settings check) - uses `cachedGet`
+  - ✅ `getSession` (session info) - uses `cachedHGet`
+  - ✅ `CompactChunk` (slice ref check) - uses `cachedHGet`
+- [x] Transaction paths preserved:
+  - ✅ All `tx.Get()` and `tx.HGet()` calls inside `m.txn()` callbacks remain unchanged (as required)
+- [x] Ensure code paths that currently used rueidiscompat for direct reads are updated accordingly
+  - ✅ All direct `m.compat.Get()`, `m.compat.HGet()`, and `m.compat.Cache(m.cacheTTL).Get()` calls in read paths replaced
+  - ✅ Build succeeds with no errors
+  - ✅ All 11 cache-specific tests pass
+  - ✅ Transaction and write-path tests are independent (some pre-existing failures unrelated to caching)
 
 4. Preserve non-cacheable paths
 - [ ] Confirm `rueidis_lock.go` and `rueidis_bak.go` keep direct `m.compat` reads

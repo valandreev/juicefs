@@ -427,24 +427,27 @@ func (m *rueidisMeta) doLoad() ([]byte, error) {
 	if m.compat == nil {
 		return m.redisMeta.doLoad()
 	}
-	cmd := m.compat.Get(Background(), m.setting())
-	if err := cmd.Err(); err != nil {
-		if err == rueidiscompat.Nil {
-			return nil, nil
-		}
-		return nil, err
+	data, err := m.cachedGet(Background(), m.setting())
+	if err == syscall.ENOENT {
+		return nil, nil
 	}
-	return cmd.Bytes()
+	return data, err
 }
 
 func (m *rueidisMeta) getCounter(name string) (int64, error) {
 	if m.compat == nil {
 		return m.redisMeta.getCounter(name)
 	}
-	cmd := m.compat.Get(Background(), m.counterKey(name))
-	v, err := cmd.Int64()
-	if err == rueidiscompat.Nil {
-		err = nil
+	data, err := m.cachedGet(Background(), m.counterKey(name))
+	if err == syscall.ENOENT {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	v, err := strconv.ParseInt(string(data), 10, 64)
+	if err != nil {
+		return 0, err
 	}
 	// Rueidis stores nextInode/nextChunk as value-1, add 1 when reading
 	if name == "nextInode" || name == "nextChunk" {
@@ -507,8 +510,8 @@ func (m *rueidisMeta) doInit(format *Format, force bool) error {
 	}
 
 	ctx := Background()
-	body, err := m.compat.Get(ctx, m.setting()).Bytes()
-	if err != nil && err != rueidiscompat.Nil {
+	body, err := m.cachedGet(ctx, m.setting())
+	if err != nil && err != syscall.ENOENT {
 		return err
 	}
 
@@ -632,8 +635,8 @@ func (m *rueidisMeta) getSession(sid string, detail bool) (*Session, error) {
 		return m.redisMeta.getSession(sid, detail)
 	}
 	ctx := Background()
-	info, err := m.compat.HGet(ctx, m.sessionInfos(), sid).Bytes()
-	if err == rueidiscompat.Nil {
+	info, err := m.cachedHGet(ctx, m.sessionInfos(), sid)
+	if err == syscall.ENOENT {
 		info = []byte("{}")
 	} else if err != nil {
 		return nil, fmt.Errorf("HGet sessionInfos %s: %v", sid, err)
@@ -1975,7 +1978,7 @@ func (m *rueidisMeta) getACLCompat(ctx Context, tx rueidiscompat.Tx, id uint32) 
 		}
 		val = []byte(data)
 	} else {
-		val, err = m.compat.HGet(ctx, m.aclKey(), key).Bytes()
+		val, err = m.cachedHGet(ctx, m.aclKey(), key)
 		if err != nil {
 			return nil, err
 		}
@@ -2132,20 +2135,34 @@ func (m *rueidisMeta) doGetDirStat(ctx Context, ino Ino, trySync bool) (*dirStat
 	}
 
 	field := ino.String()
-	dataLength, errLength := m.compat.HGet(ctx, m.dirDataLengthKey(), field).Int64()
-	if errLength != nil && errLength != rueidiscompat.Nil {
+	dataLengthBytes, errLength := m.cachedHGet(ctx, m.dirDataLengthKey(), field)
+	if errLength != nil && errLength != syscall.ENOENT {
 		return nil, errno(errLength)
 	}
-	usedSpace, errSpace := m.compat.HGet(ctx, m.dirUsedSpaceKey(), field).Int64()
-	if errSpace != nil && errSpace != rueidiscompat.Nil {
-		return nil, errno(errSpace)
-	}
-	usedInodes, errInodes := m.compat.HGet(ctx, m.dirUsedInodesKey(), field).Int64()
-	if errInodes != nil && errInodes != rueidiscompat.Nil {
-		return nil, errno(errInodes)
+	var dataLength int64
+	if errLength == nil {
+		dataLength, _ = strconv.ParseInt(string(dataLengthBytes), 10, 64)
 	}
 
-	if errLength != rueidiscompat.Nil && errSpace != rueidiscompat.Nil && errInodes != rueidiscompat.Nil {
+	usedSpaceBytes, errSpace := m.cachedHGet(ctx, m.dirUsedSpaceKey(), field)
+	if errSpace != nil && errSpace != syscall.ENOENT {
+		return nil, errno(errSpace)
+	}
+	var usedSpace int64
+	if errSpace == nil {
+		usedSpace, _ = strconv.ParseInt(string(usedSpaceBytes), 10, 64)
+	}
+
+	usedInodesBytes, errInodes := m.cachedHGet(ctx, m.dirUsedInodesKey(), field)
+	if errInodes != nil && errInodes != syscall.ENOENT {
+		return nil, errno(errInodes)
+	}
+	var usedInodes int64
+	if errInodes == nil {
+		usedInodes, _ = strconv.ParseInt(string(usedInodesBytes), 10, 64)
+	}
+
+	if errLength != syscall.ENOENT && errSpace != syscall.ENOENT && errInodes != syscall.ENOENT {
 		if trySync && (dataLength < 0 || usedSpace < 0 || usedInodes < 0) {
 			return m.doSyncDirStat(ctx, ino)
 		}
@@ -2164,7 +2181,7 @@ func (m *rueidisMeta) doGetFacl(ctx Context, ino Ino, aclType uint8, aclId uint3
 	}
 
 	if aclId == aclAPI.None {
-		val, err := m.compat.Get(ctx, m.inodeKey(ino)).Bytes()
+		val, err := m.cachedGet(ctx, m.inodeKey(ino))
 		if err != nil {
 			return errno(err)
 		}
@@ -2464,9 +2481,10 @@ func (m *rueidisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss [
 	}, key))
 
 	if st != 0 && st != syscall.EINVAL {
-		if err := m.compat.HGet(ctx, m.sliceRefs(), m.sliceKey(id, size)).Err(); err == nil {
+		_, err := m.cachedHGet(ctx, m.sliceRefs(), m.sliceKey(id, size))
+		if err == nil {
 			st = 0
-		} else if err == rueidiscompat.Nil {
+		} else if err == syscall.ENOENT {
 			logger.Infof("compacted chunk %d was not used", id)
 			st = syscall.EINVAL
 		}
@@ -2568,8 +2586,8 @@ func (m *rueidisMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byt
 
 	defer m.timeit("GetXattr", time.Now())
 	inode = m.checkRoot(inode)
-	val, err := m.compat.HGet(ctx, m.xattrKey(inode), name).Bytes()
-	if err == rueidiscompat.Nil {
+	val, err := m.cachedHGet(ctx, m.xattrKey(inode), name)
+	if err == syscall.ENOENT {
 		return ENOATTR
 	}
 	if err != nil {
@@ -2596,7 +2614,7 @@ func (m *rueidisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.E
 		*names = append(*names, 0)
 	}
 
-	data, err := m.compat.Get(ctx, m.inodeKey(inode)).Bytes()
+	data, err := m.cachedGet(ctx, m.inodeKey(inode))
 	if err != nil {
 		return errno(err)
 	}
@@ -2825,19 +2843,21 @@ func (m *rueidisMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*
 				}
 
 				maxSpace, maxInodes := m.parseQuota(val)
-				usedSpace, err := m.compat.HGet(ctx, config.usedSpaceKey, keyStr).Int64()
-				if err != nil && err != rueidiscompat.Nil {
+				usedSpaceBytes, err := m.cachedHGet(ctx, config.usedSpaceKey, keyStr)
+				if err != nil && err != syscall.ENOENT {
 					return nil, nil, nil, err
 				}
-				if err == rueidiscompat.Nil {
-					usedSpace = 0
+				var usedSpace int64
+				if err == nil {
+					usedSpace, _ = strconv.ParseInt(string(usedSpaceBytes), 10, 64)
 				}
-				usedInodes, err := m.compat.HGet(ctx, config.usedInodesKey, keyStr).Int64()
-				if err != nil && err != rueidiscompat.Nil {
+				usedInodesBytes, err := m.cachedHGet(ctx, config.usedInodesKey, keyStr)
+				if err != nil && err != syscall.ENOENT {
 					return nil, nil, nil, err
 				}
-				if err == rueidiscompat.Nil {
-					usedInodes = 0
+				var usedInodes int64
+				if err == nil {
+					usedInodes, _ = strconv.ParseInt(string(usedInodesBytes), 10, 64)
 				}
 
 				quotas[id] = &Quota{
@@ -3154,18 +3174,13 @@ func (m *rueidisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino,
 	}
 
 	if foundIno == 0 || len(encodedAttr) == 0 {
-		buf, e := m.compat.HGet(ctx, entryKey, name).Bytes()
+		buf, e := m.cachedHGet(ctx, entryKey, name)
 		if e != nil {
 			return errno(e)
 		}
 		foundType, foundIno = m.parseEntry(buf)
 
-		// Use client-side caching for inode attribute reads if cacheTTL > 0
-		if m.cacheTTL > 0 {
-			encodedAttr, err = m.compat.Cache(m.cacheTTL).Get(ctx, m.inodeKey(foundIno)).Bytes()
-		} else {
-			encodedAttr, err = m.compat.Get(ctx, m.inodeKey(foundIno)).Bytes()
-		}
+		encodedAttr, err = m.cachedGet(ctx, m.inodeKey(foundIno))
 	} else {
 		err = nil
 	}
@@ -3175,7 +3190,7 @@ func (m *rueidisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino,
 			m.parseAttr(encodedAttr, attr)
 			m.of.Update(foundIno, attr)
 		}
-	} else if err == rueidiscompat.Nil {
+	} else if err == syscall.ENOENT {
 		if attr != nil {
 			logger.Warnf("no attribute for inode %d (%d, %s)", foundIno, parent, name)
 			*attr = Attr{Typ: foundType}
