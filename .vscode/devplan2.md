@@ -111,11 +111,18 @@ How to use this file: Each step includes a short description and a checkbox. Aft
   - Can add debug logging to track received INVALIDATE messages if needed in future
 
 7. Tests and integration
-- [ ] Add unit tests for the read-write-consistency scenarios:
-  - same-client write->read should see update
-  - different-client write->read should see update
-  - large TTL (1h) test where write must be visible immediately
-- [ ] Create small integration harness using ephemeral Redis (Docker) + two JuiceFS clients (or two processes) to validate invalidation behavior
+- [x] Add unit tests for the read-write-consistency scenarios:
+  - ✅ same-client write->read should see update (TestRueidis_SameClientWriteReadConsistency)
+  - ✅ different-client write->read should see update (TestRueidis_CrossClientWriteReadConsistency)
+  - ✅ large TTL (1h) test where write must be visible immediately (TestRueidis_LargeTTLConsistency)
+  - ✅ All tests passing after fixing CLIENT TRACKING PREFIX to match actual key format
+  - ✅ Root cause identified: tracked prefixes used hardcoded "jfs" fallback when base.prefix was empty, but keys are stored without prefix in standalone Redis
+  - ✅ Fix: removed "jfs" fallback so tracked prefixes match actual stored keys (empty prefix for standalone, "{DB}" for cluster)
+- [x] Create small integration harness using ephemeral Redis (Docker) + two JuiceFS clients (or two processes) to validate invalidation behavior
+  - ✅ Created TestRueidisIntegration_Invalidate test validating cross-client invalidation
+  - ✅ Test uses remote Redis server (no Docker required)
+  - ✅ Test validates: write from client A → cachedGet from client B sees update immediately
+  - ✅ Poll window: 30 attempts × 100ms (~3s timeout)
 
 8. Config, docs and rollout
 - [x] Document that TTL is controlled only via the connection URI `?ttl=` for Rueidis (no `meta.cache-ttl` config). Provide examples and migration notes.

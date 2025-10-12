@@ -128,9 +128,8 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	// This enables automatic cache invalidation when keys change on the server
 	// We track all keys with the metadata prefix to ensure proper invalidation
 	prefix := base.prefix
-	if prefix == "" {
-		prefix = "jfs"
-	}
+	// Note: prefix is empty for standalone Redis, or "{DB}" for cluster mode
+	// We must track keys as they are actually stored, not with a default "jfs" prefix
 	opt.ClientTrackingOptions = []string{
 		"PREFIX", prefix + "i", // inode keys
 		"PREFIX", prefix + "d", // directory entry keys
