@@ -60,18 +60,20 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	canonical := mapRueidisScheme(driver)
 	uri := canonical + "://" + addr
 
-	// Parse and extract cache-ttl query parameter before passing to rueidis.ParseURL
-	// Default: 5 seconds (good default for most scenarios)
-	cacheTTL := 10 * time.Second
+	// Parse and extract ttl query parameter before passing to rueidis.ParseURL
+	// Default: 1 hour (CSC enabled by default with server-side invalidation via BCAST)
+	// Use ?ttl=0 to disable client-side caching
+	// Examples: ?ttl=2h, ?ttl=10s, ?ttl=0
+	cacheTTL := 1 * time.Hour
 	cleanAddr := addr
 	if u, err := url.Parse(uri); err == nil {
-		if ttlStr := u.Query().Get("cache-ttl"); ttlStr != "" {
+		if ttlStr := u.Query().Get("ttl"); ttlStr != "" {
 			if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed >= 0 {
 				cacheTTL = parsed
 			}
-			// Strip cache-ttl from query params for rueidis.ParseURL
+			// Strip ttl from query params for rueidis.ParseURL
 			q := u.Query()
-			q.Del("cache-ttl")
+			q.Del("ttl")
 			u.RawQuery = q.Encode()
 			// Extract just the address part (without scheme)
 			cleanAddr = u.Host + u.Path
@@ -152,6 +154,63 @@ func (m *rueidisMeta) Shutdown() error {
 		m.client.Close()
 	}
 	return m.redisMeta.Shutdown()
+}
+
+// cachedGet performs a GET operation with client-side caching enabled.
+// It returns the value as bytes or an error. Returns ENOENT if key doesn't exist.
+// Uses m.cacheTTL from the connection URI (?ttl=) to control cache duration.
+// When cacheTTL is 0, caching is disabled and a direct GET is performed.
+func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
+	if m.cacheTTL > 0 {
+		// Use client-side caching with server-assisted invalidation (BCAST mode)
+		data, err := m.compat.Cache(m.cacheTTL).Get(ctx, key).Bytes()
+		if err == rueidiscompat.Nil {
+			return nil, syscall.ENOENT
+		}
+		return data, err
+	}
+	// Caching disabled (?ttl=0)
+	data, err := m.compat.Get(ctx, key).Bytes()
+	if err == rueidiscompat.Nil {
+		return nil, syscall.ENOENT
+	}
+	return data, err
+}
+
+// cachedHGet performs an HGET operation with client-side caching enabled.
+// It returns the field value as bytes or an error. Returns ENOENT if key or field doesn't exist.
+// Uses m.cacheTTL from the connection URI (?ttl=) to control cache duration.
+// When cacheTTL is 0, caching is disabled and a direct HGET is performed.
+func (m *rueidisMeta) cachedHGet(ctx Context, key string, field string) ([]byte, error) {
+	if m.cacheTTL > 0 {
+		// Use client-side caching with server-assisted invalidation (BCAST mode)
+		data, err := m.compat.Cache(m.cacheTTL).HGet(ctx, key, field).Bytes()
+		if err == rueidiscompat.Nil {
+			return nil, syscall.ENOENT
+		}
+		return data, err
+	}
+	// Caching disabled (?ttl=0)
+	data, err := m.compat.HGet(ctx, key, field).Bytes()
+	if err == rueidiscompat.Nil {
+		return nil, syscall.ENOENT
+	}
+	return data, err
+}
+
+// cachedMGet performs a batch GET operation with client-side caching enabled.
+// It returns a map of key -> RedisMessage with cached results.
+// Uses rueidis.MGetCache for efficient batched caching when m.cacheTTL > 0.
+// When cacheTTL is 0, this method currently returns an error (not implemented for non-cached path).
+// TODO(Step 2): Implement non-cached DoMulti path if needed, or require cacheTTL > 0 for batch operations.
+func (m *rueidisMeta) cachedMGet(ctx Context, keys []string) (map[string]rueidis.RedisMessage, error) {
+	if m.cacheTTL > 0 {
+		// Use MGetCache for efficient batched client-side caching
+		return rueidis.MGetCache(m.client, ctx, m.cacheTTL, keys)
+	}
+	// For now, batch operations require caching enabled
+	// Individual cachedGet calls can be used as fallback when caching is disabled
+	return nil, fmt.Errorf("batch operations require cacheTTL > 0; use individual cachedGet calls or enable caching via ?ttl= URI parameter")
 }
 
 // replaceErrnoCompat wraps a transaction function to convert syscall.Errno to errNo

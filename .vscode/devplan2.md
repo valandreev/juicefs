@@ -5,18 +5,27 @@ Goal: Fully enable Rueidis client-side caching so reads use local cache with ser
 How to use this file: Each step includes a short description and a checkbox. After you complete a step, update the checkbox to [x] and commit the change. For code changes, link to PR/commit SHA next to the step.
 
 1. Design cached-read helpers
-- [ ] Decide TTL default (suggest: 1h) and ensure TTL is sourced only from the connection URI `?ttl=` (e.g., `?ttl=2h`, `?ttl=10s`, `?ttl=0` to disable). Remove reliance on any `meta.cache-ttl` config for Rueidis connections.
-- [ ] Define helper APIs to implement in `pkg/meta/rueidis.go`:
-  - `cachedGet(ctx Context, key string) ([]byte, error)`
-  - `cachedHGet(ctx Context, key string, field string) ([]byte, error)`
-  - `doMultiCache(ctx Context, keys []string) ([][]byte, error)`
-- Notes: Map `rueidiscompat.Nil` -> ENOENT. Helpers must accept `Context` for tracing and timeouts.
+- [x] Decide TTL default (suggest: 1h) and ensure TTL is sourced only from the connection URI `?ttl=` (e.g., `?ttl=2h`, `?ttl=10s`, `?ttl=0` to disable). Remove reliance on any `meta.cache-ttl` config for Rueidis connections.
+  - ✅ Changed default TTL from 10s to 1h
+  - ✅ Changed URI parameter from `cache-ttl` to `ttl`
+  - ✅ Updated documentation in code comments
+- [x] Define helper APIs to implement in `pkg/meta/rueidis.go`:
+  - ✅ `cachedGet(ctx Context, key string) ([]byte, error)` - GET with CSC, maps rueidiscompat.Nil to ENOENT
+  - ✅ `cachedHGet(ctx Context, key string, field string) ([]byte, error)` - HGET with CSC, maps rueidiscompat.Nil to ENOENT  
+  - ✅ `cachedMGet(ctx Context, keys []string) (map[string]rueidis.RedisMessage, error)` - Batch GET with MGetCache (requires cacheTTL > 0)
+- Notes: All helpers check `m.cacheTTL > 0` and fall back to direct operations when caching is disabled. Commit: (pending)
 
 2. Implement cached helpers
-- [ ] Implement `cachedGet` using `m.compat.Cache(ttl).Get(ctx, key)` or Rueidis equivalent
-- [ ] Implement `cachedHGet` using `.Cache(ttl).HGet(ctx, key, field)`
-- [ ] Implement `doMultiCache` using `DoMultiCache` or `MGetCache` for batches
-- [ ] Add unit tests for these helpers (Nil case, normal cache hit/miss behavior)
+- [x] Implement `cachedGet` using `m.compat.Cache(ttl).Get(ctx, key)` or Rueidis equivalent
+  - ✅ Implemented with Nil → ENOENT mapping and TTL > 0 check
+- [x] Implement `cachedHGet` using `.Cache(ttl).HGet(ctx, key, field)`
+  - ✅ Implemented with Nil → ENOENT mapping and TTL > 0 check
+- [x] Implement `doMultiCache` using `DoMultiCache` or `MGetCache` for batches
+  - ✅ Implemented `cachedMGet` using `rueidis.MGetCache` (requires TTL > 0)
+- [x] Add unit tests for these helpers (Nil case, normal cache hit/miss behavior)
+  - ✅ Added 11 comprehensive tests in `pkg/meta/rueidis_cache_test.go`
+  - ✅ All tests pass (updated existing tests to use `?ttl=` and 1h default)
+  - ✅ Tests cover: default TTL, custom TTL, disabled caching, various formats, Nil handling, cache enabled/disabled paths, batch operations
 
 3. Replace read paths to use cached helpers
 - [ ] `GetAttr` / `doGetAttr`: replace `m.compat.Get` with `cachedGet`
