@@ -79,7 +79,7 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	//   When enabled, writes will prime the cache with fresh data after update
 	//   Note: Server-side invalidation is usually sufficient; priming adds overhead
 	cacheTTL := 1 * time.Hour
-	enablePrime := false
+	enablePrime := true
 	cleanAddr := addr
 
 	if u, err := url.Parse(uri); err == nil {
