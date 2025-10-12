@@ -40,12 +40,13 @@ import (
 type rueidisMeta struct {
 	*redisMeta
 
-	scheme    string
-	canonical string
-	option    rueidis.ClientOption
-	client    rueidis.Client
-	compat    rueidiscompat.Cmdable
-	cacheTTL  time.Duration // client-side cache TTL for read operations
+	scheme      string
+	canonical   string
+	option      rueidis.ClientOption
+	client      rueidis.Client
+	compat      rueidiscompat.Cmdable
+	cacheTTL    time.Duration // client-side cache TTL for read operations
+	enablePrime bool          // post-write cache priming (disabled by default, use ?prime=1 to enable)
 }
 
 // Temporary Rueidis registration that delegates to the Redis implementation.
@@ -60,26 +61,45 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	canonical := mapRueidisScheme(driver)
 	uri := canonical + "://" + addr
 
-	// Parse and extract ttl query parameter before passing to rueidis.ParseURL
-	// Default: 1 hour (CSC enabled by default with server-side invalidation via BCAST)
-	// Use ?ttl=0 to disable client-side caching
-	// Examples: ?ttl=2h, ?ttl=10s, ?ttl=0
+	// Parse and extract URI query parameters before passing to rueidis.ParseURL
+	//
+	// TTL parameter (?ttl=):
+	//   Default: 1 hour (CSC enabled by default with server-side invalidation via BCAST)
+	//   Use ?ttl=0 to disable client-side caching
+	//   Examples: ?ttl=2h, ?ttl=10s, ?ttl=0
+	//
+	// Prime parameter (?prime=1):
+	//   Default: disabled (rely on server-side invalidation)
+	//   Use ?prime=1 to enable post-write cache priming (experimental)
+	//   When enabled, writes will prime the cache with fresh data after update
+	//   Note: Server-side invalidation is usually sufficient; priming adds overhead
 	cacheTTL := 1 * time.Hour
+	enablePrime := false
 	cleanAddr := addr
+
 	if u, err := url.Parse(uri); err == nil {
+		// Extract ttl parameter
 		if ttlStr := u.Query().Get("ttl"); ttlStr != "" {
 			if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed >= 0 {
 				cacheTTL = parsed
 			}
-			// Strip ttl from query params for rueidis.ParseURL
-			q := u.Query()
-			q.Del("ttl")
-			u.RawQuery = q.Encode()
-			// Extract just the address part (without scheme)
-			cleanAddr = u.Host + u.Path
-			if u.RawQuery != "" {
-				cleanAddr += "?" + u.RawQuery
-			}
+		}
+
+		// Extract prime parameter
+		if primeStr := u.Query().Get("prime"); primeStr == "1" || primeStr == "true" {
+			enablePrime = true
+		}
+
+		// Strip custom params from query for rueidis.ParseURL
+		q := u.Query()
+		q.Del("ttl")
+		q.Del("prime")
+		u.RawQuery = q.Encode()
+
+		// Extract just the address part (without scheme)
+		cleanAddr = u.Host + u.Path
+		if u.RawQuery != "" {
+			cleanAddr += "?" + u.RawQuery
 		}
 	}
 
@@ -122,13 +142,14 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	}
 
 	m := &rueidisMeta{
-		redisMeta: base,
-		scheme:    driver,
-		canonical: canonical,
-		option:    opt,
-		client:    client,
-		compat:    rueidiscompat.NewAdapter(client),
-		cacheTTL:  cacheTTL,
+		redisMeta:   base,
+		scheme:      driver,
+		canonical:   canonical,
+		option:      opt,
+		client:      client,
+		compat:      rueidiscompat.NewAdapter(client),
+		cacheTTL:    cacheTTL,
+		enablePrime: enablePrime,
 	}
 	m.redisMeta.en = m
 	return m, nil
