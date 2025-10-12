@@ -160,6 +160,12 @@ func (m *rueidisMeta) Shutdown() error {
 // It returns the value as bytes or an error. Returns ENOENT if key doesn't exist.
 // Uses m.cacheTTL from the connection URI (?ttl=) to control cache duration.
 // When cacheTTL is 0, caching is disabled and a direct GET is performed.
+//
+// DO NOT USE in these contexts:
+//   - Inside m.txn() callbacks - use tx.Get() directly for transaction consistency
+//   - Lock operations (rueidis_lock.go) - require strong consistency
+//   - Backup/restore (rueidis_bak.go) - require authoritative data
+//   - Any write path that needs read-modify-write atomicity
 func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
 	if m.cacheTTL > 0 {
 		// Use client-side caching with server-assisted invalidation (BCAST mode)
@@ -181,6 +187,12 @@ func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
 // It returns the field value as bytes or an error. Returns ENOENT if key or field doesn't exist.
 // Uses m.cacheTTL from the connection URI (?ttl=) to control cache duration.
 // When cacheTTL is 0, caching is disabled and a direct HGET is performed.
+//
+// DO NOT USE in these contexts:
+//   - Inside m.txn() callbacks - use tx.HGet() directly for transaction consistency
+//   - Lock operations (rueidis_lock.go) - require strong consistency
+//   - Backup/restore (rueidis_bak.go) - require authoritative data
+//   - Any write path that needs read-modify-write atomicity
 func (m *rueidisMeta) cachedHGet(ctx Context, key string, field string) ([]byte, error) {
 	if m.cacheTTL > 0 {
 		// Use client-side caching with server-assisted invalidation (BCAST mode)
@@ -228,6 +240,12 @@ func replaceErrnoCompat(txf func(tx rueidiscompat.Tx) error) func(tx rueidiscomp
 // txn wraps rueidiscompat.Watch with retry logic and pessimistic locking
 // to match redisMeta.txn behavior. This ensures transaction consistency
 // and handles optimistic lock failures (TxFailedErr) with exponential backoff.
+//
+// IMPORTANT: Code inside the txf callback MUST use tx.Get/tx.HGet directly,
+// NOT the cached helpers (cachedGet/cachedHGet). Transaction reads require
+// strong consistency and must see the exact state at transaction time to
+// ensure correct WATCH/MULTI/EXEC behavior. Using cached reads could lead
+// to stale data being used in transactions, causing race conditions.
 func (m *rueidisMeta) txn(ctx Context, txf func(tx rueidiscompat.Tx) error, keys ...string) error {
 	if m.compat == nil {
 		// If compat is not initialized, this is a critical error

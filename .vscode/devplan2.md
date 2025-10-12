@@ -57,8 +57,16 @@ How to use this file: Each step includes a short description and a checkbox. Aft
   - ✅ Transaction and write-path tests are independent (some pre-existing failures unrelated to caching)
 
 4. Preserve non-cacheable paths
-- [ ] Confirm `rueidis_lock.go` and `rueidis_bak.go` keep direct `m.compat` reads
-- [ ] Add comments explaining why cache is disabled in these files (consistency/backup correctness)
+- [x] Confirm `rueidis_lock.go` and `rueidis_bak.go` keep direct `m.compat` reads
+  - ✅ Verified rueidis_lock.go uses tx.HGet() inside m.txn() callbacks (line 164)
+  - ✅ Verified rueidis_bak.go contains no cached reads, only direct m.compat operations
+  - ✅ All transaction paths in rueidis.go verified to use tx.Get/tx.HGet directly
+- [x] Add comments explaining why cache is disabled in these files (consistency/backup correctness)
+  - ✅ Added comprehensive comment to rueidis_lock.go explaining locks require strong consistency
+  - ✅ Added comprehensive comment to rueidis_bak.go explaining backups require authoritative data
+  - ✅ Enhanced m.txn() function documentation with IMPORTANT note about transaction reads
+  - ✅ Enhanced cachedGet/cachedHGet documentation with "DO NOT USE" contexts list
+  - ✅ Build successful, all 11 cache tests passing
 
 5. Write-paths and optional priming
 - [ ] Audit all write operations (Create, Unlink, Rename, SetAttr, Truncate, Fallocate, Mknod) to ensure they update the same keys used by read helpers

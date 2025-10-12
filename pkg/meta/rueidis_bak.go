@@ -33,6 +33,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// NOTE: Backup/restore operations must NOT use client-side caching helpers.
+// Backup requires reading the exact current state from Redis to ensure data
+// integrity and consistency. All reads in this file use direct m.compat operations
+// to bypass any caching layer and guarantee we're reading authoritative data.
+
 // Rueidis-specific backup operations that use m.compat instead of m.rdb.
 // Most of the backup/restore logic is inherited from redisMeta, but methods
 // that directly use m.rdb need Rueidis-specific implementations.

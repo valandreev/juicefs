@@ -29,6 +29,11 @@ import (
 	"github.com/redis/rueidis/rueidiscompat"
 )
 
+// NOTE: Lock operations must NOT use client-side caching helpers (cachedGet/cachedHGet).
+// Lock state must always be read directly from Redis within transactions to ensure
+// strong consistency and avoid race conditions. All lock reads use tx.Get/tx.HGet
+// inside m.txn() callbacks, which provide WATCH/MULTI/EXEC transaction guarantees.
+
 // Flock implements BSD advisory file locking.
 func (m *rueidisMeta) Flock(ctx Context, inode Ino, owner uint64, ltype uint32, block bool) syscall.Errno {
 	if m.compat == nil {
