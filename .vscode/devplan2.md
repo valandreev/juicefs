@@ -5,7 +5,7 @@ Goal: Fully enable Rueidis client-side caching so reads use local cache with ser
 How to use this file: Each step includes a short description and a checkbox. After you complete a step, update the checkbox to [x] and commit the change. For code changes, link to PR/commit SHA next to the step.
 
 1. Design cached-read helpers
-- [ ] Decide TTL config key (suggest: `meta.cache-ttl`) and default (suggest: 1h or 10s during testing)
+- [ ] Decide TTL default (suggest: 1h) and ensure TTL is sourced only from the connection URI `?ttl=` (e.g., `?ttl=2h`, `?ttl=10s`, `?ttl=0` to disable). Remove reliance on any `meta.cache-ttl` config for Rueidis connections.
 - [ ] Define helper APIs to implement in `pkg/meta/rueidis.go`:
   - `cachedGet(ctx Context, key string) ([]byte, error)`
   - `cachedHGet(ctx Context, key string, field string) ([]byte, error)`
@@ -47,9 +47,9 @@ How to use this file: Each step includes a short description and a checkbox. Aft
 - [ ] Create small integration harness using ephemeral Redis (Docker) + two JuiceFS clients (or two processes) to validate invalidation behavior
 
 8. Config, docs and rollout
-- [ ] Add `meta.cache-ttl` to config schema and default values in docs
+- [ ] Document that TTL is controlled only via the connection URI `?ttl=` for Rueidis (no `meta.cache-ttl` config). Provide examples and migration notes.
 - [ ] Document usage in `docs/en/reference` and `.vscode/metafix.md` (link to this PR and tests)
-- [ ] Add CLI flags (e.g., `--meta-cache-ttl`) for local testing
+- [ ] Add example CLI/testing flags (e.g., a `--rueidis-ttl` option for developers), but avoid introducing a persistent `meta.cache-ttl` config; prefer URI-based TTL for production.
 
 9. Code review & monitored rollout
 - [ ] Open PR, request reviews from Rueidis and JuiceFS maintainers
@@ -70,4 +70,14 @@ Notes:
 - Don't cache in transactional code paths; transactions must use direct reads.
 - Prefer server-side invalidation; avoid eager priming unless necessary.
 - Consider switching to OPTIN tracking later for large-scale deployments.
+
+Configuration defaults (policy)
+- [ ] CSC (client-side caching) must be ENABLED by default for the Rueidis metadata client in BCAST mode. This is the default behavior when the metadata URI does not explicitly disable caching.
+- [ ] To explicitly disable CSC for a Rueidis connection, use the TTL query parameter `?ttl=0` in the metadata URI, e.g.:
+  - `rueidis://ip:6379/0?ttl=0` (disable caching)
+- [ ] To set TTL via the metadata URI use `?ttl=` with a duration suffix, examples:
+  - `rueidis://ip:6379/0?ttl=2h` sets caching TTL to 2 hours
+  - `rueidis://ip:6379/0?ttl=10s` sets caching TTL to 10 seconds
+- [ ] TTL for Rueidis is controlled only via the connection URI `?ttl=`. Legacy `meta.cache-ttl` (if present) is ignored for Rueidis connections; document migration path if necessary.
+- [ ] These defaults and URI parsing apply ONLY to the Rueidis metadata client. The existing go-redis (`redis.go`) implementation remains unchanged and continues to operate without automatic client-side caching unless explicitly adapted later.
 
