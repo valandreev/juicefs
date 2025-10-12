@@ -151,7 +151,7 @@ When being used as metadata storage engine for Juice, KeyDB is used exactly in t
 [Rueidis](https://github.com/redis/rueidis) is a high-performance Redis client for Go that supports client-side caching with automatic server-assisted invalidation. When used as a JuiceFS metadata engine, Rueidis provides the same Redis protocol compatibility while offering improved performance through intelligent client-side caching.
 
 :::tip Performance Advantage
-Rueidis implements automatic client-side caching with **broadcast mode tracking**. Cached metadata entries have a default TTL of 2 weeks but are automatically invalidated by the Redis server when data changes. This eliminates unnecessary round-trips for read-heavy workloads while maintaining strong consistency.
+Rueidis implements automatic client-side caching with **broadcast mode (BCAST) tracking**. Cached metadata entries have a default TTL of 1 hour but are automatically invalidated by the Redis server when data changes. This eliminates unnecessary round-trips for read-heavy workloads while maintaining strong consistency.
 :::
 
 #### Create a file system
@@ -162,14 +162,14 @@ When using Rueidis as the metadata storage engine, use the following URI format:
   <TabItem value="tcp" label="TCP">
 
 ```
-rueidis[s]://[<username>:<password>@]<host>[:<port>]/<db>[?cache-ttl=<duration>]
+rueidis[s]://[<username>:<password>@]<host>[:<port>]/<db>[?ttl=<duration>][&prime=<0|1>]
 ```
 
   </TabItem>
   <TabItem value="unix-socket" label="Unix socket">
 
 ```
-rueidisunix://[<username>:<password>@]<socket-file-path>?db=<db>[&cache-ttl=<duration>]
+rueidisunix://[<username>:<password>@]<socket-file-path>?db=<db>[&ttl=<duration>][&prime=<0|1>]
 ```
 
   </TabItem>
@@ -181,13 +181,20 @@ Where `[]` enclosed are optional and the rest are mandatory.
 - `<username>` is supported for Redis 6.0+ (can be omitted, but keep the `:` before password).
 - Default Redis port is `6379` and can be omitted if unchanged.
 - `<db>` specifies the Redis logical database number (0-15 by default).
-- Optional `cache-ttl` parameter sets client-side cache entry lifetime (default: `336h` = 2 weeks). Supports Go duration format like `24h`, `30m`, `1h30m`.
+- Optional `ttl` parameter sets client-side cache entry lifetime (default: `1h` = 1 hour). Supports Go duration format like `2h`, `30m`, `10s`, `500ms`. Use `ttl=0` to disable caching.
+- Optional `prime=1` enables post-write cache priming (default: `0` = disabled). Server-side invalidation is usually sufficient.
 
 :::note Cache Behavior
-Client-side caching is **automatically enabled** with broadcast mode tracking for all metadata keys (inodes, directory entries, chunks, xattrs, etc.). The Redis server sends invalidation notifications immediately when tracked keys change, ensuring cache consistency without manual intervention.
+Client-side caching is **automatically enabled** with broadcast mode (BCAST) tracking for all metadata read operations. The Redis server sends INVALIDATE notifications immediately when tracked keys change, ensuring cache consistency across all clients. Key types tracked include:
+- Inode attributes (file/directory metadata)
+- Directory entries (file listings)
+- Extended attributes (xattrs, ACLs)
+- Directory statistics (usage counters)
+- Quota usage
+- Global counters and settings
 :::
 
-For example, the following command creates a JuiceFS file system named `pics` using Rueidis with default cache settings:
+For example, the following command creates a JuiceFS file system named `pics` using Rueidis with default cache settings (1 hour TTL):
 
 ```shell
 juicefs format \
@@ -197,13 +204,23 @@ juicefs format \
     pics
 ```
 
-To use a custom cache TTL of 1 hour:
+To use a custom cache TTL of 2 hours:
 
 ```shell
 juicefs format \
     --storage s3 \
     ... \
-    "rueidis://:mypassword@192.168.1.6:6379/1?cache-ttl=1h" \
+    "rueidis://:mypassword@192.168.1.6:6379/1?ttl=2h" \
+    pics
+```
+
+To disable client-side caching (for testing or debugging):
+
+```shell
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1?ttl=0" \
     pics
 ```
 
@@ -233,6 +250,13 @@ export META_PASSWORD=mypassword
 juicefs mount -d "rueidis://192.168.1.6:6379/1" /mnt/jfs
 ```
 
+To mount with custom cache TTL:
+
+```shell
+export META_PASSWORD=mypassword
+juicefs mount -d "rueidis://192.168.1.6:6379/1?ttl=2h" /mnt/jfs
+```
+
 #### Set up TLS
 
 Rueidis supports both TLS server-side authentication and mTLS mutual authentication. Use the `rueidiss://` protocol header for TLS connections:
@@ -251,18 +275,48 @@ Supported TLS options:
 - `tls-ca-cert-file=<path>`: CA certificate path (optional; uses system CA if omitted).
 - `insecure-skip-verify=true`: Skip server certificate verification (not recommended for production).
 
-Options are combined with `&`, and the first option starts with `?`, for example: `?cache-ttl=1h&tls-cert-file=client.crt&tls-key-file=client.key`.
+Options are combined with `&`, and the first option starts with `?`, for example: `?ttl=1h&tls-cert-file=client.crt&tls-key-file=client.key`.
 
 #### Performance Comparison
 
-Compared to the standard Redis client, Rueidis offers:
+Compared to the standard Redis client (`redis://`), Rueidis offers:
 
 - **Lower latency**: Client-side caching eliminates network round-trips for cached metadata reads (typically 70-90% of reads in file workloads).
 - **Reduced Redis load**: Broadcast mode tracking means only write operations and cache misses hit the Redis server.
 - **Automatic consistency**: Server-assisted invalidation ensures clients never use stale data, even with long TTLs.
+- **Better concurrency**: Automatic pipelining and connection pooling improve performance under high concurrency.
 
-:::note
-Rueidis requires Redis 6.0 or higher for client-side caching features. The same `maxmemory-policy noeviction` recommendation applies.
+#### Monitoring Cache Performance
+
+Rueidis exposes Prometheus metrics for cache monitoring:
+
+- `rueidis_cache_hits_total`: Count of cache-enabled operations (TTL > 0)
+- `rueidis_cache_misses_total`: Count of direct operations (TTL = 0, caching disabled)
+
+For debugging cache state, you can query Redis tracking information using the `CLIENT TRACKINGINFO` command. This shows:
+- Active tracking mode (should be `on` and `bcast`)
+- Key prefixes being tracked
+- Number of tracked keys
+- Invalidation statistics
+
+:::tip Migration from Redis
+To migrate an existing JuiceFS file system from `redis://` to `rueidis://`, simply change the scheme in your metadata URL:
+
+**Before:**
+```shell
+juicefs mount -d "redis://192.168.1.6:6379/1" /mnt/jfs
+```
+
+**After:**
+```shell
+juicefs mount -d "rueidis://192.168.1.6:6379/1" /mnt/jfs
+```
+
+The metadata format is identical—only the client implementation changes. You can start with a conservative TTL (like `?ttl=10s`) and increase it gradually after monitoring performance.
+:::
+
+:::note Requirements
+Rueidis requires Redis 6.0 or higher for client-side caching features (CLIENT TRACKING support). The same `maxmemory-policy noeviction` recommendation applies as with standard Redis.
 :::
 
 ## Key-Value Database

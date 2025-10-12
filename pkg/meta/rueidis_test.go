@@ -250,3 +250,72 @@ func TestRueidisSmoke(t *testing.T) {
 		rueidisClient.Rmdir(ctx, RootInode, "dir")
 	})
 }
+
+// TestGetCacheTrackingInfo verifies that CLIENT TRACKINGINFO can be queried for debugging
+func TestGetCacheTrackingInfo(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	t.Run("caching enabled", func(t *testing.T) {
+		url := "rueidis://100.121.51.13:6379/4?ttl=1h"
+		m := NewClient(url, &Config{})
+		if m == nil {
+			t.Fatal("Cannot connect to Rueidis test server")
+		}
+		defer m.Shutdown()
+
+		rueidisClient, ok := m.(*rueidisMeta)
+		if !ok {
+			t.Fatal("Expected rueidisMeta client")
+		}
+
+		info, err := rueidisClient.GetCacheTrackingInfo(Background())
+		if err != nil {
+			t.Fatalf("GetCacheTrackingInfo failed: %v", err)
+		}
+
+		// Verify tracking is active
+		if flags, ok := info["flags"].([]string); ok {
+			found := false
+			for _, flag := range flags {
+				if flag == "on" || flag == "bcast" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("Expected tracking to be 'on' or 'bcast', got flags: %v", flags)
+			}
+		}
+
+		// Verify JuiceFS metadata is present
+		if ttl, ok := info["juicefs_cache_ttl"].(string); !ok || ttl == "" {
+			t.Errorf("Expected juicefs_cache_ttl in info, got: %v", info)
+		}
+	})
+
+	t.Run("caching disabled", func(t *testing.T) {
+		url := "rueidis://100.121.51.13:6379/3?ttl=0"
+		m := NewClient(url, &Config{})
+		if m == nil {
+			t.Fatal("Cannot connect to Rueidis test server")
+		}
+		defer m.Shutdown()
+
+		rueidisClient, ok := m.(*rueidisMeta)
+		if !ok {
+			t.Fatal("Expected rueidisMeta client")
+		}
+
+		info, err := rueidisClient.GetCacheTrackingInfo(Background())
+		if err != nil {
+			t.Fatalf("GetCacheTrackingInfo failed: %v", err)
+		}
+
+		// Should return status message when caching disabled
+		if status, ok := info["status"].(string); !ok || status != "caching disabled (ttl=0)" {
+			t.Errorf("Expected 'caching disabled' status, got: %v", info)
+		}
+	})
+}

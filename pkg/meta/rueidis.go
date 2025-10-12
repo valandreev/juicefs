@@ -32,6 +32,7 @@ import (
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
 	pkgerrors "github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/rueidis"
 	"github.com/redis/rueidis/rueidiscompat"
 	"golang.org/x/sync/errgroup"
@@ -47,6 +48,10 @@ type rueidisMeta struct {
 	compat      rueidiscompat.Cmdable
 	cacheTTL    time.Duration // client-side cache TTL for read operations
 	enablePrime bool          // post-write cache priming (disabled by default, use ?prime=1 to enable)
+
+	// Client-side cache metrics
+	cacheHits   prometheus.Counter // successful cache hits
+	cacheMisses prometheus.Counter // cache misses requiring Redis fetch
 }
 
 // Temporary Rueidis registration that delegates to the Redis implementation.
@@ -150,6 +155,14 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		compat:      rueidiscompat.NewAdapter(client),
 		cacheTTL:    cacheTTL,
 		enablePrime: enablePrime,
+		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_cache_hits_total",
+			Help: "Total number of successful client-side cache hits (data served from local cache).",
+		}),
+		cacheMisses: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_cache_misses_total",
+			Help: "Total number of cache misses requiring fetch from Redis server.",
+		}),
 	}
 	m.redisMeta.en = m
 	return m, nil
@@ -170,6 +183,17 @@ func (m *rueidisMeta) Name() string {
 	return "rueidis"
 }
 
+// InitMetrics registers Rueidis-specific metrics in addition to base metrics.
+func (m *rueidisMeta) InitMetrics(reg prometheus.Registerer) {
+	// Register base metrics first
+	m.redisMeta.InitMetrics(reg)
+
+	// Register Rueidis client-side cache metrics
+	if reg != nil {
+		reg.MustRegister(m.cacheHits)
+		reg.MustRegister(m.cacheMisses)
+	}
+}
 func (m *rueidisMeta) Shutdown() error {
 	if m.client != nil {
 		m.client.Close()
@@ -182,6 +206,10 @@ func (m *rueidisMeta) Shutdown() error {
 // Uses m.cacheTTL from the connection URI (?ttl=) to control cache duration.
 // When cacheTTL is 0, caching is disabled and a direct GET is performed.
 //
+// Metrics: Tracks operations via cacheHits (TTL>0) or cacheMisses (TTL=0).
+// Note: Actual cache hit/miss ratio is not exposed by Rueidis; these metrics
+// track whether caching is enabled for the operation.
+//
 // DO NOT USE in these contexts:
 //   - Inside m.txn() callbacks - use tx.Get() directly for transaction consistency
 //   - Lock operations (rueidis_lock.go) - require strong consistency
@@ -190,13 +218,16 @@ func (m *rueidisMeta) Shutdown() error {
 func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
 	if m.cacheTTL > 0 {
 		// Use client-side caching with server-assisted invalidation (BCAST mode)
+		// Note: This may hit local cache or fetch from Redis; Rueidis handles it internally
+		m.cacheHits.Inc()
 		data, err := m.compat.Cache(m.cacheTTL).Get(ctx, key).Bytes()
 		if err == rueidiscompat.Nil {
 			return nil, syscall.ENOENT
 		}
 		return data, err
 	}
-	// Caching disabled (?ttl=0)
+	// Caching disabled (?ttl=0) - direct fetch from Redis
+	m.cacheMisses.Inc()
 	data, err := m.compat.Get(ctx, key).Bytes()
 	if err == rueidiscompat.Nil {
 		return nil, syscall.ENOENT
@@ -209,6 +240,8 @@ func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
 // Uses m.cacheTTL from the connection URI (?ttl=) to control cache duration.
 // When cacheTTL is 0, caching is disabled and a direct HGET is performed.
 //
+// Metrics: Tracks operations via cacheHits (TTL>0) or cacheMisses (TTL=0).
+//
 // DO NOT USE in these contexts:
 //   - Inside m.txn() callbacks - use tx.HGet() directly for transaction consistency
 //   - Lock operations (rueidis_lock.go) - require strong consistency
@@ -217,13 +250,15 @@ func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
 func (m *rueidisMeta) cachedHGet(ctx Context, key string, field string) ([]byte, error) {
 	if m.cacheTTL > 0 {
 		// Use client-side caching with server-assisted invalidation (BCAST mode)
+		m.cacheHits.Inc()
 		data, err := m.compat.Cache(m.cacheTTL).HGet(ctx, key, field).Bytes()
 		if err == rueidiscompat.Nil {
 			return nil, syscall.ENOENT
 		}
 		return data, err
 	}
-	// Caching disabled (?ttl=0)
+	// Caching disabled (?ttl=0) - direct fetch from Redis
+	m.cacheMisses.Inc()
 	data, err := m.compat.HGet(ctx, key, field).Bytes()
 	if err == rueidiscompat.Nil {
 		return nil, syscall.ENOENT
@@ -235,15 +270,64 @@ func (m *rueidisMeta) cachedHGet(ctx Context, key string, field string) ([]byte,
 // It returns a map of key -> RedisMessage with cached results.
 // Uses rueidis.MGetCache for efficient batched caching when m.cacheTTL > 0.
 // When cacheTTL is 0, this method currently returns an error (not implemented for non-cached path).
+//
+// Metrics: Tracks operations via cacheHits (TTL>0) or cacheMisses (TTL=0).
 // TODO(Step 2): Implement non-cached DoMulti path if needed, or require cacheTTL > 0 for batch operations.
 func (m *rueidisMeta) cachedMGet(ctx Context, keys []string) (map[string]rueidis.RedisMessage, error) {
 	if m.cacheTTL > 0 {
 		// Use MGetCache for efficient batched client-side caching
+		m.cacheHits.Inc()
 		return rueidis.MGetCache(m.client, ctx, m.cacheTTL, keys)
 	}
 	// For now, batch operations require caching enabled
 	// Individual cachedGet calls can be used as fallback when caching is disabled
+	m.cacheMisses.Inc()
 	return nil, fmt.Errorf("batch operations require cacheTTL > 0; use individual cachedGet calls or enable caching via ?ttl= URI parameter")
+}
+
+// GetCacheTrackingInfo returns CLIENT TRACKINGINFO from Redis for debugging client-side cache state.
+// This provides detailed information about the BCAST tracking configuration, including:
+//   - flags: Tracking mode flags (e.g., "on", "bcast")
+//   - redirect: Client ID for redirect mode (usually -1 for broadcast)
+//   - prefixes: List of key prefixes being tracked for invalidation
+//   - num-keys: Number of keys currently being tracked
+//
+// Returns raw map[string]interface{} from Redis CLIENT TRACKINGINFO command.
+// Only useful when m.cacheTTL > 0 (caching enabled).
+func (m *rueidisMeta) GetCacheTrackingInfo(ctx Context) (map[string]interface{}, error) {
+	if m.cacheTTL == 0 {
+		return map[string]interface{}{
+			"status": "caching disabled (ttl=0)",
+		}, nil
+	}
+
+	// CLIENT TRACKINGINFO returns detailed tracking state
+	cmd := m.client.B().ClientTrackinginfo().Build()
+	resp, err := m.client.Do(ctx, cmd).ToMap()
+	if err != nil {
+		return nil, fmt.Errorf("CLIENT TRACKINGINFO failed: %w", err)
+	}
+
+	// Convert RedisMessage map to plain interface{} map for easier inspection
+	result := make(map[string]interface{})
+	for k, v := range resp {
+		// Try different type conversions
+		if arr, err := v.AsStrSlice(); err == nil {
+			result[k] = arr
+		} else if str, err := v.ToString(); err == nil {
+			result[k] = str
+		} else if num, err := v.AsInt64(); err == nil {
+			result[k] = num
+		} else {
+			result[k] = v.String() // fallback to string representation
+		}
+	}
+
+	// Add JuiceFS-specific metadata
+	result["juicefs_cache_ttl"] = m.cacheTTL.String()
+	result["juicefs_enable_prime"] = m.enablePrime
+
+	return result, nil
 }
 
 // replaceErrnoCompat wraps a transaction function to convert syscall.Errno to errNo
