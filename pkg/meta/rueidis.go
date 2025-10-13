@@ -718,6 +718,87 @@ func (m *rueidisMeta) incrCounter(name string, value int64) (int64, error) {
 	return v, nil
 }
 
+// primeInodes allocates a batch of inode IDs from Redis and returns the starting ID.
+// It performs an atomic INCRBY operation on the nextInode counter.
+//
+// Behavior:
+//   - Increments nextInode counter by n (batch size)
+//   - Returns the first ID in the allocated range
+//   - Updates metrics (inodePrimeCalls on success, primeErrors on failure)
+//
+// Example: If Redis nextInode=100 (stored as 99) and n=256:
+//   - INCRBY returns 355 (99+256)
+//   - We return start=100 (range is 100-355 inclusive, 256 IDs)
+//
+// Note: nextInode is stored as value-1, so:
+//   - stored value after INCRBY = old + n
+//   - actual next ID = stored + 1
+//   - start of our range = (stored + 1) - n + 1 = stored - n + 2
+func (m *rueidisMeta) primeInodes(n uint64) (start uint64, err error) {
+	if m.compat == nil || n == 0 {
+		return 0, fmt.Errorf("invalid prime request: compat=%v n=%d", m.compat != nil, n)
+	}
+
+	ctx := Background()
+	key := m.counterKey("nextInode")
+
+	// Perform atomic INCRBY
+	result, err := m.compat.IncrBy(ctx, key, int64(n)).Result()
+	if err != nil {
+		m.primeErrors.Inc()
+		logger.Warnf("primeInodes(%d) failed: %v", n, err)
+		return 0, fmt.Errorf("primeInodes INCRBY failed: %w", err)
+	}
+
+	// Calculate start ID
+	// result is the new stored value (which is actual_next - 1)
+	// start = (result + 1) - n = result - n + 1
+	start = uint64(result) - n + 1
+
+	m.inodePrimeCalls.Inc()
+	logger.Debugf("primeInodes(%d): allocated range [%d, %d], next=%d", n, start, start+n-1, result+1)
+
+	return start, nil
+}
+
+// primeChunks allocates a batch of chunk IDs from Redis and returns the starting ID.
+// It performs an atomic INCRBY operation on the nextChunk counter.
+//
+// Behavior:
+//   - Increments nextChunk counter by n (batch size)
+//   - Returns the first ID in the allocated range
+//   - Updates metrics (chunkPrimeCalls on success, primeErrors on failure)
+//
+// Example: If Redis nextChunk=1000 (stored as 999) and n=2048:
+//   - INCRBY returns 3047 (999+2048)
+//   - We return start=1000 (range is 1000-3047 inclusive, 2048 IDs)
+//
+// Note: nextChunk is stored as value-1, same semantics as nextInode.
+func (m *rueidisMeta) primeChunks(n uint64) (start uint64, err error) {
+	if m.compat == nil || n == 0 {
+		return 0, fmt.Errorf("invalid prime request: compat=%v n=%d", m.compat != nil, n)
+	}
+
+	ctx := Background()
+	key := m.counterKey("nextChunk")
+
+	// Perform atomic INCRBY
+	result, err := m.compat.IncrBy(ctx, key, int64(n)).Result()
+	if err != nil {
+		m.primeErrors.Inc()
+		logger.Warnf("primeChunks(%d) failed: %v", n, err)
+		return 0, fmt.Errorf("primeChunks INCRBY failed: %w", err)
+	}
+
+	// Calculate start ID (same formula as primeInodes)
+	start = uint64(result) - n + 1
+
+	m.chunkPrimeCalls.Inc()
+	logger.Debugf("primeChunks(%d): allocated range [%d, %d], next=%d", n, start, start+n-1, result+1)
+
+	return start, nil
+}
+
 func (m *rueidisMeta) setIfSmall(name string, value, diff int64) (bool, error) {
 	if m.compat == nil {
 		return m.redisMeta.setIfSmall(name, value, diff)

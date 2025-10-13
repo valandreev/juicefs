@@ -52,7 +52,7 @@ Status legend:
 - Acceptance: Code compiles; metrics are initialized in `InitMetrics` and registered when `m.InitMetrics()` is called.
 
 ### 3) Implement `primeInodes(n)` and `primeChunks(n)` helpers
-- [ ] Implement private methods on `rueidisMeta`:
+- [x] Implement private methods on `rueidisMeta`:
   - `func (m *rueidisMeta) primeInodes(n uint64) (start uint64, err error)`
   - `func (m *rueidisMeta) primeChunks(n uint64) (start uint64, err error)`
 - Behavior:
@@ -60,6 +60,7 @@ Status legend:
   - Compute start = returned - n + 1 (account for current storage semantics where `nextInode` might be stored off-by-one; consult `incrCounter` implementation and adapt if needed).
   - Update metrics and return error on failure.
 - Acceptance: Unit test for the helper using a mocked compat client or local Redis instance verifying returned range semantics.
+- **COMPLETED**: Added `primeInodes` and `primeChunks` functions in `rueidis.go` (lines ~720-780). Created comprehensive unit test `TestRueidisPrimeFunctions` with 4 subtests (all passing). Tests use direct Redis reads to bypass client-side cache and verify correct ID allocation semantics.
 
 ### 4) Implement `nextInode()` and `nextChunkID()` sync paths
 - [ ] Implement small methods returning next ID:
