@@ -706,6 +706,34 @@ func (m *rueidisMeta) incrCounter(name string, value int64) (int64, error) {
 	if m.conf.ReadOnly {
 		return 0, syscall.EROFS
 	}
+
+	// Use pool-based batching for nextInode and nextChunk when metaPrimeEnabled
+	if m.metaPrimeEnabled && value > 0 {
+		if name == "nextInode" {
+			// Allocate 'value' inodes using batch prime
+			// We need to return the value that baseMeta expects:
+			// baseMeta will compute: next = returned - value, maxid = returned
+			// So if primeInodes returns start=1 for batch=100:
+			// We should return start + value = 1 + 100 = 101
+			// Then baseMeta will: next = 101 - 100 = 1, maxid = 101 ✓
+			start, err := m.primeInodes(uint64(value))
+			if err != nil {
+				return 0, err
+			}
+			return int64(start) + value, nil
+		}
+
+		if name == "nextChunk" {
+			// Same logic for chunks
+			start, err := m.primeChunks(uint64(value))
+			if err != nil {
+				return 0, err
+			}
+			return int64(start) + value, nil
+		}
+	}
+
+	// For other counters or when batching disabled, use direct IncrBy
 	key := m.counterKey(name)
 	cmd := m.compat.IncrBy(Background(), key, value)
 	v, err := cmd.Result()

@@ -84,11 +84,12 @@ Status legend:
 - **COMPLETED**: Implemented `asyncPrefetchInodes()` and `asyncPrefetchChunks()` (lines ~912-950). Both functions use `prefetchLock` and boolean flags (`inodePrefetching`/`chunkPrefetching`) for deduplication. Integrated into Step 4's `nextInode()`/`nextChunkID()` methods. Concurrent allocation test validates this works correctly.
 
 ### 6) Integrate `next*` into allocation sites
-- [ ] Identify all places where the code previously relied on `incrCounter("nextInode")` / `incrCounter("nextChunk")` (use global grep for `nextInode` and `nextChunk` and `incrCounter(` in repo). Replace those with `m.nextInode()` and `m.nextChunkID()` appropriately.
+- [x] Identify all places where the code previously relied on `incrCounter("nextInode")` / `incrCounter("nextChunk")` (use global grep for `nextInode` and `nextChunk` and `incrCounter(` in repo). Replace those with `m.nextInode()` and `m.nextChunkID()` appropriately.
 - Important: If any `INCR` was performed *inside* a `txn` or `Watch` critical section, do NOT call `prime*` inside the txn. Instead:
   - Pre-prime before the transaction and pass the already-allocated ID(s) into the transaction.
   - If the code previously used INCR inside txn for a reason (rare), flag those spots and handle carefully — usually they are outside txn.
 - Acceptance: All compilation errors fixed and tests for functions that allocate IDs updated.
+- **COMPLETED**: Modified `incrCounter()` in `rueidis.go` to intercept `nextInode` and `nextChunk` calls. When `metaPrimeEnabled=true` and `value > 0`, uses `primeInodes(value)` / `primeChunks(value)` and returns `start + value` to match `baseMeta` expectations. This automatically integrates batching into all allocation sites (`baseMeta.allocateInodes()`, `baseMeta.NewSlice()`, etc.) without modifying each call site individually. All tests pass including `TestRueidisWriteRead`.
 
 ### 7) Crash/restart semantics test and doc note
 - [ ] Add unit/integration test or documentation verifying that unused IDs lost during crashes are acceptable and expected. Add a note in `docs/development/internals.md` explaining the behavior and cluster hash-tag requirement.
