@@ -514,14 +514,22 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 	}
 
 	start := time.Now()
+	logger := utils.GetLogger("juicefs")
+
+	var coalescedCount, msetCount, hmsetCount, errorCount int
 	defer func() {
 		duration := time.Since(start).Seconds()
 		m.batchFlushDuration.Observe(duration)
 		m.batchSizeHistogram.Observe(float64(len(ops)))
+
+		// Debug logging for flush events
+		logger.Debugf("Batch flush: ops=%d coalesced=%d mset=%d hmset=%d errors=%d duration=%.3fms",
+			len(ops), coalescedCount, msetCount, hmsetCount, errorCount, duration*1000)
 	}()
 
 	// Step 1: Coalesce operations
 	result := coalesceOps(ops)
+	coalescedCount = result.SavedCount
 	if result.SavedCount > 0 {
 		// Track coalescing savings by type
 		savedByType := make(map[OpType]int)
@@ -537,9 +545,15 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 
 	// Step 1.5: Optimize multiple SETs into MSET (Step 6)
 	msetCmds, nonSetOps := m.buildMSET(result.Coalesced)
+	msetCount = len(msetCmds)
 
 	// Step 1.6: Optimize multiple HSETs into HMSET (Step 7)
 	hmsetCmdsBySlot, nonHsetOps := m.buildHMSET(nonSetOps)
+
+	// Calculate total HMSET commands for tracking
+	for _, cmds := range hmsetCmdsBySlot {
+		hmsetCount += len(cmds)
+	}
 
 	// Step 2: Build rueidis commands for remaining operations
 	ctx := context.Background()
@@ -623,6 +637,8 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 	failedOps := make([]*BatchOp, 0)
 	for i, result := range results {
 		if err := result.Error(); err != nil {
+			errorCount++
+
 			// Check if this is an MSET command that failed
 			if originalOps, isMSET := msetOpsMap[i]; isMSET {
 				// Check if it's a CROSSSLOT error
