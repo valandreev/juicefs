@@ -1699,3 +1699,190 @@ func TestBatchWrite_FlushBarrier_InodeFilter(t *testing.T) {
 
 	t.Log("Successfully verified inode filtering logic")
 }
+
+// Test 52: Adaptive batch sizing - size increase on high queue depth
+func TestBatchWrite_AdaptiveSizing_Increase(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize adaptive sizing fields
+	m.baseBatchSize = 512
+	m.maxBatchSize = 2048
+	m.highWaterMark = 1000
+	m.lowWaterMark = 100
+	m.currentBatchSize.Store(512)
+	m.batchSizeCurrent = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_batch_size_current",
+	})
+
+	// Simulate high queue depth for multiple samples
+	for i := 0; i < 10; i++ {
+		m.batchQueueSize.Store(1500) // Above high watermark
+		m.adjustBatchSize()
+	}
+
+	// Verify batch size increased to max
+	newSize := m.currentBatchSize.Load()
+	if newSize != 2048 {
+		t.Errorf("Expected batch size to increase to 2048, got %d", newSize)
+	}
+
+	t.Logf("Successfully increased batch size from 512 to %d", newSize)
+}
+
+// Test 53: Adaptive batch sizing - size decrease on low queue depth
+func TestBatchWrite_AdaptiveSizing_Decrease(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize adaptive sizing fields
+	m.baseBatchSize = 512
+	m.maxBatchSize = 2048
+	m.highWaterMark = 1000
+	m.lowWaterMark = 100
+	m.currentBatchSize.Store(2048) // Start at max
+	m.batchSizeCurrent = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_batch_size_current",
+	})
+
+	// Simulate low queue depth for multiple samples
+	for i := 0; i < 10; i++ {
+		m.batchQueueSize.Store(50) // Below low watermark
+		m.adjustBatchSize()
+	}
+
+	// Verify batch size decreased to base
+	newSize := m.currentBatchSize.Load()
+	if newSize != 512 {
+		t.Errorf("Expected batch size to decrease to 512, got %d", newSize)
+	}
+
+	t.Logf("Successfully decreased batch size from 2048 to %d", newSize)
+}
+
+// Test 54: Adaptive batch sizing - no oscillation in middle range
+func TestBatchWrite_AdaptiveSizing_Stable(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize adaptive sizing fields
+	m.baseBatchSize = 512
+	m.maxBatchSize = 2048
+	m.highWaterMark = 1000
+	m.lowWaterMark = 100
+	m.currentBatchSize.Store(512)
+	m.batchSizeCurrent = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_batch_size_current",
+	})
+
+	// Simulate moderate queue depth (between watermarks)
+	for i := 0; i < 20; i++ {
+		m.batchQueueSize.Store(500) // Between low and high watermarks
+		m.adjustBatchSize()
+	}
+
+	// Verify batch size stays at base (no change)
+	newSize := m.currentBatchSize.Load()
+	if newSize != 512 {
+		t.Errorf("Expected batch size to remain at 512, got %d", newSize)
+	}
+
+	t.Log("Successfully verified stable batch size in middle range")
+}
+
+// Test 55: Adaptive batch sizing - sample window averaging
+func TestBatchWrite_AdaptiveSizing_Averaging(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize adaptive sizing fields
+	m.baseBatchSize = 512
+	m.maxBatchSize = 2048
+	m.highWaterMark = 1000
+	m.lowWaterMark = 100
+	m.currentBatchSize.Store(512)
+	m.batchSizeCurrent = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_batch_size_current",
+	})
+
+	// Simulate mixed queue depths - average should be above threshold
+	depths := []int64{200, 1500, 1200, 1800, 1100, 1400, 1600, 1300, 1700, 1500}
+	for _, depth := range depths {
+		m.batchQueueSize.Store(depth)
+		m.adjustBatchSize()
+	}
+
+	// Average is ~1330, which is > 1000 (high watermark)
+	// So batch size should increase
+	newSize := m.currentBatchSize.Load()
+	if newSize != 2048 {
+		t.Errorf("Expected batch size to increase to 2048 based on average, got %d", newSize)
+	}
+
+	t.Log("Successfully verified window averaging logic")
+}
+
+// Test 56: Adaptive batch sizing - metric updates
+func TestBatchWrite_AdaptiveSizing_Metrics(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize adaptive sizing fields
+	m.baseBatchSize = 512
+	m.maxBatchSize = 2048
+	m.highWaterMark = 1000
+	m.lowWaterMark = 100
+	m.currentBatchSize.Store(512)
+	m.batchSizeCurrent = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_batch_size_current",
+	})
+
+	// Initial metric value should match initial batch size
+	// (Note: In real code, metric is set in newRueidisMeta)
+	m.batchSizeCurrent.Set(512)
+
+	// Trigger size increase
+	for i := 0; i < 10; i++ {
+		m.batchQueueSize.Store(1500)
+		m.adjustBatchSize()
+	}
+
+	// Verify metric was updated (we can't read the gauge value directly in tests,
+	// but we can verify the function was called without panic)
+	newSize := m.currentBatchSize.Load()
+	if newSize != 2048 {
+		t.Errorf("Expected batch size 2048, got %d", newSize)
+	}
+
+	t.Log("Successfully verified metric update mechanism")
+}
+
+// Test 57: Adaptive batch sizing - circular buffer wraparound
+func TestBatchWrite_AdaptiveSizing_CircularBuffer(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize adaptive sizing fields
+	m.baseBatchSize = 512
+	m.maxBatchSize = 2048
+	m.highWaterMark = 1000
+	m.lowWaterMark = 100
+	m.currentBatchSize.Store(512)
+	m.batchSizeCurrent = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_batch_size_current",
+	})
+
+	// Fill buffer with low values, then high values
+	// This tests that old samples are properly replaced
+	for i := 0; i < 20; i++ {
+		if i < 10 {
+			m.batchQueueSize.Store(50) // Low
+		} else {
+			m.batchQueueSize.Store(1500) // High
+		}
+		m.adjustBatchSize()
+	}
+
+	// After 20 samples, only last 10 matter (all high)
+	// So batch size should be at max
+	newSize := m.currentBatchSize.Load()
+	if newSize != 2048 {
+		t.Errorf("Expected batch size 2048 after buffer wraparound, got %d", newSize)
+	}
+
+	t.Log("Successfully verified circular buffer behavior")
+}

@@ -328,6 +328,7 @@ func (m *rueidisMeta) batchFlusher() {
 	defer close(m.batchDoneChan)
 
 	pendingOps := make([]*BatchOp, 0, m.batchSize)
+	adaptiveSampleCounter := 0 // Count flushes to trigger adaptive sizing check
 
 	for {
 		select {
@@ -344,6 +345,8 @@ func (m *rueidisMeta) batchFlusher() {
 				_ = m.flushBatch(pendingOps)
 				pendingOps = pendingOps[:0] // Reset slice
 			}
+			// Check adaptive sizing periodically (every timer tick)
+			m.adjustBatchSize()
 
 		case op := <-m.batchQueue:
 			// New operation arrived
@@ -362,8 +365,9 @@ func (m *rueidisMeta) batchFlusher() {
 				shouldFlush = true
 			}
 
-			// Policy 1: Size-based flush
-			if len(pendingOps) >= m.batchSize {
+			// Policy 1: Size-based flush (use current adaptive size)
+			currentSize := int(m.currentBatchSize.Load())
+			if len(pendingOps) >= currentSize {
 				shouldFlush = true
 			}
 
@@ -381,7 +385,7 @@ func (m *rueidisMeta) batchFlusher() {
 			// Drain more ops if available (batch opportunistically)
 			if !shouldFlush {
 			drainLoop:
-				for len(pendingOps) < m.batchSize {
+				for len(pendingOps) < currentSize {
 					select {
 					case nextOp := <-m.batchQueue:
 						pendingOps = append(pendingOps, nextOp)
@@ -408,6 +412,13 @@ func (m *rueidisMeta) batchFlusher() {
 					_ = m.flushBatch(pendingOps)
 				}
 				pendingOps = pendingOps[:0] // Reset slice
+
+				// Periodically check adaptive sizing (every 10 flushes)
+				adaptiveSampleCounter++
+				if adaptiveSampleCounter >= 10 {
+					adaptiveSampleCounter = 0
+					m.adjustBatchSize()
+				}
 			}
 		}
 
@@ -1044,4 +1055,62 @@ func containsOp(ops []*BatchOp, target *BatchOp) bool {
 		}
 	}
 	return false
+}
+
+// adjustBatchSize dynamically adjusts the batch size based on queue depth.
+//
+// Algorithm:
+// 1. Sample current queue depth
+// 2. Store in circular buffer (last 10 samples)
+// 3. Calculate average queue depth
+// 4. If average > highWaterMark (1000): increase to maxBatchSize (2048)
+// 5. If average < lowWaterMark (100): decrease to baseBatchSize (512)
+//
+// This prevents oscillation by using a windowed average and hysteresis
+// (high/low watermarks with gap to avoid thrashing).
+func (m *rueidisMeta) adjustBatchSize() {
+	m.adaptiveLock.Lock()
+	defer m.adaptiveLock.Unlock()
+
+	// Sample current queue depth
+	currentDepth := m.batchQueueSize.Load()
+
+	// Store sample in circular buffer
+	m.lastQueueSamples[m.sampleIndex] = currentDepth
+	m.sampleIndex = (m.sampleIndex + 1) % len(m.lastQueueSamples)
+
+	// Calculate average queue depth over last N samples
+	var sum int64
+	var count int
+	for i := 0; i < len(m.lastQueueSamples); i++ {
+		if m.lastQueueSamples[i] > 0 || i < m.sampleIndex {
+			sum += m.lastQueueSamples[i]
+			count++
+		}
+	}
+
+	if count == 0 {
+		return // No samples yet
+	}
+
+	avgDepth := sum / int64(count)
+	currentSize := m.currentBatchSize.Load()
+
+	// Decide whether to adjust batch size
+	var newSize int32
+
+	if avgDepth > int64(m.highWaterMark) && currentSize < int32(m.maxBatchSize) {
+		// Queue is consistently high - increase batch size
+		newSize = int32(m.maxBatchSize)
+	} else if avgDepth < int64(m.lowWaterMark) && currentSize > int32(m.baseBatchSize) {
+		// Queue is consistently low - decrease batch size
+		newSize = int32(m.baseBatchSize)
+	} else {
+		// No change needed
+		return
+	}
+
+	// Update batch size
+	m.currentBatchSize.Store(newSize)
+	m.batchSizeCurrent.Set(float64(newSize))
 }

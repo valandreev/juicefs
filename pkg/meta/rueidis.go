@@ -92,6 +92,16 @@ type rueidisMeta struct {
 	batchQueueBytes  atomic.Int64  // current queue size in bytes
 	batchFlushTicker *time.Ticker  // timer for periodic flush
 
+	// Adaptive batch sizing (Step 15)
+	currentBatchSize atomic.Int32 // current dynamic batch size
+	baseBatchSize    int          // minimum batch size (default: 512)
+	maxBatchSize     int          // maximum batch size (default: 2048)
+	highWaterMark    int          // queue depth to trigger size increase (default: 1000)
+	lowWaterMark     int          // queue depth to trigger size decrease (default: 100)
+	lastQueueSamples [10]int64    // last 10 queue depth samples
+	sampleIndex      int          // current sample index
+	adaptiveLock     sync.Mutex   // protects adaptive sizing state
+
 	// Batch write metrics
 	batchOpsQueued        *prometheus.CounterVec // by type
 	batchOpsFlushed       *prometheus.CounterVec // by type
@@ -105,6 +115,7 @@ type rueidisMeta struct {
 	batchMsetOpsSaved     prometheus.Counter     // ops saved via MSET
 	batchHmsetConversions prometheus.Counter     // HMSET conversions total
 	batchHsetCoalesced    prometheus.Counter     // HSET ops coalesced into HMSET
+	batchSizeCurrent      prometheus.Gauge       // current adaptive batch size
 }
 
 // Temporary Rueidis registration that delegates to the Redis implementation.
@@ -315,6 +326,11 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		maxQueueSize:     maxQueueSize,
 		batchStopChan:    make(chan struct{}),
 		batchDoneChan:    make(chan struct{}),
+		// Adaptive batch sizing
+		baseBatchSize: batchSize,
+		maxBatchSize:  2048,
+		highWaterMark: 1000,
+		lowWaterMark:  100,
 		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "rueidis_cache_hits_total",
 			Help: "Total number of successful client-side cache hits (data served from local cache).",
@@ -401,8 +417,16 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 			Name: "rueidis_batch_hset_coalesced_total",
 			Help: "Total number of HSET operations coalesced into HMSET commands.",
 		}),
+		batchSizeCurrent: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "rueidis_batch_size_current",
+			Help: "Current adaptive batch size (dynamically adjusted based on queue depth).",
+		}),
 	}
 	m.redisMeta.en = m
+
+	// Initialize adaptive batch sizing
+	m.currentBatchSize.Store(int32(batchSize))
+	m.batchSizeCurrent.Set(float64(batchSize))
 
 	// Start batch flusher goroutine if batching is enabled
 	if batchWriteEnabled {
@@ -460,6 +484,7 @@ func (m *rueidisMeta) InitMetrics(reg prometheus.Registerer) {
 		reg.MustRegister(m.batchMsetOpsSaved)
 		reg.MustRegister(m.batchHmsetConversions)
 		reg.MustRegister(m.batchHsetCoalesced)
+		reg.MustRegister(m.batchSizeCurrent)
 	}
 }
 func (m *rueidisMeta) Shutdown() error {
