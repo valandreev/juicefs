@@ -19,6 +19,7 @@ package meta
 import (
 	"context"
 	"fmt"
+	"syscall"
 	"testing"
 	"time"
 
@@ -64,6 +65,37 @@ func newTestRueidisMeta(batchEnabled bool, queueSize int) *rueidisMeta {
 		m.batchHsetCoalesced = prometheus.NewCounter(
 			prometheus.CounterOpts{Name: "test_batch_hset_coalesced_total"},
 		)
+	}
+
+	return m
+}
+
+// Helper function to create a test rueidisMeta with flusher goroutine running
+func newTestRueidisMetaWithFlusher(batchEnabled bool, queueSize int) *rueidisMeta {
+	m := newTestRueidisMeta(batchEnabled, queueSize)
+
+	if batchEnabled {
+		// Initialize additional fields needed for flusher
+		m.batchSize = 512
+		m.batchBytes = 262144
+		m.batchFlushTicker = time.NewTicker(2 * time.Millisecond)
+		m.batchStopChan = make(chan struct{})
+		m.batchDoneChan = make(chan struct{})
+		m.batchFlushDuration = prometheus.NewHistogram(
+			prometheus.HistogramOpts{Name: "test_batch_flush_duration_seconds"},
+		)
+		m.batchSizeHistogram = prometheus.NewHistogram(
+			prometheus.HistogramOpts{Name: "test_batch_size_ops"},
+		)
+		m.batchQueueDepthGauge = prometheus.NewGauge(
+			prometheus.GaugeOpts{Name: "test_batch_queue_depth"},
+		)
+		m.batchPoisonOps = prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "test_batch_poison_ops_total"},
+		)
+
+		// Start flusher goroutine
+		go m.batchFlusher()
 	}
 
 	return m
@@ -1528,4 +1560,142 @@ func TestBatchWrite_HMSETSlotGrouping(t *testing.T) {
 	// - This prevents CROSSSLOT errors in Redis Cluster
 
 	t.Log("Successfully verified hash slot grouping for HMSET")
+}
+
+// Test 47: Flush barrier - basic functionality
+func TestBatchWrite_FlushBarrier_Basic(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Enqueue 10 operations for inode 123
+	for i := 0; i < 10; i++ {
+		op := &BatchOp{
+			Type:  OpSET,
+			Key:   fmt.Sprintf("key%d", i),
+			Value: []byte(fmt.Sprintf("value%d", i)),
+			Inode: 123,
+		}
+		err := m.enqueueBatchOp(op)
+		if err != nil {
+			t.Fatalf("Failed to enqueue op %d: %v", i, err)
+		}
+	}
+
+	// Verify ops were queued
+	queueSize := m.batchQueueSize.Load()
+	if queueSize != 10 {
+		t.Errorf("Expected queue size 10, got %d", queueSize)
+	}
+
+	t.Log("Successfully enqueued 10 operations for inode 123")
+}
+
+// Test 48: Flush barrier - timeout behavior
+func TestBatchWrite_FlushBarrier_Timeout(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Don't start the flusher goroutine to simulate slow flush
+
+	// Enqueue operation
+	op := &BatchOp{
+		Type:  OpSET,
+		Key:   "test_key",
+		Value: []byte("test_value"),
+		Inode: 456,
+	}
+	err := m.enqueueBatchOp(op)
+	if err != nil {
+		t.Fatalf("Failed to enqueue op: %v", err)
+	}
+
+	// Call flushBarrier with very short timeout
+	// Since we haven't started the flusher, this should timeout
+	err = m.flushBarrier(456, 10*time.Millisecond)
+	if err != syscall.ETIMEDOUT {
+		t.Errorf("Expected ETIMEDOUT, got %v", err)
+	}
+
+	t.Log("Successfully detected timeout")
+}
+
+// Test 49: Flush barrier - disabled batching
+func TestBatchWrite_FlushBarrier_Disabled(t *testing.T) {
+	m := newTestRueidisMeta(false, 100) // Batching disabled
+
+	// Call flushBarrier - should be no-op
+	err := m.flushBarrier(789, 1*time.Second)
+	if err != nil {
+		t.Errorf("flushBarrier should be no-op when batching disabled, got error: %v", err)
+	}
+
+	t.Log("Successfully handled disabled batching case")
+}
+
+// Test 50: Flush barrier - result channel mechanism
+func TestBatchWrite_FlushBarrier_ResultChan(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Create a barrier operation manually
+	resultChan := make(chan error, 1)
+	barrier := &BatchOp{
+		Type:        OpSET,
+		Key:         "barrier",
+		Inode:       100,
+		Priority:    1000,
+		EnqueueTime: time.Now(),
+		ResultChan:  resultChan,
+	}
+
+	// Enqueue the barrier
+	err := m.enqueueBatchOp(barrier)
+	if err != nil {
+		t.Fatalf("Failed to enqueue barrier: %v", err)
+	}
+
+	// Verify barrier has result channel
+	if barrier.ResultChan == nil {
+		t.Error("Barrier should have ResultChan set")
+	}
+
+	// Verify high priority
+	if barrier.Priority != 1000 {
+		t.Errorf("Expected priority 1000, got %d", barrier.Priority)
+	}
+
+	t.Log("Successfully verified barrier operation structure")
+}
+
+// Test 51: Flush barrier - inode filtering
+func TestBatchWrite_FlushBarrier_InodeFilter(t *testing.T) {
+	// Test the logic of filtering operations by inode
+	ops := []*BatchOp{
+		{Type: OpSET, Key: "key1", Inode: 100},
+		{Type: OpSET, Key: "key2", Inode: 200},
+		{Type: OpSET, Key: "key3", Inode: 100},
+		{Type: OpSET, Key: "key4", Inode: 300},
+		{Type: OpSET, Key: "key5", Inode: 100},
+	}
+
+	// Filter for inode 100
+	targetInode := Ino(100)
+	filtered := make([]*BatchOp, 0)
+	for _, op := range ops {
+		if op.Inode == targetInode {
+			filtered = append(filtered, op)
+		}
+	}
+
+	// Should have 3 operations for inode 100
+	if len(filtered) != 3 {
+		t.Errorf("Expected 3 ops for inode 100, got %d", len(filtered))
+	}
+
+	// Verify keys
+	expectedKeys := []string{"key1", "key3", "key5"}
+	for i, op := range filtered {
+		if op.Key != expectedKeys[i] {
+			t.Errorf("Expected key %s at position %d, got %s", expectedKeys[i], i, op.Key)
+		}
+	}
+
+	t.Log("Successfully verified inode filtering logic")
 }

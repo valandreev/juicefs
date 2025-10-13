@@ -351,8 +351,16 @@ func (m *rueidisMeta) batchFlusher() {
 			m.batchQueueSize.Add(-1)
 			m.batchQueueBytes.Add(-int64(len(op.Value)))
 
+			// Check if this is a barrier operation (has ResultChan)
+			isBarrier := op.ResultChan != nil
+
 			// Check flush triggers
 			shouldFlush := false
+
+			// Policy 0: Barrier operation - flush immediately for this inode
+			if isBarrier {
+				shouldFlush = true
+			}
 
 			// Policy 1: Size-based flush
 			if len(pendingOps) >= m.batchSize {
@@ -360,22 +368,30 @@ func (m *rueidisMeta) batchFlusher() {
 			}
 
 			// Policy 2: Byte-based flush
-			totalBytes := 0
-			for _, o := range pendingOps {
-				totalBytes += len(o.Value)
-			}
-			if totalBytes >= m.batchBytes {
-				shouldFlush = true
+			if !shouldFlush {
+				totalBytes := 0
+				for _, o := range pendingOps {
+					totalBytes += len(o.Value)
+				}
+				if totalBytes >= m.batchBytes {
+					shouldFlush = true
+				}
 			}
 
 			// Drain more ops if available (batch opportunistically)
 			if !shouldFlush {
+			drainLoop:
 				for len(pendingOps) < m.batchSize {
 					select {
 					case nextOp := <-m.batchQueue:
 						pendingOps = append(pendingOps, nextOp)
 						m.batchQueueSize.Add(-1)
 						m.batchQueueBytes.Add(-int64(len(nextOp.Value)))
+						// Stop draining if we hit another barrier
+						if nextOp.ResultChan != nil {
+							shouldFlush = true
+							break drainLoop
+						}
 					default:
 						// No more ops available
 						goto checkFlush
@@ -385,13 +401,98 @@ func (m *rueidisMeta) batchFlusher() {
 
 		checkFlush:
 			if shouldFlush {
-				_ = m.flushBatch(pendingOps)
+				// If this is a barrier flush, separate ops by inode
+				if isBarrier {
+					m.flushWithBarrier(pendingOps)
+				} else {
+					_ = m.flushBatch(pendingOps)
+				}
 				pendingOps = pendingOps[:0] // Reset slice
 			}
 		}
 
 		// Update queue depth gauge
 		m.batchQueueDepthGauge.Set(float64(m.batchQueueSize.Load()))
+	}
+}
+
+// flushWithBarrier handles barrier operations by:
+// 1. Finding all barrier ops in the batch
+// 2. For each barrier, flush all ops for that inode up to the barrier
+// 3. Signal the barrier's ResultChan when done
+func (m *rueidisMeta) flushWithBarrier(ops []*BatchOp) {
+	if len(ops) == 0 {
+		return
+	}
+
+	// Find all barriers and their positions
+	barriers := make([]*BatchOp, 0)
+	for _, op := range ops {
+		if op.ResultChan != nil {
+			barriers = append(barriers, op)
+		}
+	}
+
+	if len(barriers) == 0 {
+		// No barriers - normal flush
+		_ = m.flushBatch(ops)
+		return
+	}
+
+	// Process each barrier
+	for _, barrier := range barriers {
+		// Filter ops for this barrier's inode (up to and including the barrier)
+		opsToFlush := make([]*BatchOp, 0)
+		for i, op := range ops {
+			// If barrier inode is 0, flush all ops up to barrier
+			// Otherwise, only flush ops for matching inode
+			if barrier.Inode == 0 || op.Inode == barrier.Inode {
+				// Skip the barrier itself (it's just a marker)
+				if op == barrier {
+					// Found the barrier - flush everything before it
+					break
+				}
+				opsToFlush = append(opsToFlush, op)
+			}
+			// Stop when we reach the barrier
+			if i == len(ops)-1 || ops[i+1] == barrier {
+				break
+			}
+		}
+
+		// Flush ops for this inode
+		err := m.flushBatch(opsToFlush)
+
+		// Signal barrier completion
+		if barrier.ResultChan != nil {
+			barrier.ResultChan <- err
+			close(barrier.ResultChan)
+		}
+	}
+
+	// Flush any remaining non-barrier ops
+	remainingOps := make([]*BatchOp, 0)
+	barrierSet := make(map[*BatchOp]bool)
+	for _, b := range barriers {
+		barrierSet[b] = true
+	}
+	for _, op := range ops {
+		if !barrierSet[op] {
+			// Check if this op was already flushed for a barrier
+			alreadyFlushed := false
+			for _, barrier := range barriers {
+				if barrier.Inode == 0 || op.Inode == barrier.Inode {
+					alreadyFlushed = true
+					break
+				}
+			}
+			if !alreadyFlushed {
+				remainingOps = append(remainingOps, op)
+			}
+		}
+	}
+	if len(remainingOps) > 0 {
+		_ = m.flushBatch(remainingOps)
 	}
 }
 

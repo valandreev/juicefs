@@ -656,33 +656,55 @@ func (m *rueidisMeta) batchDel(ctx context.Context, key string) error {
 // Note: This function blocks until the flush completes or times out (5 seconds).
 // If batching is disabled, this is a no-op.
 func (m *rueidisMeta) flushInodeOps(ino Ino) error {
+	return m.flushBarrier(ino, 5*time.Second)
+}
+
+// flushBarrier forces an immediate flush of all pending batch operations for a specific inode.
+// It blocks until all operations for the specified inode are flushed to Redis, or until the timeout expires.
+//
+// Implementation:
+//  1. Inserts a barrier operation into the batch queue with a result channel
+//  2. The flusher processes all ops for this inode up to and including the barrier
+//  3. Waits for the result channel to be signaled or timeout
+//
+// Parameters:
+//   - ino: The inode to flush operations for (0 = flush all operations)
+//   - timeout: Maximum time to wait for flush completion
+//
+// Returns:
+//   - nil if flush completed successfully
+//   - syscall.ETIMEDOUT if timeout expired
+//   - nil if batching is disabled (no-op)
+func (m *rueidisMeta) flushBarrier(ino Ino, timeout time.Duration) error {
 	if !m.batchEnabled {
 		return nil // No-op when batching disabled
 	}
 
-	// Trigger immediate flush by signaling the flusher
-	// The flusher will process all queued operations
-	// TODO: For now, we flush everything. In the future, implement per-inode filtering
-	// by adding an Inode field to BatchOp and filtering in the flusher.
-
-	// Simple approach: just signal a flush and wait briefly
-	// The flusher goroutine will wake up and process the queue
-	if m.batchFlushTicker != nil {
-		// Force a flush by draining and refilling the ticker channel
-		// This causes the flusher to wake immediately
-		select {
-		case <-m.batchFlushTicker.C:
-			// Drained old tick
-		default:
-			// No pending tick
-		}
-
-		// Wait for pending operations to be processed
-		// The flush happens asynchronously, so we give it time
-		time.Sleep(5 * time.Millisecond)
+	// Create a barrier operation with result channel
+	// The barrier will be processed when the flusher encounters it
+	resultChan := make(chan error, 1)
+	barrier := &BatchOp{
+		Type:        OpSET, // Use SET type as placeholder (won't be executed)
+		Key:         "barrier",
+		Inode:       ino,
+		Priority:    1000, // High priority to process quickly
+		EnqueueTime: time.Now(),
+		ResultChan:  resultChan,
 	}
 
-	return nil
+	// Enqueue the barrier operation
+	err := m.enqueueBatchOp(barrier)
+	if err != nil {
+		return err // Queue full or other enqueue error
+	}
+
+	// Wait for the barrier to be processed or timeout
+	select {
+	case err := <-resultChan:
+		return err // Barrier processed
+	case <-time.After(timeout):
+		return syscall.ETIMEDOUT // Timeout expired
+	}
 }
 
 // cachedGet performs a GET operation with client-side caching enabled.
