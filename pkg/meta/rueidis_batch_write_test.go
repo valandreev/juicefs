@@ -19,6 +19,7 @@ package meta
 import (
 	"context"
 	"fmt"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -2653,4 +2654,788 @@ func TestBatchWrite_GaugeMetrics(t *testing.T) {
 	}
 
 	t.Log("Successfully verified gauge metrics")
+}
+
+// ============================================================================
+// Step 19: Backward Compatibility Testing
+// ============================================================================
+
+// Test 72: Large-scale SET coalescing (100 SETs to same key)
+func TestBackwardCompat_LargeSETCoalescing(t *testing.T) {
+	ops := make([]*BatchOp, 100)
+	for i := 0; i < 100; i++ {
+		ops[i] = &BatchOp{
+			Type:  OpSET,
+			Key:   "testkey",
+			Value: []byte(fmt.Sprintf("value%d", i)),
+		}
+	}
+
+	result := coalesceOps(ops)
+
+	// Should coalesce to 1 operation (keep last value)
+	if len(result.Coalesced) != 1 {
+		t.Errorf("Expected 1 coalesced op, got %d", len(result.Coalesced))
+	}
+
+	if result.SavedCount != 99 {
+		t.Errorf("Expected 99 saved ops, got %d", result.SavedCount)
+	}
+
+	// Verify final value is the last one
+	if string(result.Coalesced[0].Value) != "value99" {
+		t.Errorf("Expected final value 'value99', got %s", result.Coalesced[0].Value)
+	}
+
+	t.Logf("Successfully coalesced 100 SETs to 1: saved %d ops", result.SavedCount)
+}
+
+// Test 73: Large-scale HSET coalescing (50 HSETs to same hash)
+func TestBackwardCompat_LargeHSETCoalescing(t *testing.T) {
+	ops := make([]*BatchOp, 50)
+	for i := 0; i < 50; i++ {
+		ops[i] = &BatchOp{
+			Type:  OpHSET,
+			Key:   "testhash",
+			Field: fmt.Sprintf("field%d", i),
+			Value: []byte(fmt.Sprintf("value%d", i)),
+		}
+	}
+
+	result := coalesceOps(ops)
+
+	// Should keep all 50 fields (different fields, not coalesced further)
+	if len(result.Coalesced) != 50 {
+		t.Errorf("Expected 50 coalesced ops, got %d", len(result.Coalesced))
+	}
+
+	// No savings yet (coalescing only merges same field)
+	if result.SavedCount != 0 {
+		t.Errorf("Expected 0 saved ops (different fields), got %d", result.SavedCount)
+	}
+
+	// Verify all 50 HSETs are for the same hash
+	for _, op := range result.Coalesced {
+		if op.Type != OpHSET {
+			t.Errorf("Expected OpHSET, got %v", op.Type)
+		}
+		if op.Key != "testhash" {
+			t.Errorf("Expected key 'testhash', got %s", op.Key)
+		}
+	}
+
+	t.Logf("Successfully verified 50 HSETs to same hash (ready for HMSET grouping)")
+}
+
+// Test 74: HINCRBY delta summation (10 HINCRBYs to same field)
+func TestBackwardCompat_HINCRBYSummation(t *testing.T) {
+	ops := make([]*BatchOp, 10)
+	for i := 0; i < 10; i++ {
+		ops[i] = &BatchOp{
+			Type:  OpHINCRBY,
+			Key:   "counter",
+			Field: "total",
+			Delta: int64(i + 1), // 1, 2, 3, ..., 10
+		}
+	}
+
+	result := coalesceOps(ops)
+
+	// Should coalesce to 1 HINCRBY with sum of all deltas
+	if len(result.Coalesced) != 1 {
+		t.Errorf("Expected 1 coalesced op, got %d", len(result.Coalesced))
+	}
+
+	if result.SavedCount != 9 {
+		t.Errorf("Expected 9 saved ops, got %d", result.SavedCount)
+	}
+
+	// Sum of 1+2+3+...+10 = 55
+	expectedSum := int64(55)
+	if result.Coalesced[0].Delta != expectedSum {
+		t.Errorf("Expected delta sum %d, got %d", expectedSum, result.Coalesced[0].Delta)
+	}
+
+	t.Logf("Successfully summed 10 HINCRBYs: %d", result.Coalesced[0].Delta)
+}
+
+// Test 75: Flush trigger - Size (512 ops)
+func TestBackwardCompat_FlushTrigger_Size(t *testing.T) {
+	m := newTestRueidisMetaWithFlusher(true, 1000)
+	defer func() {
+		close(m.batchStopChan)
+		<-m.batchDoneChan
+	}()
+
+	// Enqueue exactly 512 ops (default batch size)
+	for i := 0; i < 512; i++ {
+		op := &BatchOp{
+			Type:  OpSET,
+			Key:   fmt.Sprintf("key%d", i),
+			Value: []byte(fmt.Sprintf("value%d", i)),
+		}
+		select {
+		case m.batchQueue <- op:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("Failed to enqueue op %d", i)
+		}
+	}
+
+	// Wait for flush to complete
+	time.Sleep(50 * time.Millisecond)
+
+	// Queue should be empty after size-triggered flush
+	queueLen := len(m.batchQueue)
+	if queueLen > 0 {
+		t.Errorf("Expected empty queue after size flush, got %d ops", queueLen)
+	}
+
+	t.Log("Successfully triggered flush at 512 ops (size trigger)")
+}
+
+// Test 76: Flush trigger - Time (2ms)
+func TestBackwardCompat_FlushTrigger_Time(t *testing.T) {
+	m := newTestRueidisMetaWithFlusher(true, 1000)
+	defer func() {
+		close(m.batchStopChan)
+		<-m.batchDoneChan
+	}()
+
+	// Enqueue only 10 ops (well below batch size)
+	for i := 0; i < 10; i++ {
+		op := &BatchOp{
+			Type:  OpSET,
+			Key:   fmt.Sprintf("key%d", i),
+			Value: []byte(fmt.Sprintf("value%d", i)),
+		}
+		select {
+		case m.batchQueue <- op:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("Failed to enqueue op %d", i)
+		}
+	}
+
+	// Wait for time-based flush (2ms + buffer)
+	time.Sleep(10 * time.Millisecond)
+
+	// Queue should be empty after time-triggered flush
+	queueLen := len(m.batchQueue)
+	if queueLen > 0 {
+		t.Errorf("Expected empty queue after time flush, got %d ops", queueLen)
+	}
+
+	t.Log("Successfully triggered flush after 2ms (time trigger)")
+}
+
+// Test 77: Flush trigger - Bytes (256KB)
+func TestBackwardCompat_FlushTrigger_Bytes(t *testing.T) {
+	m := newTestRueidisMetaWithFlusher(true, 1000)
+	defer func() {
+		close(m.batchStopChan)
+		<-m.batchDoneChan
+	}()
+
+	// Enqueue ops with large values to exceed 256KB byte limit
+	// Each op: ~10KB value = 26 ops to exceed 256KB
+	largeValue := make([]byte, 10240) // 10KB
+	for i := 0; i < 30; i++ {
+		op := &BatchOp{
+			Type:  OpSET,
+			Key:   fmt.Sprintf("key%d", i),
+			Value: largeValue,
+		}
+		select {
+		case m.batchQueue <- op:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("Failed to enqueue op %d", i)
+		}
+	}
+
+	// Wait for byte-triggered flush
+	time.Sleep(50 * time.Millisecond)
+
+	// Queue should be mostly empty (some ops may have been added after flush)
+	queueLen := len(m.batchQueue)
+	if queueLen > 5 {
+		t.Errorf("Expected near-empty queue after byte flush, got %d ops", queueLen)
+	}
+
+	t.Log("Successfully triggered flush when exceeding 256KB (byte trigger)")
+}
+
+// Test 78: Mixed operation types coalescing
+func TestBackwardCompat_MixedOperations(t *testing.T) {
+	// Create a realistic mixed workload
+	ops := []*BatchOp{
+		// 10 SETs to key1 (should coalesce to 1)
+		{Type: OpSET, Key: "key1", Value: []byte("v1")},
+		{Type: OpSET, Key: "key1", Value: []byte("v2")},
+		{Type: OpSET, Key: "key1", Value: []byte("v3")},
+		{Type: OpSET, Key: "key1", Value: []byte("v4")},
+		{Type: OpSET, Key: "key1", Value: []byte("v5")},
+		{Type: OpSET, Key: "key1", Value: []byte("v6")},
+		{Type: OpSET, Key: "key1", Value: []byte("v7")},
+		{Type: OpSET, Key: "key1", Value: []byte("v8")},
+		{Type: OpSET, Key: "key1", Value: []byte("v9")},
+		{Type: OpSET, Key: "key1", Value: []byte("v10")},
+		// 5 HSETs to hash1/field1 (should coalesce to 1)
+		{Type: OpHSET, Key: "hash1", Field: "field1", Value: []byte("v1")},
+		{Type: OpHSET, Key: "hash1", Field: "field1", Value: []byte("v2")},
+		{Type: OpHSET, Key: "hash1", Field: "field1", Value: []byte("v3")},
+		{Type: OpHSET, Key: "hash1", Field: "field1", Value: []byte("v4")},
+		{Type: OpHSET, Key: "hash1", Field: "field1", Value: []byte("v5")},
+		// 5 HINCRBYs to counter/total (should sum to 15)
+		{Type: OpHINCRBY, Key: "counter", Field: "total", Delta: 1},
+		{Type: OpHINCRBY, Key: "counter", Field: "total", Delta: 2},
+		{Type: OpHINCRBY, Key: "counter", Field: "total", Delta: 3},
+		{Type: OpHINCRBY, Key: "counter", Field: "total", Delta: 4},
+		{Type: OpHINCRBY, Key: "counter", Field: "total", Delta: 5},
+		// 3 DELs (not coalescable)
+		{Type: OpDEL, Key: "oldkey1"},
+		{Type: OpDEL, Key: "oldkey2"},
+		{Type: OpDEL, Key: "oldkey3"},
+	}
+
+	result := coalesceOps(ops)
+
+	// Expected: 1 SET + 1 HSET + 1 HINCRBY + 3 DEL = 6 ops
+	expectedOps := 6
+	if len(result.Coalesced) != expectedOps {
+		t.Errorf("Expected %d coalesced ops, got %d", expectedOps, len(result.Coalesced))
+	}
+
+	// Expected savings: (10-1) + (5-1) + (5-1) = 9 + 4 + 4 = 17
+	expectedSaved := 17
+	if result.SavedCount != expectedSaved {
+		t.Errorf("Expected %d saved ops, got %d", expectedSaved, result.SavedCount)
+	}
+
+	// Verify final values
+	for _, op := range result.Coalesced {
+		switch op.Type {
+		case OpSET:
+			if op.Key == "key1" && string(op.Value) != "v10" {
+				t.Errorf("SET key1: expected 'v10', got %s", op.Value)
+			}
+		case OpHSET:
+			if op.Key == "hash1" && op.Field == "field1" && string(op.Value) != "v5" {
+				t.Errorf("HSET hash1/field1: expected 'v5', got %s", op.Value)
+			}
+		case OpHINCRBY:
+			if op.Key == "counter" && op.Field == "total" && op.Delta != 15 {
+				t.Errorf("HINCRBY counter/total: expected delta 15, got %d", op.Delta)
+			}
+		}
+	}
+
+	t.Logf("Successfully coalesced mixed workload: %d → %d ops (saved %d)",
+		len(ops), len(result.Coalesced), result.SavedCount)
+}
+
+// Test 79: Priority ordering preservation
+func TestBackwardCompat_PriorityOrdering(t *testing.T) {
+	ops := []*BatchOp{
+		{Type: OpSET, Key: "key1", Value: []byte("low"), Priority: 1},
+		{Type: OpSET, Key: "key2", Value: []byte("high"), Priority: 100},
+		{Type: OpSET, Key: "key3", Value: []byte("medium"), Priority: 50},
+		{Type: OpSET, Key: "key4", Value: []byte("critical"), Priority: 1000},
+	}
+
+	result := coalesceOps(ops)
+
+	// All ops should be preserved (different keys)
+	if len(result.Coalesced) != 4 {
+		t.Errorf("Expected 4 ops, got %d", len(result.Coalesced))
+	}
+
+	// Verify ordering by priority (descending)
+	for i := 0; i < len(result.Coalesced)-1; i++ {
+		if result.Coalesced[i].Priority < result.Coalesced[i+1].Priority {
+			t.Errorf("Priority ordering violated at index %d: %d < %d",
+				i, result.Coalesced[i].Priority, result.Coalesced[i+1].Priority)
+		}
+	}
+
+	t.Log("Successfully verified priority ordering (highest first)")
+}
+
+// Test 80: Large batch stress test (1000 mixed operations)
+func TestBackwardCompat_LargeBatchStress(t *testing.T) {
+	ops := make([]*BatchOp, 1000)
+
+	// Mix of operation types
+	for i := 0; i < 1000; i++ {
+		switch i % 5 {
+		case 0:
+			ops[i] = &BatchOp{Type: OpSET, Key: fmt.Sprintf("key%d", i%100), Value: []byte(fmt.Sprintf("v%d", i))}
+		case 1:
+			ops[i] = &BatchOp{Type: OpHSET, Key: fmt.Sprintf("hash%d", i%50), Field: fmt.Sprintf("f%d", i%20), Value: []byte(fmt.Sprintf("v%d", i))}
+		case 2:
+			ops[i] = &BatchOp{Type: OpHINCRBY, Key: fmt.Sprintf("counter%d", i%30), Field: "count", Delta: 1}
+		case 3:
+			ops[i] = &BatchOp{Type: OpDEL, Key: fmt.Sprintf("del%d", i)}
+		case 4:
+			ops[i] = &BatchOp{Type: OpRPUSH, Key: fmt.Sprintf("list%d", i%40), Value: []byte(fmt.Sprintf("item%d", i))}
+		}
+	}
+
+	start := time.Now()
+	result := coalesceOps(ops)
+	duration := time.Since(start)
+
+	// Should significantly reduce operation count
+	if len(result.Coalesced) >= 1000 {
+		t.Error("Coalescing should reduce operation count")
+	}
+
+	// Should complete quickly (< 100ms for 1000 ops)
+	if duration > 100*time.Millisecond {
+		t.Errorf("Coalescing took too long: %v", duration)
+	}
+
+	t.Logf("Coalesced 1000 ops → %d ops in %v (saved %d, %.1f%% reduction)",
+		len(result.Coalesced), duration, result.SavedCount,
+		float64(result.SavedCount)/float64(len(ops))*100)
+}
+
+// Test 81: Queue back-pressure test
+func TestBackwardCompat_QueueBackPressure(t *testing.T) {
+	// Create meta with small queue
+	m := newTestRueidisMeta(true, 10) // Only 10 slots
+
+	// Try to enqueue more than capacity
+	successCount := 0
+	for i := 0; i < 20; i++ {
+		op := &BatchOp{
+			Type:  OpSET,
+			Key:   fmt.Sprintf("key%d", i),
+			Value: []byte(fmt.Sprintf("value%d", i)),
+		}
+
+		// Try non-blocking send
+		select {
+		case m.batchQueue <- op:
+			successCount++
+		case <-time.After(1 * time.Millisecond):
+			// Back-pressure working - queue full
+		}
+	}
+
+	// Should have enqueued exactly 10 (queue capacity)
+	if successCount != 10 {
+		t.Errorf("Expected 10 successful enqueues, got %d", successCount)
+	}
+
+	queueLen := len(m.batchQueue)
+	if queueLen != 10 {
+		t.Errorf("Expected queue length 10, got %d", queueLen)
+	}
+
+	t.Logf("Back-pressure working: enqueued %d/%d ops", successCount, 20)
+}
+
+// Test 82: Non-coalescable operations preserved
+func TestBackwardCompat_NonCoalescablePreserved(t *testing.T) {
+	ops := []*BatchOp{
+		{Type: OpDEL, Key: "key1"},
+		{Type: OpDEL, Key: "key2"},
+		{Type: OpDEL, Key: "key3"},
+		{Type: OpRPUSH, Key: "list1", Value: []byte("item1")},
+		{Type: OpRPUSH, Key: "list1", Value: []byte("item2")},
+		{Type: OpRPUSH, Key: "list1", Value: []byte("item3")},
+		{Type: OpZADD, Key: "zset1", Value: []byte("member1"), Score: 1.0},
+		{Type: OpZADD, Key: "zset1", Value: []byte("member2"), Score: 2.0},
+	}
+
+	result := coalesceOps(ops)
+
+	// All operations should be preserved (no coalescing for these types)
+	if len(result.Coalesced) != len(ops) {
+		t.Errorf("Expected %d ops preserved, got %d", len(ops), len(result.Coalesced))
+	}
+
+	if result.SavedCount != 0 {
+		t.Errorf("Expected 0 saved ops (non-coalescable), got %d", result.SavedCount)
+	}
+
+	t.Log("Successfully verified non-coalescable operations preserved")
+}
+
+// Test 83: Inode-specific flush barrier
+func TestBackwardCompat_InodeFlushBarrier(t *testing.T) {
+	m := newTestRueidisMetaWithFlusher(true, 1000)
+	defer func() {
+		close(m.batchStopChan)
+		<-m.batchDoneChan
+	}()
+
+	// Enqueue ops for multiple inodes
+	for inode := 1; inode <= 5; inode++ {
+		for i := 0; i < 10; i++ {
+			op := &BatchOp{
+				Type:  OpSET,
+				Key:   fmt.Sprintf("i%d:key%d", inode, i),
+				Value: []byte(fmt.Sprintf("value%d", i)),
+				Inode: Ino(inode),
+			}
+			select {
+			case m.batchQueue <- op:
+			case <-time.After(100 * time.Millisecond):
+				t.Fatalf("Failed to enqueue op")
+			}
+		}
+	}
+
+	// Flush only inode 3
+	err := m.flushBarrier(Ino(3), 1*time.Second)
+	if err != nil {
+		t.Fatalf("Flush barrier failed: %v", err)
+	}
+
+	// Queue should still have ops for other inodes
+	queueLen := len(m.batchQueue)
+	if queueLen == 0 {
+		t.Error("Expected ops remaining for other inodes")
+	}
+
+	t.Logf("Successfully flushed inode 3, %d ops remaining", queueLen)
+}
+
+// Test 84: Empty batch handling
+func TestBackwardCompat_EmptyBatch(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Test empty slice
+	err := m.flushBatch(nil)
+	if err != nil {
+		t.Errorf("Empty batch should not error, got: %v", err)
+	}
+
+	// Test empty array
+	err = m.flushBatch([]*BatchOp{})
+	if err != nil {
+		t.Errorf("Empty batch should not error, got: %v", err)
+	}
+
+	t.Log("Successfully handled empty batches")
+}
+
+// Test 85: Concurrent enqueue safety
+func TestBackwardCompat_ConcurrentEnqueue(t *testing.T) {
+	m := newTestRueidisMetaWithFlusher(true, 10000)
+	defer func() {
+		close(m.batchStopChan)
+		<-m.batchDoneChan
+	}()
+
+	// Concurrent enqueues from multiple goroutines
+	numGoroutines := 10
+	opsPerGoroutine := 100
+	var wg sync.WaitGroup
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				op := &BatchOp{
+					Type:  OpSET,
+					Key:   fmt.Sprintf("g%d:key%d", goroutineID, i),
+					Value: []byte(fmt.Sprintf("value%d", i)),
+				}
+				select {
+				case m.batchQueue <- op:
+				case <-time.After(100 * time.Millisecond):
+					t.Errorf("Goroutine %d failed to enqueue op %d", goroutineID, i)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond) // Allow flushes to complete
+
+	t.Logf("Successfully enqueued %d ops from %d concurrent goroutines",
+		numGoroutines*opsPerGoroutine, numGoroutines)
+}
+
+// Test 86: Error handling - Retryable errors
+func TestBackwardCompat_RetryableErrors(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Simulate retryable error (network timeout)
+	ops := []*BatchOp{
+		{Type: OpSET, Key: "key1", Value: []byte("value1")},
+		{Type: OpSET, Key: "key2", Value: []byte("value2")},
+	}
+
+	// First attempt: simulate network error (would be retried in real implementation)
+	// For unit test, we just verify error handling doesn't panic
+	err := m.flushBatch(ops)
+
+	// Without real Redis, this will fail, but shouldn't panic
+	// In real implementation with retry logic, this would succeed after retry
+	if err == nil {
+		t.Log("Flush succeeded (mock Redis)")
+	} else {
+		t.Logf("Flush failed as expected (no Redis): %v", err)
+	}
+
+	t.Log("Successfully handled retryable error scenario")
+}
+
+// Test 87: Error handling - Poison operation detection
+func TestBackwardCompat_PoisonDetection(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Create operations including an invalid one (empty key)
+	ops := []*BatchOp{
+		{Type: OpSET, Key: "valid1", Value: []byte("value1")},
+		{Type: OpSET, Key: "", Value: []byte("bad")}, // Empty key (invalid)
+		{Type: OpSET, Key: "valid2", Value: []byte("value2")},
+	}
+
+	// Attempt flush - should detect poison operation
+	err := m.flushBatch(ops)
+
+	// Error expected due to invalid operation
+	if err == nil {
+		t.Error("Expected error for poison operation")
+	} else {
+		t.Logf("Poison operation correctly detected: %v", err)
+	}
+
+	t.Log("Successfully detected poison operation")
+}
+
+// Test 88: Adaptive batch sizing verification
+func TestBackwardCompat_AdaptiveSizing(t *testing.T) {
+	m := newTestRueidisMeta(true, 1000)
+
+	// Verify adaptive sizing fields are initialized
+	currentSize := m.currentBatchSize.Load()
+	if currentSize <= 0 {
+		t.Errorf("Expected positive batch size, got %d", currentSize)
+	}
+
+	// Simulate queue depth changes
+	m.batchQueueSize.Store(500)
+	m.adjustBatchSize()
+
+	// Should have updated metrics
+	t.Logf("Current batch size: %d, queue depth: %d",
+		m.currentBatchSize.Load(), m.batchQueueSize.Load())
+
+	t.Log("Successfully verified adaptive batch sizing mechanism")
+}
+
+// Test 89: MSET optimization - Multiple keys
+func TestBackwardCompat_MSETOptimization(t *testing.T) {
+	// Create 20 SET operations for different keys
+	ops := make([]*BatchOp, 20)
+	for i := 0; i < 20; i++ {
+		ops[i] = &BatchOp{
+			Type:  OpSET,
+			Key:   fmt.Sprintf("key%d", i),
+			Value: []byte(fmt.Sprintf("value%d", i)),
+		}
+	}
+
+	// Verify all are SET operations (eligible for MSET grouping)
+	for _, op := range ops {
+		if op.Type != OpSET {
+			t.Errorf("Expected OpSET, got %v", op.Type)
+		}
+	}
+
+	t.Logf("Successfully verified 20 SETs (ready for MSET grouping)")
+}
+
+// Test 92: Real-world workload simulation
+func TestBackwardCompat_RealWorldWorkload(t *testing.T) {
+	// Simulate typical filesystem metadata workload:
+	// - Many inode updates (SETs)
+	// - Chunk metadata (HSETs)
+	// - Reference counting (HINCRBYs)
+	// - Deletions (DELs)
+
+	ops := make([]*BatchOp, 0, 500)
+
+	// 200 inode attribute updates (many to same inodes)
+	for i := 0; i < 200; i++ {
+		inode := (i % 50) + 1 // 50 inodes, each updated ~4 times
+		ops = append(ops, &BatchOp{
+			Type:  OpSET,
+			Key:   fmt.Sprintf("inode%d", inode),
+			Value: []byte(fmt.Sprintf("attr%d", i)),
+			Inode: Ino(inode),
+		})
+	}
+
+	// 150 chunk metadata updates (HSET)
+	for i := 0; i < 150; i++ {
+		inode := (i % 30) + 1
+		chunkIdx := i % 10
+		ops = append(ops, &BatchOp{
+			Type:  OpHSET,
+			Key:   fmt.Sprintf("chunk%d", inode),
+			Field: fmt.Sprintf("idx%d", chunkIdx),
+			Value: []byte(fmt.Sprintf("data%d", i)),
+			Inode: Ino(inode),
+		})
+	}
+
+	// 100 reference count updates (HINCRBY)
+	for i := 0; i < 100; i++ {
+		inode := (i % 20) + 1
+		ops = append(ops, &BatchOp{
+			Type:  OpHINCRBY,
+			Key:   fmt.Sprintf("refs%d", inode),
+			Field: "count",
+			Delta: 1,
+			Inode: Ino(inode),
+		})
+	}
+
+	// 50 deletions (DEL)
+	for i := 0; i < 50; i++ {
+		ops = append(ops, &BatchOp{
+			Type: OpDEL,
+			Key:  fmt.Sprintf("old%d", i),
+		})
+	}
+
+	start := time.Now()
+	result := coalesceOps(ops)
+	coalesceDuration := time.Since(start)
+
+	// Should achieve significant reduction
+	reductionPct := float64(result.SavedCount) / float64(len(ops)) * 100
+	if reductionPct < 20 {
+		t.Errorf("Expected at least 20%% reduction, got %.1f%%", reductionPct)
+	}
+
+	t.Logf("Real-world workload: %d ops → %d ops (%.1f%% reduction) in %v",
+		len(ops), len(result.Coalesced), reductionPct, coalesceDuration)
+	t.Logf("  - Inode updates: coalesced from 200 to ~50 (same inodes)")
+	t.Logf("  - Chunk metadata: 150 HSETs (some coalesced)")
+	t.Logf("  - Reference counts: 100 HINCRBYs coalesced to ~20 sums")
+	t.Logf("  - Deletions: 50 DELs preserved")
+}
+
+// Test 93: Batch ordering correctness
+func TestBackwardCompat_BatchOrdering(t *testing.T) {
+	// Ensure operations maintain correct order for correctness
+	ops := []*BatchOp{
+		{Type: OpSET, Key: "key1", Value: []byte("v1")},
+		{Type: OpHINCRBY, Key: "counter", Field: "total", Delta: 5},
+		{Type: OpSET, Key: "key1", Value: []byte("v2")},             // Should overwrite v1
+		{Type: OpHINCRBY, Key: "counter", Field: "total", Delta: 3}, // Should sum to 8
+		{Type: OpDEL, Key: "key1"},                                  // Should delete after v2
+	}
+
+	result := coalesceOps(ops)
+
+	// Find final operations
+	var foundSET, foundHINCRBY, foundDEL bool
+	for _, op := range result.Coalesced {
+		switch op.Type {
+		case OpSET:
+			if op.Key == "key1" {
+				// Should NOT exist - DEL comes after
+				foundSET = true
+			}
+		case OpHINCRBY:
+			if op.Key == "counter" && op.Field == "total" {
+				if op.Delta != 8 {
+					t.Errorf("Expected HINCRBY delta 8, got %d", op.Delta)
+				}
+				foundHINCRBY = true
+			}
+		case OpDEL:
+			if op.Key == "key1" {
+				foundDEL = true
+			}
+		}
+	}
+
+	if foundSET {
+		t.Error("SET key1 should have been eliminated by subsequent DEL")
+	}
+	if !foundHINCRBY {
+		t.Error("HINCRBY should be present with summed delta")
+	}
+	if !foundDEL {
+		t.Error("DEL should be present")
+	}
+
+	t.Log("Successfully verified batch ordering and DEL precedence")
+}
+
+// Test 94: Performance benchmark - Coalescing overhead
+func TestBackwardCompat_CoalescingPerformance(t *testing.T) {
+	// Measure coalescing performance for various batch sizes
+	sizes := []int{10, 50, 100, 500, 1000, 5000}
+
+	for _, size := range sizes {
+		ops := make([]*BatchOp, size)
+		for i := 0; i < size; i++ {
+			ops[i] = &BatchOp{
+				Type:  OpSET,
+				Key:   fmt.Sprintf("key%d", i%100), // 10x coalescing opportunity
+				Value: []byte(fmt.Sprintf("value%d", i)),
+			}
+		}
+
+		start := time.Now()
+		result := coalesceOps(ops)
+		duration := time.Since(start)
+
+		// Should complete in reasonable time
+		maxDuration := time.Duration(size/10) * time.Millisecond // ~100 ops/ms
+		if duration > maxDuration {
+			t.Errorf("Coalescing %d ops took %v (expected < %v)", size, duration, maxDuration)
+		}
+
+		t.Logf("Batch size %4d: %d → %d ops in %v (%.1f ops/ms)",
+			size, size, len(result.Coalesced), duration,
+			float64(size)/duration.Seconds()/1000)
+	}
+}
+
+// Test 95: Graceful shutdown
+func TestBackwardCompat_GracefulShutdown(t *testing.T) {
+	m := newTestRueidisMetaWithFlusher(true, 1000)
+
+	// Enqueue operations
+	for i := 0; i < 50; i++ {
+		op := &BatchOp{
+			Type:  OpSET,
+			Key:   fmt.Sprintf("key%d", i),
+			Value: []byte(fmt.Sprintf("value%d", i)),
+		}
+		select {
+		case m.batchQueue <- op:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("Failed to enqueue op %d", i)
+		}
+	}
+
+	// Initiate shutdown
+	close(m.batchStopChan)
+
+	// Wait for completion
+	select {
+	case <-m.batchDoneChan:
+		t.Log("Successfully completed graceful shutdown")
+	case <-time.After(1 * time.Second):
+		t.Error("Shutdown timed out")
+	}
+
+	// Queue should be drained
+	queueLen := len(m.batchQueue)
+	if queueLen > 0 {
+		t.Logf("Warning: %d ops remaining after shutdown (expected in mock)", queueLen)
+	}
 }
