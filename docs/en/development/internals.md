@@ -348,6 +348,23 @@ In Redis Keys, integers (including inode numbers) are represented as decimal str
 - Value Type: String
 - Value: value of the counter, which is actually an integer
 
+**ID Batching Optimization (Rueidis only):**
+
+When using the Rueidis metadata engine with ID batching enabled (default), the `nextInode` and `nextChunk` counters are accessed differently:
+
+- **Without batching** (legacy Redis client or `metaprime=0`): Each file creation or chunk allocation performs a `INCR` operation on the counter (1 Redis round-trip per operation).
+- **With batching** (Rueidis default): IDs are pre-allocated in batches using `INCRBY <batch_size>` and served from a local pool (1 Redis round-trip per batch, typically 256-2048 IDs).
+
+When batching is enabled:
+1. JuiceFS client maintains local pools of pre-allocated inode and chunk IDs.
+2. When a pool is empty or low, it calls `INCRBY` to allocate a batch atomically.
+3. IDs are served from the pool without Redis round-trips until the pool is exhausted.
+4. Background prefetch refills pools at configurable low-watermark thresholds (default 25%).
+
+**Important:** Unused IDs in pools are lost on crash/restart. This is safe because JuiceFS does not require sequential IDs—gaps are acceptable. The maximum ID gap after a crash is `inode_batch + chunk_batch` (default: ~2300 IDs).
+
+**Configuration:** See [Rueidis ID Batching documentation](../reference/how_to_set_up_metadata_engine.md#id-batching-for-write-heavy-workloads) for URI parameters and tuning guidance.
+
 #### Session
 
 - Key: `allSessions`

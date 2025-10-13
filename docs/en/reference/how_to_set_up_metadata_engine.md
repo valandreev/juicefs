@@ -277,6 +277,96 @@ Supported TLS options:
 
 Options are combined with `&`, and the first option starts with `?`, for example: `?ttl=1h&tls-cert-file=client.crt&tls-key-file=client.key`.
 
+#### ID Batching for Write-Heavy Workloads
+
+:::tip Performance Feature
+For write-heavy workloads (creating many files/directories or writing to many chunks), Rueidis supports **ID batching** to dramatically reduce Redis round-trips when allocating inode and chunk IDs.
+:::
+
+By default, each file creation or chunk write requires a Redis `INCR` operation to allocate a unique ID. With ID batching enabled, JuiceFS pre-allocates IDs in batches using `INCRBY`, stores them locally, and serves IDs from the local pool. This can reduce Redis round-trips by **100-250x** for high-rate write workloads.
+
+**URI Parameters:**
+
+- `metaprime=0`: Disable ID batching (default: enabled with `metaprime=1`)
+- `inode_batch=N`: Inode ID batch size (default: `256`)
+- `chunk_batch=N`: Chunk ID batch size (default: `2048`)
+- `inode_low_watermark=N`: Inode pool prefetch watermark in % (default: `25`)
+- `chunk_low_watermark=N`: Chunk pool prefetch watermark in % (default: `25`)
+
+**Example usage for high-rate file creation workload:**
+
+```shell
+# Format with optimized batching for small file writes (10K files/sec)
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1?inode_batch=512&chunk_batch=4096" \
+    pics
+```
+
+**Example usage for large file workload (chunked writes):**
+
+```shell
+# Format with larger chunk batches for big files (100MB+ files)
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1?inode_batch=128&chunk_batch=8192" \
+    pics
+```
+
+**Disable batching for backward compatibility:**
+
+```shell
+# Disable ID batching (use legacy INCR-per-request behavior)
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1?metaprime=0" \
+    pics
+```
+
+**How it works:**
+
+1. When the local ID pool is empty, JuiceFS calls `INCRBY <batch_size>` to allocate a range of IDs atomically.
+2. IDs are served from the local pool without Redis round-trips.
+3. When the pool reaches the low watermark (default 25%), an async goroutine prefetches the next batch in the background.
+4. On crash/restart, unused IDs in the pool are lost (this is safe—IDs don't need to be sequential).
+
+**Redis Cluster Note:**
+
+:::warning Redis Cluster Hash Tags
+If using Redis Cluster, ensure that `nextInode` and `nextChunk` counter keys are in the same slot by using hash tags in your keyspace prefix. Otherwise, `INCRBY` operations may fail with `CROSSSLOT` errors. Most JuiceFS deployments use a single Redis instance or Redis Sentinel (not Cluster), so this is rarely an issue.
+:::
+
+**Monitoring:**
+
+Prometheus metrics for ID batching:
+
+- `juicefs_meta_inode_prime_calls_total`: Number of inode batch allocations (INCRBY calls)
+- `juicefs_meta_chunk_prime_calls_total`: Number of chunk batch allocations (INCRBY calls)
+- `juicefs_meta_prime_errors_total`: Number of failed prime operations
+- `juicefs_meta_inode_ids_served_total`: Total inode IDs allocated from pool
+- `juicefs_meta_chunk_ids_served_total`: Total chunk IDs allocated from pool
+- `juicefs_meta_inode_prefetch_async_total`: Background prefetch operations for inodes
+- `juicefs_meta_chunk_prefetch_async_total`: Background prefetch operations for chunks
+
+**Performance impact example:**
+
+```
+Workload: Create 1000 files
+Network RTT: 30ms
+
+Without batching:
+- Redis calls: 1000 INCR operations
+- Total latency: 1000 × 30ms = 30 seconds
+
+With batching (inode_batch=256):
+- Redis calls: ≈4 INCRBY operations
+- Total latency: ≈4 × 30ms = 120ms
+- Speedup: 250x
+```
+
 #### Performance Comparison
 
 Compared to the standard Redis client (`redis://`), Rueidis offers:
