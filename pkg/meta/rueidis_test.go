@@ -319,3 +319,288 @@ func TestGetCacheTrackingInfo(t *testing.T) {
 		}
 	})
 }
+
+// TestURIParameterParsing tests URI parameter parsing and validation
+func TestURIParameterParsing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	baseURL := "rueidis://100.121.51.13:6379/14"
+
+	tests := []struct {
+		name                string
+		url                 string
+		expectBatchEnabled  bool
+		expectBatchSize     int
+		expectBatchBytes    int
+		expectBatchInterval time.Duration
+	}{
+		{
+			name:                "default parameters",
+			url:                 baseURL,
+			expectBatchEnabled:  true,
+			expectBatchSize:     512,
+			expectBatchBytes:    262144, // 256KB
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "batching disabled",
+			url:                 baseURL + "?batchwrite=0",
+			expectBatchEnabled:  false,
+			expectBatchSize:     512,
+			expectBatchBytes:    262144,
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "batching disabled with false",
+			url:                 baseURL + "?batchwrite=false",
+			expectBatchEnabled:  false,
+			expectBatchSize:     512,
+			expectBatchBytes:    262144,
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_size min range",
+			url:                 baseURL + "?batch_size=16",
+			expectBatchEnabled:  true,
+			expectBatchSize:     16,
+			expectBatchBytes:    262144,
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_size max range",
+			url:                 baseURL + "?batch_size=4096",
+			expectBatchEnabled:  true,
+			expectBatchSize:     4096,
+			expectBatchBytes:    262144,
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_size out of range low",
+			url:                 baseURL + "?batch_size=8",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512, // should use default
+			expectBatchBytes:    262144,
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_size out of range high",
+			url:                 baseURL + "?batch_size=8192",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512, // should use default
+			expectBatchBytes:    262144,
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_bytes min range",
+			url:                 baseURL + "?batch_bytes=4096",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512,
+			expectBatchBytes:    4096,
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_bytes max range",
+			url:                 baseURL + "?batch_bytes=1048576",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512,
+			expectBatchBytes:    1048576,
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_bytes out of range low",
+			url:                 baseURL + "?batch_bytes=1024",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512,
+			expectBatchBytes:    262144, // should use default
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_bytes out of range high",
+			url:                 baseURL + "?batch_bytes=2097152",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512,
+			expectBatchBytes:    262144, // should use default
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_interval min range",
+			url:                 baseURL + "?batch_interval=100us",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512,
+			expectBatchBytes:    262144,
+			expectBatchInterval: 100 * time.Microsecond,
+		},
+		{
+			name:                "custom batch_interval max range",
+			url:                 baseURL + "?batch_interval=50ms",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512,
+			expectBatchBytes:    262144,
+			expectBatchInterval: 50 * time.Millisecond,
+		},
+		{
+			name:                "custom batch_interval out of range low",
+			url:                 baseURL + "?batch_interval=50us",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512,
+			expectBatchBytes:    262144,
+			expectBatchInterval: 2 * time.Millisecond, // should use default
+		},
+		{
+			name:                "custom batch_interval out of range high",
+			url:                 baseURL + "?batch_interval=100ms",
+			expectBatchEnabled:  true,
+			expectBatchSize:     512,
+			expectBatchBytes:    262144,
+			expectBatchInterval: 2 * time.Millisecond, // should use default
+		},
+		{
+			name:                "all custom parameters",
+			url:                 baseURL + "?batch_size=128&batch_bytes=65536&batch_interval=5ms",
+			expectBatchEnabled:  true,
+			expectBatchSize:     128,
+			expectBatchBytes:    65536,
+			expectBatchInterval: 5 * time.Millisecond,
+		},
+		{
+			name:                "mixed with other parameters",
+			url:                 baseURL + "?ttl=5m&batch_size=256&prime=true",
+			expectBatchEnabled:  true,
+			expectBatchSize:     256,
+			expectBatchBytes:    262144,
+			expectBatchInterval: 2 * time.Millisecond,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt // capture
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewClient(tt.url, &Config{})
+			if m == nil {
+				t.Fatal("Cannot connect to Rueidis test server")
+			}
+			defer m.Shutdown()
+
+			rueidisClient, ok := m.(*rueidisMeta)
+			if !ok {
+				t.Fatal("Expected rueidisMeta client")
+			}
+
+			// Verify batch write enabled/disabled
+			if rueidisClient.batchEnabled != tt.expectBatchEnabled {
+				t.Errorf("Expected batchEnabled=%v, got %v",
+					tt.expectBatchEnabled, rueidisClient.batchEnabled)
+			}
+
+			// Verify batch size
+			if rueidisClient.batchSize != tt.expectBatchSize {
+				t.Errorf("Expected batchSize=%d, got %d",
+					tt.expectBatchSize, rueidisClient.batchSize)
+			}
+
+			// Verify batch bytes
+			if rueidisClient.batchBytes != tt.expectBatchBytes {
+				t.Errorf("Expected batchBytes=%d, got %d",
+					tt.expectBatchBytes, rueidisClient.batchBytes)
+			}
+
+			// Verify batch interval
+			if rueidisClient.flushInterval != tt.expectBatchInterval {
+				t.Errorf("Expected flushInterval=%v, got %v",
+					tt.expectBatchInterval, rueidisClient.flushInterval)
+			}
+		})
+	}
+}
+
+// TestURIParameterValidation tests validation ranges for URI parameters
+func TestURIParameterValidation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	baseURL := "rueidis://100.121.51.13:6379/14"
+
+	t.Run("batch_size validation", func(t *testing.T) {
+		validSizes := []int{16, 32, 64, 128, 256, 512, 1024, 2048, 4096}
+		invalidSizes := []int{0, 1, 8, 15, 4097, 8192, 10000}
+
+		for _, size := range validSizes {
+			url := baseURL + "?batch_size=" + string(rune(size+'0'))
+			m := NewClient(url, &Config{})
+			if m != nil {
+				defer m.Shutdown()
+			}
+		}
+
+		for _, size := range invalidSizes {
+			url := baseURL + "?batch_size=" + string(rune(size+'0'))
+			m := NewClient(url, &Config{})
+			if m != nil {
+				rueidisClient := m.(*rueidisMeta)
+				// Invalid sizes should fall back to default (512)
+				if rueidisClient.batchSize != 512 {
+					t.Errorf("Expected invalid size %d to fall back to 512, got %d",
+						size, rueidisClient.batchSize)
+				}
+				m.Shutdown()
+			}
+		}
+	})
+
+	t.Run("batch_bytes validation", func(t *testing.T) {
+		validBytes := []int{4096, 8192, 65536, 131072, 262144, 524288, 1048576}
+		invalidBytes := []int{0, 1024, 2048, 1048577, 2097152}
+
+		for _, bytes := range validBytes {
+			url := baseURL + "?batch_bytes=" + string(rune(bytes+'0'))
+			m := NewClient(url, &Config{})
+			if m != nil {
+				defer m.Shutdown()
+			}
+		}
+
+		for _, bytes := range invalidBytes {
+			url := baseURL + "?batch_bytes=" + string(rune(bytes+'0'))
+			m := NewClient(url, &Config{})
+			if m != nil {
+				rueidisClient := m.(*rueidisMeta)
+				// Invalid bytes should fall back to default (262144)
+				if rueidisClient.batchBytes != 262144 {
+					t.Errorf("Expected invalid bytes %d to fall back to 262144, got %d",
+						bytes, rueidisClient.batchBytes)
+				}
+				m.Shutdown()
+			}
+		}
+	})
+
+	t.Run("batch_interval validation", func(t *testing.T) {
+		validIntervals := []string{"100us", "500us", "1ms", "2ms", "5ms", "10ms", "50ms"}
+		invalidIntervals := []string{"50us", "99us", "51ms", "100ms", "1s"}
+
+		for _, interval := range validIntervals {
+			url := baseURL + "?batch_interval=" + interval
+			m := NewClient(url, &Config{})
+			if m != nil {
+				defer m.Shutdown()
+			}
+		}
+
+		for _, interval := range invalidIntervals {
+			url := baseURL + "?batch_interval=" + interval
+			m := NewClient(url, &Config{})
+			if m != nil {
+				rueidisClient := m.(*rueidisMeta)
+				// Invalid intervals should fall back to default (2ms)
+				if rueidisClient.flushInterval != 2*time.Millisecond {
+					t.Errorf("Expected invalid interval %s to fall back to 2ms, got %v",
+						interval, rueidisClient.flushInterval)
+				}
+				m.Shutdown()
+			}
+		}
+	})
+}

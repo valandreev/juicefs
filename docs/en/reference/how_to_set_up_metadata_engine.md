@@ -367,6 +367,159 @@ With batching (inode_batch=256):
 - Speedup: 250x
 ```
 
+#### Batch Write Optimization
+
+:::tip Performance Feature
+Rueidis supports **batch write optimization** to reduce Redis round-trips for metadata write operations. This feature batches multiple metadata updates into fewer Redis commands (using MSET, HMSET, and pipelining), significantly improving write throughput.
+:::
+
+By default, each metadata write operation (file creation, attribute update, directory stat update, etc.) requires a separate Redis command. With batch write optimization enabled, JuiceFS buffers operations in memory and flushes them in optimized batches using:
+
+- **MSET batching**: Combines multiple SET operations into a single MSET command
+- **HMSET batching**: Combines multiple HSET operations on the same hash into HMSET commands
+- **Coalescing**: Merges repeated updates to the same key (e.g., counter increments)
+- **Pipelining**: Sends multiple commands in a single network round-trip
+
+**URI Parameters:**
+
+- `batchwrite=0`: Disable batch writes (default: enabled with `batchwrite=1`)
+- `batch_size=N`: Maximum operations per batch (default: `512`, range: 16-4096)
+- `batch_bytes=N`: Maximum batch size in bytes (default: `262144` = 256KB, range: 4KB-1MB)
+- `batch_interval=D`: Maximum time between flushes (default: `2ms`, range: 100µs-50ms)
+
+**Default Behavior:**
+
+Batch write optimization is **enabled by default** with conservative parameters suitable for most workloads. You typically don't need to adjust these unless you have specific requirements.
+
+**Example usage for high-throughput workload:**
+
+```shell
+# Format with optimized batching for high write rate (10K+ ops/sec)
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1?batch_size=1024&batch_interval=5ms" \
+    pics
+```
+
+**Example usage for low-latency workload:**
+
+```shell
+# Format with smaller batches and shorter interval for low latency
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1?batch_size=128&batch_interval=500us" \
+    pics
+```
+
+**Disable batching for legacy behavior:**
+
+```shell
+# Disable batch writes (use immediate write-through behavior)
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1?batchwrite=0" \
+    pics
+```
+
+**Combined with other features:**
+
+```shell
+# Optimize for write-heavy workload: ID batching + write batching + caching
+juicefs format \
+    --storage s3 \
+    ... \
+    "rueidis://:mypassword@192.168.1.6:6379/1?ttl=2h&inode_batch=512&chunk_batch=4096&batch_size=1024&batch_interval=5ms" \
+    pics
+```
+
+**How it works:**
+
+1. Metadata write operations are enqueued to an in-memory buffer instead of being sent immediately.
+2. A background flusher goroutine drains the queue and builds optimized batches:
+   - Combines multiple SET operations into MSET commands
+   - Groups HSET operations by hash key and combines them into HMSET commands
+   - Coalesces repeated operations (e.g., multiple HINCRBY on the same field)
+   - Applies priority ordering to ensure critical operations are flushed first
+3. Batches are flushed when:
+   - The operation count reaches `batch_size`, OR
+   - The total size in bytes reaches `batch_bytes`, OR
+   - The flush interval timer (`batch_interval`) expires, OR
+   - An explicit flush is requested (e.g., fsync)
+4. Retry logic handles transient errors with exponential backoff (up to 3 retries).
+5. Poison operations (operations that fail repeatedly) are logged and removed from the queue.
+
+**Consistency guarantees:**
+
+- **Ordering**: Operations maintain per-inode ordering through flush barriers.
+- **Atomicity**: Each batch flush is atomic (all-or-nothing) within Redis transaction limits.
+- **Durability**: fsync and close operations trigger explicit batch flushes before returning.
+- **Visibility**: Synchronous operations (like fsync) wait for their batch to be flushed and committed to Redis.
+
+**Redis Cluster compatibility:**
+
+Batch write optimization is fully compatible with Redis Cluster. The implementation handles:
+- **CROSSSLOT errors**: Automatically falls back to individual operations when MSET/HMSET spans multiple slots
+- **Hash tag requirements**: No special keyspace setup needed (automatic handling)
+- **Connection pooling**: Uses per-slot connections for optimal cluster performance
+
+**Monitoring:**
+
+Prometheus metrics for batch writes:
+
+- `rueidis_batch_ops_queued_total{type="SET|HSET|..."}`: Operations queued for batching
+- `rueidis_batch_ops_flushed_total{type="SET|HSET|..."}`: Operations successfully flushed
+- `rueidis_batch_coalesce_saved_ops_total{type="..."}`: Operations eliminated by coalescing
+- `rueidis_batch_mset_conversions_total`: Number of MSET batch conversions
+- `rueidis_batch_mset_ops_saved_total`: SET operations saved via MSET batching
+- `rueidis_batch_hmset_conversions_total`: Number of HMSET batch conversions
+- `rueidis_batch_hset_coalesced_total`: HSET operations coalesced into HMSET
+- `rueidis_batch_flush_duration_seconds`: Histogram of flush operation durations
+- `rueidis_batch_queue_depth`: Current queue depth (gauge)
+- `rueidis_batch_size_ops`: Histogram of actual operations per batch
+- `rueidis_batch_errors_total{type="..."}`: Errors by type during flush
+- `rueidis_batch_poison_ops_total`: Operations that failed repeatedly and were dropped
+- `rueidis_batch_retry_ops_total{type="..."}`: Retry attempts by error type
+
+**Performance impact example:**
+
+```
+Workload: Update 1000 file attributes (chmod, chown, etc.)
+Network RTT: 30ms
+
+Without batching:
+- Redis calls: 1000 individual commands
+- Total latency: 1000 × 30ms = 30 seconds
+
+With batching (batch_size=512, batch_interval=2ms):
+- Redis calls: ≈2 batches (MSET + pipeline)
+- Total latency: ≈2 × 30ms + 2ms buffering = 62ms
+- Speedup: 483x
+```
+
+**When to adjust parameters:**
+
+- **High write rate (10K+ ops/sec)**: Increase `batch_size` to 1024-2048 and `batch_interval` to 5-10ms
+- **Low latency requirement**: Decrease `batch_size` to 128-256 and `batch_interval` to 500µs-1ms  
+- **High network latency**: Increase `batch_size` and `batch_interval` to amortize RTT cost
+- **Synchronous writes (fsync-heavy)**: Keep defaults; fsync triggers immediate flush
+- **Debugging/testing**: Disable with `batchwrite=0` to isolate batching effects
+
+**Adaptive batch sizing:**
+
+The batch flusher automatically adjusts batch size based on queue depth to balance throughput and latency:
+- **High queue depth (>1000)**: Increases batch size up to 2048 to drain queue faster
+- **Low queue depth (<100)**: Decreases batch size down to 512 to reduce latency
+- **Stable state**: Maintains optimal batch size based on recent queue behavior
+
+This adaptive behavior requires no tuning—the flusher learns the optimal batch size for your workload.
+
+#### Monitoring Cache Performance
+
+```
+
 #### Performance Comparison
 
 Compared to the standard Redis client (`redis://`), Rueidis offers:
