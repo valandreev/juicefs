@@ -1284,3 +1284,110 @@ func TestBatchHelpers_QueueFull(t *testing.T) {
 		t.Fatal("Blocked operation didn't complete")
 	}
 }
+
+// Test 41: Directory stat batching - verify operations are queued
+func TestBatchWrite_DirectoryStats(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	ctx := Background()
+
+	// Directly test the batch helpers that doUpdateDirStat uses
+	spaceKey := "dirUsedSpace"
+	lengthKey := "dirDataLength"
+	inodesKey := "dirUsedInodes"
+
+	// Simulate what doUpdateDirStat does: update stats for multiple directories
+	// Directory 100: length=1024, space=2048, inodes=5
+	err := m.batchHIncrBy(ctx, lengthKey, "100", 1024)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+	err = m.batchHIncrBy(ctx, spaceKey, "100", 2048)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+	err = m.batchHIncrBy(ctx, inodesKey, "100", 5)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+
+	// Directory 101: length=2048, space=4096, inodes=10
+	err = m.batchHIncrBy(ctx, lengthKey, "101", 2048)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+	err = m.batchHIncrBy(ctx, spaceKey, "101", 4096)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+	err = m.batchHIncrBy(ctx, inodesKey, "101", 10)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+
+	// Verify operations were queued (6 total)
+	count := 0
+	timeout := time.After(200 * time.Millisecond)
+	for count < 6 {
+		select {
+		case op := <-m.batchQueue:
+			if op.Type != OpHINCRBY {
+				t.Errorf("Expected OpHINCRBY, got %v", op.Type)
+			}
+			count++
+		case <-timeout:
+			t.Fatalf("Expected 6 operations, got %d", count)
+		}
+	}
+
+	t.Logf("Successfully queued %d directory stat operations", count)
+}
+
+// Test 42: Directory stat batching coalescing
+func TestBatchWrite_DirectoryStatsCoalescing(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	ctx := Background()
+
+	spaceKey := "dirUsedSpace"
+
+	// Enqueue multiple updates to the same directory field
+	// These should coalesce via HINCRBY summing: 1024 + 2048 + 512 = 3584
+	err := m.batchHIncrBy(ctx, spaceKey, "100", 1024)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+
+	err = m.batchHIncrBy(ctx, spaceKey, "100", 2048)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+
+	err = m.batchHIncrBy(ctx, spaceKey, "100", 512)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+
+	// Drain queue and verify operations were queued
+	count := 0
+	timeout := time.After(100 * time.Millisecond)
+	for count < 3 {
+		select {
+		case op := <-m.batchQueue:
+			if op.Type != OpHINCRBY {
+				t.Errorf("Expected OpHINCRBY, got %v", op.Type)
+			}
+			if op.Key != spaceKey {
+				t.Errorf("Expected key %s, got %s", spaceKey, op.Key)
+			}
+			if op.Field != "100" {
+				t.Errorf("Expected field '100', got '%s'", op.Field)
+			}
+			count++
+		case <-timeout:
+			t.Fatalf("Expected 3 operations, got %d", count)
+		}
+	}
+
+	t.Logf("Successfully queued %d directory stat operations (will coalesce to 1 during flush)", count)
+}

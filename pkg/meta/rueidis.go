@@ -2988,6 +2988,36 @@ func (m *rueidisMeta) doUpdateDirStat(ctx Context, batch map[Ino]dirStat) error 
 		defer wg.Wait()
 	}
 
+	// Use batch writer for directory stat updates
+	// This allows coalescing multiple HIncrBy operations across directories
+	if m.batchEnabled {
+		for ino, stat := range batch {
+			if nonexist[ino] {
+				continue
+			}
+			field := ino.String()
+			if stat.length != 0 {
+				if err := m.batchHIncrBy(ctx, lengthKey, field, stat.length); err != nil {
+					return err
+				}
+			}
+			if stat.space != 0 {
+				if err := m.batchHIncrBy(ctx, spaceKey, field, stat.space); err != nil {
+					return err
+				}
+			}
+			if stat.inodes != 0 {
+				if err := m.batchHIncrBy(ctx, inodesKey, field, stat.inodes); err != nil {
+					return err
+				}
+			}
+		}
+		// No explicit flush needed - operations will be flushed by background flusher
+		// or by next critical operation that needs consistency
+		return nil
+	}
+
+	// Fallback to pipeline for non-batched mode (legacy behavior)
 	for _, group := range m.groupBatch(batch, 1000) {
 		_, err := m.compat.Pipelined(ctx, func(pipe rueidiscompat.Pipeliner) error {
 			for _, ino := range group {
