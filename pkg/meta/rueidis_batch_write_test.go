@@ -17,10 +17,57 @@
 package meta
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+// Helper function to create a test rueidisMeta with proper initialization
+func newTestRueidisMeta(batchEnabled bool, queueSize int) *rueidisMeta {
+	m := &rueidisMeta{
+		batchEnabled: batchEnabled,
+		batchQueue:   make(chan *BatchOp, queueSize),
+		maxQueueSize: queueSize * 10, // Prevent back-pressure in tests
+		redisMeta:    &redisMeta{},
+	}
+
+	// Initialize metrics to prevent nil pointer panics
+	if batchEnabled {
+		m.batchOpsQueued = prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "test_batch_ops_queued_total"},
+			[]string{"type"},
+		)
+		m.batchOpsFlushed = prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "test_batch_ops_flushed_total"},
+			[]string{"type"},
+		)
+		m.batchCoalesceSaved = prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "test_batch_coalesce_saved_total"},
+			[]string{"type"},
+		)
+		m.batchErrors = prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "test_batch_errors_total"},
+			[]string{"error_type"},
+		)
+		m.batchMsetConversions = prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "test_batch_mset_conversions_total"},
+		)
+		m.batchMsetOpsSaved = prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "test_batch_mset_ops_saved_total"},
+		)
+		m.batchHmsetConversions = prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "test_batch_hmset_conversions_total"},
+		)
+		m.batchHsetCoalesced = prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "test_batch_hset_coalesced_total"},
+		)
+	}
+
+	return m
+}
 
 // Test 1: SET coalescing - multiple SETs to same key → keep last
 func TestCoalesceSET_SameKey(t *testing.T) {
@@ -931,5 +978,309 @@ func TestHMSET_DifferentFields(t *testing.T) {
 		if !fields[field] {
 			t.Errorf("Expected field %s not found", field)
 		}
+	}
+}
+
+// Test 33: batchSet helper function - batching enabled
+func TestBatchSet_BatchingEnabled(t *testing.T) {
+	m := newTestRueidisMeta(true, 10)
+
+	ctx := context.Background()
+
+	// Test with string value
+	err := m.batchSet(ctx, "test:key1", "value1")
+	if err != nil {
+		t.Fatalf("batchSet failed: %v", err)
+	}
+
+	// Verify operation was queued
+	select {
+	case op := <-m.batchQueue:
+		if op.Type != OpSET {
+			t.Errorf("Expected OpSET, got %v", op.Type)
+		}
+		if op.Key != "test:key1" {
+			t.Errorf("Expected key 'test:key1', got '%s'", op.Key)
+		}
+		if string(op.Value) != "value1" {
+			t.Errorf("Expected value 'value1', got '%s'", string(op.Value))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Operation not queued within timeout")
+	}
+
+	// Test with byte slice value
+	err = m.batchSet(ctx, "test:key2", []byte("bytes"))
+	if err != nil {
+		t.Fatalf("batchSet with []byte failed: %v", err)
+	}
+
+	select {
+	case op := <-m.batchQueue:
+		if string(op.Value) != "bytes" {
+			t.Errorf("Expected value 'bytes', got '%s'", string(op.Value))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Byte slice operation not queued")
+	}
+
+	// Test with int value
+	err = m.batchSet(ctx, "test:counter", 42)
+	if err != nil {
+		t.Fatalf("batchSet with int failed: %v", err)
+	}
+
+	select {
+	case op := <-m.batchQueue:
+		if string(op.Value) != "42" {
+			t.Errorf("Expected value '42', got '%s'", string(op.Value))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Int operation not queued")
+	}
+}
+
+// Test 34: batchHSet helper function - batching enabled
+func TestBatchHSet_BatchingEnabled(t *testing.T) {
+	m := newTestRueidisMeta(true, 10)
+
+	ctx := context.Background()
+
+	// Test with string value
+	err := m.batchHSet(ctx, "hash:config", "timeout", "30")
+	if err != nil {
+		t.Fatalf("batchHSet failed: %v", err)
+	}
+
+	// Verify operation was queued
+	select {
+	case op := <-m.batchQueue:
+		if op.Type != OpHSET {
+			t.Errorf("Expected OpHSET, got %v", op.Type)
+		}
+		if op.Key != "hash:config" {
+			t.Errorf("Expected key 'hash:config', got '%s'", op.Key)
+		}
+		if op.Field != "timeout" {
+			t.Errorf("Expected field 'timeout', got '%s'", op.Field)
+		}
+		if string(op.Value) != "30" {
+			t.Errorf("Expected value '30', got '%s'", string(op.Value))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Operation not queued within timeout")
+	}
+
+	// Test with byte slice value
+	err = m.batchHSet(ctx, "hash:data", "content", []byte("binary data"))
+	if err != nil {
+		t.Fatalf("batchHSet with []byte failed: %v", err)
+	}
+
+	select {
+	case op := <-m.batchQueue:
+		if string(op.Value) != "binary data" {
+			t.Errorf("Expected value 'binary data', got '%s'", string(op.Value))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Byte slice operation not queued")
+	}
+}
+
+// Test 35: batchHDel helper function
+func TestBatchHDel_BatchingEnabled(t *testing.T) {
+	m := newTestRueidisMeta(true, 10)
+
+	ctx := context.Background()
+
+	err := m.batchHDel(ctx, "hash:config", "old_field")
+	if err != nil {
+		t.Fatalf("batchHDel failed: %v", err)
+	}
+
+	// Verify operation was queued
+	select {
+	case op := <-m.batchQueue:
+		if op.Type != OpHDEL {
+			t.Errorf("Expected OpHDEL, got %v", op.Type)
+		}
+		if op.Key != "hash:config" {
+			t.Errorf("Expected key 'hash:config', got '%s'", op.Key)
+		}
+		if op.Field != "old_field" {
+			t.Errorf("Expected field 'old_field', got '%s'", op.Field)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Operation not queued within timeout")
+	}
+}
+
+// Test 36: batchHIncrBy helper function
+func TestBatchHIncrBy_BatchingEnabled(t *testing.T) {
+	m := newTestRueidisMeta(true, 10)
+
+	ctx := context.Background()
+
+	err := m.batchHIncrBy(ctx, "hash:stats", "counter", 10)
+	if err != nil {
+		t.Fatalf("batchHIncrBy failed: %v", err)
+	}
+
+	// Verify operation was queued
+	select {
+	case op := <-m.batchQueue:
+		if op.Type != OpHINCRBY {
+			t.Errorf("Expected OpHINCRBY, got %v", op.Type)
+		}
+		if op.Key != "hash:stats" {
+			t.Errorf("Expected key 'hash:stats', got '%s'", op.Key)
+		}
+		if op.Field != "counter" {
+			t.Errorf("Expected field 'counter', got '%s'", op.Field)
+		}
+		if op.Delta != 10 {
+			t.Errorf("Expected delta 10, got %d", op.Delta)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Operation not queued within timeout")
+	}
+}
+
+// Test 37: batchIncrBy helper function
+func TestBatchIncrBy_BatchingEnabled(t *testing.T) {
+	m := newTestRueidisMeta(true, 10)
+
+	ctx := context.Background()
+
+	err := m.batchIncrBy(ctx, "key:counter", 5)
+	if err != nil {
+		t.Fatalf("batchIncrBy failed: %v", err)
+	}
+
+	// Verify operation was queued
+	select {
+	case op := <-m.batchQueue:
+		if op.Type != OpINCRBY {
+			t.Errorf("Expected OpINCRBY, got %v", op.Type)
+		}
+		if op.Key != "key:counter" {
+			t.Errorf("Expected key 'key:counter', got '%s'", op.Key)
+		}
+		if op.Delta != 5 {
+			t.Errorf("Expected delta 5, got %d", op.Delta)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Operation not queued within timeout")
+	}
+}
+
+// Test 38: batchDel helper function
+func TestBatchDel_BatchingEnabled(t *testing.T) {
+	m := newTestRueidisMeta(true, 10)
+
+	ctx := context.Background()
+
+	err := m.batchDel(ctx, "key:old")
+	if err != nil {
+		t.Fatalf("batchDel failed: %v", err)
+	}
+
+	// Verify operation was queued
+	select {
+	case op := <-m.batchQueue:
+		if op.Type != OpDEL {
+			t.Errorf("Expected OpDEL, got %v", op.Type)
+		}
+		if op.Key != "key:old" {
+			t.Errorf("Expected key 'key:old', got '%s'", op.Key)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Operation not queued within timeout")
+	}
+}
+
+// Test 39: Helper functions with batching disabled (fallback path)
+// Note: This test verifies that the helper functions correctly check batchEnabled.
+// Full fallback testing with actual Redis calls requires integration tests.
+func TestBatchHelpers_BatchingDisabled(t *testing.T) {
+	// Create rueidisMeta with batching disabled
+	m := &rueidisMeta{
+		batchEnabled: false,
+		batchQueue:   make(chan *BatchOp, 10), // Won't be used
+		redisMeta:    &redisMeta{},
+	}
+
+	if m.batchEnabled {
+		t.Error("Expected batchEnabled to be false")
+	}
+
+	// Verify that the queue is not used when batching is disabled
+	initialQueueLen := len(m.batchQueue)
+
+	// Test each helper function with recovery from panic (due to nil compat)
+	testCases := []struct {
+		name string
+		fn   func() error
+	}{
+		{"batchSet", func() error { return m.batchSet(context.Background(), "test", "value") }},
+		{"batchHSet", func() error { return m.batchHSet(context.Background(), "hash", "field", "value") }},
+		{"batchHDel", func() error { return m.batchHDel(context.Background(), "hash", "field") }},
+		{"batchHIncrBy", func() error { return m.batchHIncrBy(context.Background(), "hash", "field", 1) }},
+		{"batchIncrBy", func() error { return m.batchIncrBy(context.Background(), "key", 1) }},
+		{"batchDel", func() error { return m.batchDel(context.Background(), "key") }},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					// Panic is expected due to nil compat, which means fallback path was taken
+					t.Logf("%s: Fallback path taken (panicked on nil compat as expected)", tc.name)
+				}
+			}()
+
+			_ = tc.fn()
+			// If we didn't panic, the function returned an error (also acceptable)
+		})
+	}
+
+	// Verify queue was not used (length unchanged)
+	if len(m.batchQueue) != initialQueueLen {
+		t.Errorf("Queue should not be used when batching disabled, initial=%d final=%d",
+			initialQueueLen, len(m.batchQueue))
+	}
+}
+
+// Test 40: Helper functions queue full (back-pressure)
+func TestBatchHelpers_QueueFull(t *testing.T) {
+	m := newTestRueidisMeta(true, 2) // Very small queue
+
+	ctx := context.Background()
+
+	// Fill the queue
+	_ = m.batchSet(ctx, "key1", "value1")
+	_ = m.batchSet(ctx, "key2", "value2")
+
+	// Next operation should timeout (queue full)
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- m.batchSet(ctx, "key3", "value3")
+	}()
+
+	// Wait a bit to ensure the operation is blocked
+	time.Sleep(50 * time.Millisecond)
+
+	// Drain one slot
+	<-m.batchQueue
+
+	// Now the blocked operation should succeed
+	select {
+	case err := <-errChan:
+		if err != nil {
+			// This is expected - enqueueBatchOp has a 100ms timeout
+			t.Logf("Operation timed out as expected: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Blocked operation didn't complete")
 	}
 }

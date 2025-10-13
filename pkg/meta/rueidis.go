@@ -478,6 +478,171 @@ func (m *rueidisMeta) Shutdown() error {
 	return m.redisMeta.Shutdown()
 }
 
+// Batch write helper functions
+
+// batchSet enqueues a SET operation for batching if batch writes are enabled.
+// If batching is disabled, it falls back to direct execution via compat.Set.
+// Returns an error if the operation fails to enqueue (e.g., queue full) or execute.
+//
+// Note: The value parameter accepts any type (string, []byte, int, etc.) and will be
+// serialized appropriately. For byte slices, they are stored directly in BatchOp.
+//
+// Usage: Replace direct compat.Set calls with batchSet for non-atomic writes.
+// DO NOT use for operations within atomic transaction blocks (WATCH/MULTI).
+func (m *rueidisMeta) batchSet(ctx context.Context, key string, value any) error {
+	if !m.batchEnabled {
+		// Fallback to direct execution when batching disabled
+		return m.compat.Set(ctx, key, value, 0).Err()
+	}
+
+	// Convert value to []byte for BatchOp storage
+	var valueBytes []byte
+	switch v := value.(type) {
+	case []byte:
+		valueBytes = v
+	case string:
+		valueBytes = []byte(v)
+	default:
+		// For other types, use fmt.Sprint to convert to string
+		valueBytes = []byte(fmt.Sprint(v))
+	}
+
+	// Enqueue for batch processing
+	op := &BatchOp{
+		Type:  OpSET,
+		Key:   key,
+		Value: valueBytes,
+	}
+	return m.enqueueBatchOp(op)
+}
+
+// batchHSet enqueues an HSET operation for batching if batch writes are enabled.
+// If batching is disabled, it falls back to direct execution via compat.HSet.
+// Returns an error if the operation fails to enqueue (e.g., queue full) or execute.
+//
+// Note: The value parameter accepts any type (string, []byte, int, etc.) and will be
+// serialized appropriately. For byte slices, they are stored directly in BatchOp.
+//
+// Usage: Replace direct compat.HSet calls with batchHSet for non-atomic writes.
+// DO NOT use for operations within atomic transaction blocks (WATCH/MULTI).
+func (m *rueidisMeta) batchHSet(ctx context.Context, key, field string, value any) error {
+	if !m.batchEnabled {
+		// Fallback to direct execution when batching disabled
+		return m.compat.HSet(ctx, key, field, value).Err()
+	}
+
+	// Convert value to []byte for BatchOp storage
+	var valueBytes []byte
+	switch v := value.(type) {
+	case []byte:
+		valueBytes = v
+	case string:
+		valueBytes = []byte(v)
+	default:
+		// For other types, use fmt.Sprint to convert to string
+		valueBytes = []byte(fmt.Sprint(v))
+	}
+
+	// Enqueue for batch processing
+	op := &BatchOp{
+		Type:  OpHSET,
+		Key:   key,
+		Field: field,
+		Value: valueBytes,
+	}
+	return m.enqueueBatchOp(op)
+}
+
+// batchHDel enqueues an HDEL operation for batching if batch writes are enabled.
+// If batching is disabled, it falls back to direct execution via compat.HDel.
+// Returns an error if the operation fails to enqueue (e.g., queue full) or execute.
+//
+// Usage: Replace direct compat.HDel calls with batchHDel for non-atomic writes.
+// DO NOT use for operations within atomic transaction blocks (WATCH/MULTI).
+func (m *rueidisMeta) batchHDel(ctx context.Context, key, field string) error {
+	if !m.batchEnabled {
+		// Fallback to direct execution when batching disabled
+		return m.compat.HDel(ctx, key, field).Err()
+	}
+
+	// Enqueue for batch processing
+	op := &BatchOp{
+		Type:  OpHDEL,
+		Key:   key,
+		Field: field,
+	}
+	return m.enqueueBatchOp(op)
+}
+
+// batchHIncrBy enqueues an HINCRBY operation for batching if batch writes are enabled.
+// If batching is disabled, it falls back to direct execution via compat.HIncrBy.
+// Returns an error if the operation fails to enqueue (e.g., queue full) or execute.
+//
+// Note: Multiple HINCRBY operations to the same hash+field are coalesced (summed)
+// during batch processing for efficiency.
+//
+// Usage: Replace direct compat.HIncrBy calls with batchHIncrBy for non-atomic writes.
+// DO NOT use for operations within atomic transaction blocks (WATCH/MULTI).
+func (m *rueidisMeta) batchHIncrBy(ctx context.Context, key, field string, delta int64) error {
+	if !m.batchEnabled {
+		// Fallback to direct execution when batching disabled
+		return m.compat.HIncrBy(ctx, key, field, delta).Err()
+	}
+
+	// Enqueue for batch processing
+	op := &BatchOp{
+		Type:  OpHINCRBY,
+		Key:   key,
+		Field: field,
+		Delta: delta,
+	}
+	return m.enqueueBatchOp(op)
+}
+
+// batchIncrBy enqueues an INCRBY operation for batching if batch writes are enabled.
+// If batching is disabled, it falls back to direct execution via compat.IncrBy.
+// Returns an error if the operation fails to enqueue (e.g., queue full) or execute.
+//
+// Note: Multiple INCRBY operations to the same key are coalesced (summed)
+// during batch processing for efficiency.
+//
+// Usage: Replace direct compat.IncrBy calls with batchIncrBy for non-atomic writes.
+// DO NOT use for operations within atomic transaction blocks (WATCH/MULTI).
+func (m *rueidisMeta) batchIncrBy(ctx context.Context, key string, delta int64) error {
+	if !m.batchEnabled {
+		// Fallback to direct execution when batching disabled
+		return m.compat.IncrBy(ctx, key, delta).Err()
+	}
+
+	// Enqueue for batch processing
+	op := &BatchOp{
+		Type:  OpINCRBY,
+		Key:   key,
+		Delta: delta,
+	}
+	return m.enqueueBatchOp(op)
+}
+
+// batchDel enqueues a DEL operation for batching if batch writes are enabled.
+// If batching is disabled, it falls back to direct execution via compat.Del.
+// Returns an error if the operation fails to enqueue (e.g., queue full) or execute.
+//
+// Usage: Replace direct compat.Del calls with batchDel for non-atomic writes.
+// DO NOT use for operations within atomic transaction blocks (WATCH/MULTI).
+func (m *rueidisMeta) batchDel(ctx context.Context, key string) error {
+	if !m.batchEnabled {
+		// Fallback to direct execution when batching disabled
+		return m.compat.Del(ctx, key).Err()
+	}
+
+	// Enqueue for batch processing
+	op := &BatchOp{
+		Type: OpDEL,
+		Key:  key,
+	}
+	return m.enqueueBatchOp(op)
+}
+
 // cachedGet performs a GET operation with client-side caching enabled.
 // It returns the value as bytes or an error. Returns ENOENT if key doesn't exist.
 // Uses m.cacheTTL from the connection URI (?ttl=) to control cache duration.
