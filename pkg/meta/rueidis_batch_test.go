@@ -5,6 +5,7 @@ package meta
 
 import (
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -362,4 +363,190 @@ func TestRueidisPrimeFunctions(t *testing.T) {
 	if err := rm.Reset(); err != nil {
 		t.Logf("Cleanup failed: %v", err)
 	}
+}
+
+// TestRueidisNextInode verifies the nextInode() pool management logic
+func TestRueidisNextInode(t *testing.T) {
+	// Create Rueidis meta with batching enabled
+	addr := "100.121.51.13:6379/15?metaprime=1&inode_batch=10&inode_low_watermark=30"
+	m, err := newRueidisMeta("rueidis", addr, &Config{})
+	if err != nil {
+		t.Skipf("Connection error (expected): %v", err)
+		return
+	}
+	rm := m.(*rueidisMeta)
+	defer rm.Reset()
+
+	t.Run("pool_refill_and_serve", func(t *testing.T) {
+		// Allocate 5 IDs - should prime once and serve from pool
+		ids := make([]uint64, 5)
+		for i := 0; i < 5; i++ {
+			id, err := rm.nextInode()
+			if err != nil {
+				t.Fatalf("nextInode() failed: %v", err)
+			}
+			ids[i] = id
+			t.Logf("Allocated inode ID: %d", id)
+		}
+
+		// Verify all IDs are unique and sequential
+		for i := 1; i < len(ids); i++ {
+			if ids[i] != ids[i-1]+1 {
+				t.Errorf("IDs not sequential: ids[%d]=%d, ids[%d]=%d", i-1, ids[i-1], i, ids[i])
+			}
+		}
+	})
+
+	t.Run("pool_exhaustion_refill", func(t *testing.T) {
+		// Allocate 25 IDs - should refill pool multiple times (batch=10)
+		ids := make([]uint64, 25)
+		for i := 0; i < 25; i++ {
+			id, err := rm.nextInode()
+			if err != nil {
+				t.Fatalf("nextInode()[%d] failed: %v", i, err)
+			}
+			ids[i] = id
+		}
+
+		// Verify uniqueness
+		seen := make(map[uint64]bool)
+		for _, id := range ids {
+			if seen[id] {
+				t.Errorf("Duplicate ID: %d", id)
+			}
+			seen[id] = true
+		}
+		t.Logf("Allocated %d unique IDs: [%d, %d]", len(ids), ids[0], ids[len(ids)-1])
+	})
+
+	t.Run("concurrent_allocation", func(t *testing.T) {
+		// Spawn 5 goroutines allocating 20 IDs each
+		const (
+			numGoroutines = 5
+			idsPerRoutine = 20
+		)
+		allIDs := make(chan uint64, numGoroutines*idsPerRoutine)
+		var wg sync.WaitGroup
+
+		for g := 0; g < numGoroutines; g++ {
+			wg.Add(1)
+			go func(gid int) {
+				defer wg.Done()
+				for i := 0; i < idsPerRoutine; i++ {
+					id, err := rm.nextInode()
+					if err != nil {
+						t.Errorf("goroutine %d: nextInode() failed: %v", gid, err)
+						return
+					}
+					allIDs <- id
+				}
+			}(g)
+		}
+
+		wg.Wait()
+		close(allIDs)
+
+		// Verify all IDs are unique
+		seen := make(map[uint64]bool)
+		count := 0
+		for id := range allIDs {
+			if seen[id] {
+				t.Errorf("Duplicate ID from concurrent allocation: %d", id)
+			}
+			seen[id] = true
+			count++
+		}
+		t.Logf("Concurrent allocation: %d unique IDs", count)
+		if count != numGoroutines*idsPerRoutine {
+			t.Errorf("Expected %d IDs, got %d", numGoroutines*idsPerRoutine, count)
+		}
+	})
+}
+
+// TestRueidisNextChunkID verifies the nextChunkID() pool management logic
+func TestRueidisNextChunkID(t *testing.T) {
+	// Create Rueidis meta with batching enabled
+	addr := "100.121.51.13:6379/15?metaprime=1&chunk_batch=20&chunk_low_watermark=25"
+	m, err := newRueidisMeta("rueidis", addr, &Config{})
+	if err != nil {
+		t.Skipf("Connection error (expected): %v", err)
+		return
+	}
+	rm := m.(*rueidisMeta)
+	defer rm.Reset()
+
+	t.Run("basic_allocation", func(t *testing.T) {
+		// Allocate 10 chunk IDs
+		ids := make([]uint64, 10)
+		for i := 0; i < 10; i++ {
+			id, err := rm.nextChunkID()
+			if err != nil {
+				t.Fatalf("nextChunkID() failed: %v", err)
+			}
+			ids[i] = id
+		}
+
+		// Verify sequential
+		for i := 1; i < len(ids); i++ {
+			if ids[i] != ids[i-1]+1 {
+				t.Errorf("Chunk IDs not sequential: ids[%d]=%d, ids[%d]=%d", i-1, ids[i-1], i, ids[i])
+			}
+		}
+		t.Logf("Allocated chunk IDs: [%d, %d]", ids[0], ids[len(ids)-1])
+	})
+
+	t.Run("large_allocation", func(t *testing.T) {
+		// Allocate 50 IDs (batch=20, so multiple refills)
+		ids := make([]uint64, 50)
+		for i := 0; i < 50; i++ {
+			id, err := rm.nextChunkID()
+			if err != nil {
+				t.Fatalf("nextChunkID()[%d] failed: %v", i, err)
+			}
+			ids[i] = id
+		}
+
+		// Verify all unique
+		seen := make(map[uint64]bool)
+		for _, id := range ids {
+			if seen[id] {
+				t.Errorf("Duplicate chunk ID: %d", id)
+			}
+			seen[id] = true
+		}
+		t.Logf("Allocated %d unique chunk IDs", len(ids))
+	})
+}
+
+// TestRueidisMetaPrimeDisabled verifies fallback when batching is disabled
+func TestRueidisMetaPrimeDisabled(t *testing.T) {
+	// Create Rueidis meta with batching DISABLED
+	addr := "100.121.51.13:6379/15?metaprime=0"
+	m, err := newRueidisMeta("rueidis", addr, &Config{})
+	if err != nil {
+		t.Skipf("Connection error (expected): %v", err)
+		return
+	}
+	rm := m.(*rueidisMeta)
+	defer rm.Reset()
+
+	t.Run("fallback_to_incr", func(t *testing.T) {
+		// Should use incrCounter directly, not batching
+		ids := make([]uint64, 5)
+		for i := 0; i < 5; i++ {
+			id, err := rm.nextInode()
+			if err != nil {
+				t.Fatalf("nextInode() with metaprime=0 failed: %v", err)
+			}
+			ids[i] = id
+		}
+
+		// Verify sequential
+		for i := 1; i < len(ids); i++ {
+			if ids[i] != ids[i-1]+1 {
+				t.Errorf("IDs not sequential: %d, %d", ids[i-1], ids[i])
+			}
+		}
+		t.Logf("Fallback mode: allocated IDs %v", ids)
+	})
 }

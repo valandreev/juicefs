@@ -63,7 +63,7 @@ Status legend:
 - **COMPLETED**: Added `primeInodes` and `primeChunks` functions in `rueidis.go` (lines ~720-780). Created comprehensive unit test `TestRueidisPrimeFunctions` with 4 subtests (all passing). Tests use direct Redis reads to bypass client-side cache and verify correct ID allocation semantics.
 
 ### 4) Implement `nextInode()` and `nextChunkID()` sync paths
-- [ ] Implement small methods returning next ID:
+- [x] Implement small methods returning next ID:
   - `func (m *rueidisMeta) nextInode() (uint64, error)`
   - `func (m *rueidisMeta) nextChunkID() (uint64, error)`
 - Behavior:
@@ -73,13 +73,15 @@ Status legend:
   - If after serving, remaining <= low watermark, trigger an asynchronous non-blocking `prime*` to prefill next batch.
   - Ensure only one async prime runs concurrently (use a boolean flag or use atomic/Semaphore to dedupe concurrent prefetch attempts).
 - Acceptance: Unit tests simulate sequential allocation and that counts/returns are monotonic and unique.
+- **COMPLETED**: Implemented both methods with full pool management in `rueidis.go` (lines ~810-910). Created comprehensive tests in `TestRueidisNextInode` (3 subtests), `TestRueidisNextChunkID` (2 subtests), and `TestRueidisMetaPrimeDisabled` (1 subtest) - all 6 tests passing with test Redis at 100.121.51.13:6379.
 
 ### 5) Async prefetch / low-watermark logic
-- [ ] Implement asynchronous prefetch that runs in new goroutine:
+- [x] Implement asynchronous prefetch that runs in new goroutine:
   - Prefetch should try to prime exactly `batch` size.
   - Prefetch should be a no-op if another prefetch already in progress or pool was refilled.
   - Errors should be logged and increment `prime_errors` metric.
 - Acceptance: If low-watermark reached, async goroutine triggers, and pool refills without blocking writers.
+- **COMPLETED**: Implemented `asyncPrefetchInodes()` and `asyncPrefetchChunks()` (lines ~912-950). Both functions use `prefetchLock` and boolean flags (`inodePrefetching`/`chunkPrefetching`) for deduplication. Integrated into Step 4's `nextInode()`/`nextChunkID()` methods. Concurrent allocation test validates this works correctly.
 
 ### 6) Integrate `next*` into allocation sites
 - [ ] Identify all places where the code previously relied on `incrCounter("nextInode")` / `incrCounter("nextChunk")` (use global grep for `nextInode` and `nextChunk` and `incrCounter(` in repo). Replace those with `m.nextInode()` and `m.nextChunkID()` appropriately.

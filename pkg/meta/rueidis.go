@@ -799,6 +799,176 @@ func (m *rueidisMeta) primeChunks(n uint64) (start uint64, err error) {
 	return start, nil
 }
 
+// nextInode returns the next available inode ID using local pool management.
+// It maintains a local pool of pre-allocated IDs to reduce Redis round trips.
+//
+// Behavior:
+//   - If pool is empty (poolRem == 0), synchronously primes a new batch
+//   - Returns next ID from pool and decrements poolRem
+//   - If poolRem drops to low watermark, triggers async prefetch
+//   - Thread-safe (uses mutex)
+//
+// Error modes:
+//   - Returns error if priming fails (Redis unavailable, etc.)
+//   - Async prefetch failures are logged but don't block
+func (m *rueidisMeta) nextInode() (uint64, error) {
+	// Check if batching is disabled
+	if !m.metaPrimeEnabled {
+		// Fall back to direct INCR (current behavior)
+		result, err := m.incrCounter("nextInode", 1)
+		if err != nil {
+			return 0, err
+		}
+		return uint64(result), nil
+	}
+
+	m.inodePoolLock.Lock()
+	defer m.inodePoolLock.Unlock()
+
+	// Refill pool if empty (synchronous)
+	if m.inodePoolRem == 0 {
+		start, err := m.primeInodes(m.inodeBatch)
+		if err != nil {
+			return 0, err
+		}
+		m.inodePoolBase = start
+		m.inodePoolRem = m.inodeBatch
+		logger.Debugf("nextInode: refilled pool [%d, %d]", start, start+m.inodeBatch-1)
+	}
+
+	// Serve ID from pool
+	id := m.inodePoolBase
+	m.inodePoolBase++
+	m.inodePoolRem--
+	m.inodeIDsServed.Inc()
+
+	// Trigger async prefetch if at low watermark
+	if m.inodePoolRem == m.inodeLowWM {
+		m.prefetchLock.Lock()
+		if !m.inodePrefetching {
+			m.inodePrefetching = true
+			m.prefetchLock.Unlock()
+			go m.asyncPrefetchInodes()
+		} else {
+			m.prefetchLock.Unlock()
+		}
+	}
+
+	return id, nil
+}
+
+// nextChunkID returns the next available chunk ID using local pool management.
+// It maintains a local pool of pre-allocated IDs to reduce Redis round trips.
+//
+// Behavior:
+//   - If pool is empty (poolRem == 0), synchronously primes a new batch
+//   - Returns next ID from pool and decrements poolRem
+//   - If poolRem drops to low watermark, triggers async prefetch
+//   - Thread-safe (uses mutex)
+//
+// Error modes:
+//   - Returns error if priming fails (Redis unavailable, etc.)
+//   - Async prefetch failures are logged but don't block
+func (m *rueidisMeta) nextChunkID() (uint64, error) {
+	// Check if batching is disabled
+	if !m.metaPrimeEnabled {
+		// Fall back to direct INCR (current behavior)
+		result, err := m.incrCounter("nextChunk", 1)
+		if err != nil {
+			return 0, err
+		}
+		return uint64(result), nil
+	}
+
+	m.chunkPoolLock.Lock()
+	defer m.chunkPoolLock.Unlock()
+
+	// Refill pool if empty (synchronous)
+	if m.chunkPoolRem == 0 {
+		start, err := m.primeChunks(m.chunkBatch)
+		if err != nil {
+			return 0, err
+		}
+		m.chunkPoolBase = start
+		m.chunkPoolRem = m.chunkBatch
+		logger.Debugf("nextChunkID: refilled pool [%d, %d]", start, start+m.chunkBatch-1)
+	}
+
+	// Serve ID from pool
+	id := m.chunkPoolBase
+	m.chunkPoolBase++
+	m.chunkPoolRem--
+	m.chunkIDsServed.Inc()
+
+	// Trigger async prefetch if at low watermark
+	if m.chunkPoolRem == m.chunkLowWM {
+		m.prefetchLock.Lock()
+		if !m.chunkPrefetching {
+			m.chunkPrefetching = true
+			m.prefetchLock.Unlock()
+			go m.asyncPrefetchChunks()
+		} else {
+			m.prefetchLock.Unlock()
+		}
+	}
+
+	return id, nil
+}
+
+// asyncPrefetchInodes runs in a goroutine to prefetch the next batch of inodes
+// when the pool reaches low watermark. This prevents blocking on the next refill.
+func (m *rueidisMeta) asyncPrefetchInodes() {
+	defer func() {
+		m.prefetchLock.Lock()
+		m.inodePrefetching = false
+		m.prefetchLock.Unlock()
+	}()
+
+	start, err := m.primeInodes(m.inodeBatch)
+	if err != nil {
+		logger.Warnf("asyncPrefetchInodes failed: %v", err)
+		return
+	}
+
+	m.inodePoolLock.Lock()
+	defer m.inodePoolLock.Unlock()
+
+	// Only update pool if it's empty or low (race condition check)
+	if m.inodePoolRem < m.inodeLowWM {
+		m.inodePoolBase = start
+		m.inodePoolRem = m.inodeBatch
+		m.inodePrefetchAsync.Inc()
+		logger.Debugf("asyncPrefetchInodes: prefilled pool [%d, %d]", start, start+m.inodeBatch-1)
+	}
+}
+
+// asyncPrefetchChunks runs in a goroutine to prefetch the next batch of chunks
+// when the pool reaches low watermark. This prevents blocking on the next refill.
+func (m *rueidisMeta) asyncPrefetchChunks() {
+	defer func() {
+		m.prefetchLock.Lock()
+		m.chunkPrefetching = false
+		m.prefetchLock.Unlock()
+	}()
+
+	start, err := m.primeChunks(m.chunkBatch)
+	if err != nil {
+		logger.Warnf("asyncPrefetchChunks failed: %v", err)
+		return
+	}
+
+	m.chunkPoolLock.Lock()
+	defer m.chunkPoolLock.Unlock()
+
+	// Only update pool if it's empty or low (race condition check)
+	if m.chunkPoolRem < m.chunkLowWM {
+		m.chunkPoolBase = start
+		m.chunkPoolRem = m.chunkBatch
+		m.chunkPrefetchAsync.Inc()
+		logger.Debugf("asyncPrefetchChunks: prefilled pool [%d, %d]", start, start+m.chunkBatch-1)
+	}
+}
+
 func (m *rueidisMeta) setIfSmall(name string, value, diff int64) (bool, error) {
 	if m.compat == nil {
 		return m.redisMeta.setIfSmall(name, value, diff)
