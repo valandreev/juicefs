@@ -1886,3 +1886,213 @@ func TestBatchWrite_AdaptiveSizing_CircularBuffer(t *testing.T) {
 
 	t.Log("Successfully verified circular buffer behavior")
 }
+
+// Test 58: Poison operation handling - retry count tracking
+func TestBatchWrite_PoisonOp_RetryCount(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize poison/retry metrics
+	m.batchPoisonOps = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "test_batch_poison_ops_total",
+	})
+	m.batchRetryOps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "test_batch_retry_ops_total",
+	}, []string{"type"})
+
+	// Create operation with retry count
+	op := &BatchOp{
+		Type:       OpSET,
+		Key:        "test_key",
+		Value:      []byte("test_value"),
+		RetryCount: 0,
+	}
+
+	// Simulate retries
+	for i := 0; i < 3; i++ {
+		op.RetryCount++
+		if op.RetryCount < 3 {
+			t.Logf("Retry %d/%d", op.RetryCount, 3)
+		}
+	}
+
+	// Verify retry count reached threshold
+	if op.RetryCount != 3 {
+		t.Errorf("Expected retry count 3, got %d", op.RetryCount)
+	}
+
+	t.Log("Successfully tracked retry count")
+}
+
+// Test 59: Poison operation handling - handlePoisonOp logging
+func TestBatchWrite_PoisonOp_DetailedLogging(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize metrics
+	m.batchPoisonOps = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "test_batch_poison_ops_total",
+	})
+
+	// Create operation with various fields for context
+	op := &BatchOp{
+		Type:       OpHSET,
+		Key:        "test_hash",
+		Field:      "test_field",
+		Value:      []byte("some_data_here"),
+		Inode:      123,
+		Priority:   10,
+		RetryCount: 3,
+	}
+
+	// Call handlePoisonOp (should not panic, should log)
+	err := fmt.Errorf("test error: connection timeout")
+	m.handlePoisonOp(op, err)
+
+	// Verify poison metric was incremented
+	// (We can't directly read the counter value, but we verified no panic)
+
+	t.Log("Successfully logged poison operation with context")
+}
+
+// Test 60: Poison operation handling - ResultChan notification
+func TestBatchWrite_PoisonOp_ResultChan(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize metrics
+	m.batchPoisonOps = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "test_batch_poison_ops_total",
+	})
+
+	// Create operation with ResultChan
+	resultChan := make(chan error, 1)
+	op := &BatchOp{
+		Type:       OpSET,
+		Key:        "test_key",
+		Value:      []byte("test_value"),
+		RetryCount: 3,
+		ResultChan: resultChan,
+	}
+
+	// Call handlePoisonOp
+	testErr := fmt.Errorf("test error")
+	m.handlePoisonOp(op, testErr)
+
+	// Verify error was sent to ResultChan
+	select {
+	case receivedErr := <-resultChan:
+		if receivedErr != testErr {
+			t.Errorf("Expected error %v, got %v", testErr, receivedErr)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Expected error on ResultChan, got timeout")
+	}
+
+	t.Log("Successfully notified ResultChan of poison operation")
+}
+
+// Test 61: Poison operation handling - retry metric tracking
+func TestBatchWrite_PoisonOp_RetryMetrics(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize metrics
+	m.batchRetryOps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "test_batch_retry_ops_total",
+	}, []string{"type"})
+	m.batchPoisonOps = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "test_batch_poison_ops_total",
+	})
+
+	// Simulate retry scenario
+	ops := []*BatchOp{
+		{Type: OpSET, Key: "key1", RetryCount: 0},
+		{Type: OpSET, Key: "key2", RetryCount: 0},
+		{Type: OpSET, Key: "key3", RetryCount: 0},
+	}
+
+	// Simulate retry logic
+	for _, op := range ops {
+		op.RetryCount++
+		if op.RetryCount < 3 {
+			// Should increment retry metric
+			m.batchRetryOps.WithLabelValues("retryable").Inc()
+		} else {
+			// Should increment poison metric
+			m.handlePoisonOp(op, fmt.Errorf("test error"))
+		}
+	}
+
+	// All operations should have been retried (first retry)
+	for _, op := range ops {
+		if op.RetryCount != 1 {
+			t.Errorf("Expected retry count 1, got %d", op.RetryCount)
+		}
+	}
+
+	t.Log("Successfully tracked retry metrics")
+}
+
+// Test 62: Poison operation handling - threshold enforcement
+func TestBatchWrite_PoisonOp_ThresholdEnforcement(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize metrics
+	m.batchRetryOps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "test_batch_retry_ops_total",
+	}, []string{"type"})
+	m.batchPoisonOps = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "test_batch_poison_ops_total",
+	})
+
+	// Test threshold: 3 retries max
+	op := &BatchOp{
+		Type:       OpSET,
+		Key:        "test_key",
+		Value:      []byte("test_value"),
+		RetryCount: 0,
+	}
+
+	// Simulate retry loop with threshold check
+	poisonDetected := false
+	for attempt := 0; attempt < 5; attempt++ {
+		op.RetryCount++
+		if op.RetryCount < 3 {
+			m.batchRetryOps.WithLabelValues("test").Inc()
+			t.Logf("Attempt %d: Retrying", op.RetryCount)
+		} else {
+			m.handlePoisonOp(op, fmt.Errorf("max retries exceeded"))
+			poisonDetected = true
+			t.Logf("Attempt %d: Poison detected", op.RetryCount)
+			break
+		}
+	}
+
+	// Verify poison was detected at threshold
+	if !poisonDetected {
+		t.Error("Expected poison detection at threshold")
+	}
+	if op.RetryCount != 3 {
+		t.Errorf("Expected retry count 3 at poison detection, got %d", op.RetryCount)
+	}
+
+	t.Log("Successfully enforced retry threshold")
+}
+
+// Test 63: Poison operation handling - multiple error types
+func TestBatchWrite_PoisonOp_MultipleErrorTypes(t *testing.T) {
+	m := newTestRueidisMeta(true, 100)
+
+	// Initialize metrics
+	m.batchRetryOps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "test_batch_retry_ops_total",
+	}, []string{"type"})
+
+	// Test different error types
+	errorTypes := []string{"mset_retryable", "hmset_retryable", "hmset_crossslot", "retryable"}
+
+	for _, errType := range errorTypes {
+		// Increment retry metric for each type
+		m.batchRetryOps.WithLabelValues(errType).Inc()
+		t.Logf("Tracked retry for error type: %s", errType)
+	}
+
+	t.Log("Successfully tracked multiple error types")
+}

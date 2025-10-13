@@ -665,6 +665,7 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 
 					// Re-enqueue original HSET operations individually
 					for _, op := range originalOps {
+						m.batchRetryOps.WithLabelValues("hmset_crossslot").Inc()
 						failedOps = append(failedOps, op)
 					}
 				} else if m.isRetryableError(err) {
@@ -673,6 +674,7 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 					for _, op := range originalOps {
 						op.RetryCount++
 						if op.RetryCount < 3 {
+							m.batchRetryOps.WithLabelValues("hmset_retryable").Inc()
 							failedOps = append(failedOps, op)
 						} else {
 							m.handlePoisonOp(op, err)
@@ -693,6 +695,7 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 			if m.isRetryableError(err) {
 				op.RetryCount++
 				if op.RetryCount < 3 { // Max 3 retries
+					m.batchRetryOps.WithLabelValues("retryable").Inc()
 					failedOps = append(failedOps, op)
 					m.batchErrors.WithLabelValues("retryable").Inc()
 				} else {
@@ -807,8 +810,27 @@ func (m *rueidisMeta) handlePoisonOp(op *BatchOp, err error) {
 
 	// Log detailed error for debugging
 	logger := utils.GetLogger("juicefs")
-	logger.Errorf("Poison operation after %d retries: type=%v key=%s error=%v",
-		op.RetryCount, op.Type, op.Key, err)
+
+	// Build detailed context string
+	var context string
+	if op.Field != "" {
+		context = fmt.Sprintf(" field=%s", op.Field)
+	}
+	if op.Inode != 0 {
+		context += fmt.Sprintf(" inode=%d", op.Inode)
+	}
+	if op.Delta != 0 {
+		context += fmt.Sprintf(" delta=%d", op.Delta)
+	}
+	if len(op.Value) > 0 {
+		context += fmt.Sprintf(" valueSize=%d", len(op.Value))
+	}
+	if op.Priority != 0 {
+		context += fmt.Sprintf(" priority=%d", op.Priority)
+	}
+
+	logger.Errorf("Poison operation after %d retries: type=%v key=%s%s error=%v",
+		op.RetryCount, op.Type, op.Key, context, err)
 
 	// Notify via result channel if someone is waiting
 	if op.ResultChan != nil {
