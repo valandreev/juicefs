@@ -52,6 +52,31 @@ type rueidisMeta struct {
 	// Client-side cache metrics
 	cacheHits   prometheus.Counter // successful cache hits
 	cacheMisses prometheus.Counter // cache misses requiring Redis fetch
+
+	// ID batching (pre-allocation pools to reduce INCR RTTs)
+	metaPrimeEnabled bool       // enable ID batching (default: true, disable with ?metaprime=0)
+	inodePoolBase    uint64     // next inode ID to serve from local pool
+	inodePoolRem     uint64     // remaining inode IDs in local pool
+	inodeBatch       uint64     // batch size for inode allocation (default: 256)
+	inodeLowWM       uint64     // low watermark for async prefetch (default: 25% of batch)
+	inodePoolLock    sync.Mutex // protects inode pool state
+	chunkPoolBase    uint64     // next chunk ID to serve from local pool
+	chunkPoolRem     uint64     // remaining chunk IDs in local pool
+	chunkBatch       uint64     // batch size for chunk allocation (default: 2048)
+	chunkLowWM       uint64     // low watermark for async prefetch (default: 25% of batch)
+	chunkPoolLock    sync.Mutex // protects chunk pool state
+	inodePrefetching bool       // true if async inode prefetch is in progress
+	chunkPrefetching bool       // true if async chunk prefetch is in progress
+	prefetchLock     sync.Mutex // protects prefetch flags
+
+	// ID batching metrics
+	inodePrimeCalls    prometheus.Counter // number of times primeInodes() was called
+	chunkPrimeCalls    prometheus.Counter // number of times primeChunks() was called
+	primeErrors        prometheus.Counter // total prime operation errors
+	inodeIDsServed     prometheus.Counter // total inode IDs served from pool
+	chunkIDsServed     prometheus.Counter // total chunk IDs served from pool
+	inodePrefetchAsync prometheus.Counter // number of async inode prefetch operations
+	chunkPrefetchAsync prometheus.Counter // number of async chunk prefetch operations
 }
 
 // Temporary Rueidis registration that delegates to the Redis implementation.
@@ -78,8 +103,20 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	//   Use ?prime=1 to enable post-write cache priming (experimental)
 	//   When enabled, writes will prime the cache with fresh data after update
 	//   Note: Server-side invalidation is usually sufficient; priming adds overhead
+	//
+	// ID Batching parameters:
+	//   ?metaprime=0 - Disable ID batching (default: enabled)
+	//   ?inode_batch=N - Inode ID batch size (default: 256)
+	//   ?chunk_batch=N - Chunk ID batch size (default: 2048)
+	//   ?inode_low_watermark=N - Inode pool prefetch watermark in % (default: 25)
+	//   ?chunk_low_watermark=N - Chunk pool prefetch watermark in % (default: 25)
 	cacheTTL := 1 * time.Hour
 	enablePrime := true
+	metaPrimeEnabled := true
+	inodeBatch := uint64(256)
+	chunkBatch := uint64(2048)
+	inodeLowWMPercent := uint64(25)
+	chunkLowWMPercent := uint64(25)
 	cleanAddr := addr
 
 	if u, err := url.Parse(uri); err == nil {
@@ -95,10 +132,48 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 			enablePrime = true
 		}
 
+		// Extract metaprime parameter (ID batching on/off)
+		if metaPrimeStr := u.Query().Get("metaprime"); metaPrimeStr == "0" || metaPrimeStr == "false" {
+			metaPrimeEnabled = false
+		}
+
+		// Extract inode_batch parameter
+		if inodeBatchStr := u.Query().Get("inode_batch"); inodeBatchStr != "" {
+			if val, err := strconv.ParseUint(inodeBatchStr, 10, 64); err == nil && val > 0 {
+				inodeBatch = val
+			}
+		}
+
+		// Extract chunk_batch parameter
+		if chunkBatchStr := u.Query().Get("chunk_batch"); chunkBatchStr != "" {
+			if val, err := strconv.ParseUint(chunkBatchStr, 10, 64); err == nil && val > 0 {
+				chunkBatch = val
+			}
+		}
+
+		// Extract inode_low_watermark parameter (percentage)
+		if inodeWMStr := u.Query().Get("inode_low_watermark"); inodeWMStr != "" {
+			if val, err := strconv.ParseUint(inodeWMStr, 10, 64); err == nil && val > 0 && val < 100 {
+				inodeLowWMPercent = val
+			}
+		}
+
+		// Extract chunk_low_watermark parameter (percentage)
+		if chunkWMStr := u.Query().Get("chunk_low_watermark"); chunkWMStr != "" {
+			if val, err := strconv.ParseUint(chunkWMStr, 10, 64); err == nil && val > 0 && val < 100 {
+				chunkLowWMPercent = val
+			}
+		}
+
 		// Strip custom params from query for rueidis.ParseURL
 		q := u.Query()
 		q.Del("ttl")
 		q.Del("prime")
+		q.Del("metaprime")
+		q.Del("inode_batch")
+		q.Del("chunk_batch")
+		q.Del("inode_low_watermark")
+		q.Del("chunk_low_watermark")
 		u.RawQuery = q.Encode()
 
 		// Extract just the address part (without scheme)
@@ -107,6 +182,10 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 			cleanAddr += "?" + u.RawQuery
 		}
 	}
+
+	// Calculate low watermarks from percentages
+	inodeLowWM := (inodeBatch * inodeLowWMPercent) / 100
+	chunkLowWM := (chunkBatch * chunkLowWMPercent) / 100
 
 	cleanURI := canonical + "://" + cleanAddr
 	opt, err := rueidis.ParseURL(cleanURI)
@@ -146,14 +225,19 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	}
 
 	m := &rueidisMeta{
-		redisMeta:   base,
-		scheme:      driver,
-		canonical:   canonical,
-		option:      opt,
-		client:      client,
-		compat:      rueidiscompat.NewAdapter(client),
-		cacheTTL:    cacheTTL,
-		enablePrime: enablePrime,
+		redisMeta:        base,
+		scheme:           driver,
+		canonical:        canonical,
+		option:           opt,
+		client:           client,
+		compat:           rueidiscompat.NewAdapter(client),
+		cacheTTL:         cacheTTL,
+		enablePrime:      enablePrime,
+		metaPrimeEnabled: metaPrimeEnabled,
+		inodeBatch:       inodeBatch,
+		chunkBatch:       chunkBatch,
+		inodeLowWM:       inodeLowWM,
+		chunkLowWM:       chunkLowWM,
 		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "rueidis_cache_hits_total",
 			Help: "Total number of successful client-side cache hits (data served from local cache).",
@@ -161,6 +245,34 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		cacheMisses: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "rueidis_cache_misses_total",
 			Help: "Total number of cache misses requiring fetch from Redis server.",
+		}),
+		inodePrimeCalls: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_inode_prime_calls_total",
+			Help: "Number of times primeInodes() was called to refill the inode ID pool.",
+		}),
+		chunkPrimeCalls: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_chunk_prime_calls_total",
+			Help: "Number of times primeChunks() was called to refill the chunk ID pool.",
+		}),
+		primeErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_prime_errors_total",
+			Help: "Total number of errors during ID pool prime operations (INCRBY failures).",
+		}),
+		inodeIDsServed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_inode_ids_served_total",
+			Help: "Total number of inode IDs served from the local pool (without Redis RTT).",
+		}),
+		chunkIDsServed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_chunk_ids_served_total",
+			Help: "Total number of chunk IDs served from the local pool (without Redis RTT).",
+		}),
+		inodePrefetchAsync: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_inode_prefetch_async_total",
+			Help: "Number of asynchronous inode pool prefetch operations triggered by low watermark.",
+		}),
+		chunkPrefetchAsync: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_chunk_prefetch_async_total",
+			Help: "Number of asynchronous chunk pool prefetch operations triggered by low watermark.",
 		}),
 	}
 	m.redisMeta.en = m
@@ -191,6 +303,15 @@ func (m *rueidisMeta) InitMetrics(reg prometheus.Registerer) {
 	if reg != nil {
 		reg.MustRegister(m.cacheHits)
 		reg.MustRegister(m.cacheMisses)
+
+		// Register ID batching metrics
+		reg.MustRegister(m.inodePrimeCalls)
+		reg.MustRegister(m.chunkPrimeCalls)
+		reg.MustRegister(m.primeErrors)
+		reg.MustRegister(m.inodeIDsServed)
+		reg.MustRegister(m.chunkIDsServed)
+		reg.MustRegister(m.inodePrefetchAsync)
+		reg.MustRegister(m.chunkPrefetchAsync)
 	}
 }
 func (m *rueidisMeta) Shutdown() error {

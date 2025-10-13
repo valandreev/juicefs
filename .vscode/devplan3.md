@@ -28,16 +28,16 @@ Status legend:
 ## Tasks
 
 ### 1) Project prep & config parsing
-- [ ] Add and document new connection URI options handled by `newRueidisMeta`:
+- [x] Add and document new connection URI options handled by `newRueidisMeta`:
   - `inode_batch` (default 256)
   - `chunk_batch` (default 2048)
   - `inode_low_watermark` (default 25% of inode_batch)
   - `chunk_low_watermark` (default 25% of chunk_batch)
-  - `prime` or `enable_prime` already exists in rueidis.go; unify naming if necessary.
+  - `metaprime=0` disables this feature (getting back to currecnt implementation), default is feature on.
 - Acceptance: `newRueidisMeta` reads and validates these params; values stored in `rueidisMeta` struct fields.
 
 ### 2) Add pool state and metrics into `rueidisMeta`
-- [ ] Add fields (with concise names and comments) to `rueidisMeta` in `pkg/meta/rueidis.go`:
+- [x] Add fields (with concise names and comments) to `rueidisMeta` in `pkg/meta/rueidis.go`:
   - inodePoolBase uint64
   - inodePoolRem uint64
   - inodeBatch uint64
@@ -124,8 +124,8 @@ Status legend:
 ---
 
 ## File-level checklist (use these to mark progress in this file)
-- [ ] 1. Parse config and add fields in `rueidis.go`
-- [ ] 2. Add metrics and InitMetrics hooks
+- [x] 1. Parse config and add fields in `rueidis.go`
+- [x] 2. Add metrics and InitMetrics hooks
 - [ ] 3. Implement `primeInodes` / `primeChunks`
 - [ ] 4. Implement `nextInode` / `nextChunkID` with prefetch
 - [ ] 5. Replace allocation call sites
