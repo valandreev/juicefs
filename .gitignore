@@ -22,6 +22,7 @@ cmd/cmd
 # ide
 # .vscode
 .idea
+*.exe
 
 # lang
 __pycache__
