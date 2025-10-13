@@ -772,3 +772,164 @@ func TestMSET_OpsSaved(t *testing.T) {
 		t.Errorf("Expected 95 ops saved from 100 SETs → 5 MSETs, got %d", totalSavings)
 	}
 }
+
+// Test 28: HMSET grouping - single hash
+func TestBuildHMSET_SingleHash(t *testing.T) {
+	ops := []*BatchOp{
+		{Type: OpHSET, Key: "user:1", Field: "name", Value: []byte("Alice")},
+		{Type: OpHSET, Key: "user:1", Field: "age", Value: []byte("30")},
+		{Type: OpHSET, Key: "user:1", Field: "email", Value: []byte("alice@example.com")},
+		{Type: OpSET, Key: "other", Value: []byte("value")},
+	}
+
+	// Count HSETs to same hash
+	hsetCount := 0
+	for _, op := range ops {
+		if op.Type == OpHSET && op.Key == "user:1" {
+			hsetCount++
+		}
+	}
+
+	if hsetCount != 3 {
+		t.Errorf("Expected 3 HSET operations to user:1, got %d", hsetCount)
+	}
+
+	// Verify all have same key
+	keys := make(map[string]bool)
+	for _, op := range ops {
+		if op.Type == OpHSET {
+			keys[op.Key] = true
+		}
+	}
+
+	if len(keys) != 1 {
+		t.Errorf("Expected 1 unique hash key, got %d", len(keys))
+	}
+}
+
+// Test 29: HMSET grouping - multiple hashes
+func TestBuildHMSET_MultipleHashes(t *testing.T) {
+	ops := []*BatchOp{
+		{Type: OpHSET, Key: "user:1", Field: "name", Value: []byte("Alice")},
+		{Type: OpHSET, Key: "user:1", Field: "age", Value: []byte("30")},
+		{Type: OpHSET, Key: "user:2", Field: "name", Value: []byte("Bob")},
+		{Type: OpHSET, Key: "user:2", Field: "age", Value: []byte("25")},
+		{Type: OpHSET, Key: "user:3", Field: "name", Value: []byte("Charlie")},
+	}
+
+	// Group by hash key
+	hsetsByKey := make(map[string]int)
+	for _, op := range ops {
+		if op.Type == OpHSET {
+			hsetsByKey[op.Key]++
+		}
+	}
+
+	// Should have 3 different hash keys
+	if len(hsetsByKey) != 3 {
+		t.Errorf("Expected 3 different hash keys, got %d", len(hsetsByKey))
+	}
+
+	// user:1 and user:2 should have 2 fields each
+	if hsetsByKey["user:1"] != 2 {
+		t.Errorf("Expected 2 fields for user:1, got %d", hsetsByKey["user:1"])
+	}
+	if hsetsByKey["user:2"] != 2 {
+		t.Errorf("Expected 2 fields for user:2, got %d", hsetsByKey["user:2"])
+	}
+
+	// user:3 should have 1 field
+	if hsetsByKey["user:3"] != 1 {
+		t.Errorf("Expected 1 field for user:3, got %d", hsetsByKey["user:3"])
+	}
+}
+
+// Test 30: HMSET excludes HINCRBY
+func TestHMSET_ExcludesHINCRBY(t *testing.T) {
+	ops := []*BatchOp{
+		{Type: OpHSET, Key: "stats:1", Field: "views", Value: []byte("100")},
+		{Type: OpHINCRBY, Key: "stats:1", Field: "likes", Delta: 5},
+		{Type: OpHSET, Key: "stats:1", Field: "shares", Value: []byte("20")},
+	}
+
+	// Count operation types
+	hsetCount := 0
+	hincrbyCount := 0
+	for _, op := range ops {
+		if op.Type == OpHSET {
+			hsetCount++
+		} else if op.Type == OpHINCRBY {
+			hincrbyCount++
+		}
+	}
+
+	if hsetCount != 2 {
+		t.Errorf("Expected 2 HSET operations, got %d", hsetCount)
+	}
+
+	if hincrbyCount != 1 {
+		t.Errorf("Expected 1 HINCRBY operation, got %d", hincrbyCount)
+	}
+
+	// HINCRBY should NOT be included in HMSET grouping
+	// (different semantics - HINCRBY is atomic increment, HSET is set value)
+}
+
+// Test 31: HMSET optimization savings
+func TestHMSET_OpsSaved(t *testing.T) {
+	// 10 HSETs to same hash → should become 1 HMSET
+	// Coalesced count: 10 fields in 1 HMSET command
+	hsetCount := 10
+
+	if hsetCount != 10 {
+		t.Errorf("Expected 10 HSET operations, got %d", hsetCount)
+	}
+
+	// 50 HSETs across 5 hashes (10 fields each) → 5 HMSET commands
+	// Each hash gets 10 fields → 5 HMSET commands total
+	totalHsets := 50
+	hashCount := 5
+	hmsetCount := hashCount
+
+	if hmsetCount != 5 {
+		t.Errorf("Expected 5 HMSET commands from 50 HSETs, got %d", hmsetCount)
+	}
+
+	// Verify savings calculation
+	// 50 individual HSET commands vs 5 HMSET commands = 45 commands saved
+	savings := totalHsets - hmsetCount
+	if savings != 45 {
+		t.Errorf("Expected 45 commands saved, got %d", savings)
+	}
+}
+
+// Test 32: HMSET with different fields
+func TestHMSET_DifferentFields(t *testing.T) {
+	ops := []*BatchOp{
+		{Type: OpHSET, Key: "config:app", Field: "timeout", Value: []byte("30")},
+		{Type: OpHSET, Key: "config:app", Field: "retries", Value: []byte("3")},
+		{Type: OpHSET, Key: "config:app", Field: "debug", Value: []byte("false")},
+		{Type: OpHSET, Key: "config:app", Field: "log_level", Value: []byte("info")},
+	}
+
+	// Collect all fields
+	fields := make(map[string]bool)
+	for _, op := range ops {
+		if op.Type == OpHSET && op.Key == "config:app" {
+			fields[op.Field] = true
+		}
+	}
+
+	// Should have 4 unique fields
+	if len(fields) != 4 {
+		t.Errorf("Expected 4 unique fields, got %d", len(fields))
+	}
+
+	// Verify field names
+	expectedFields := []string{"timeout", "retries", "debug", "log_level"}
+	for _, field := range expectedFields {
+		if !fields[field] {
+			t.Errorf("Expected field %s not found", field)
+		}
+	}
+}

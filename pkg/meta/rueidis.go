@@ -93,16 +93,18 @@ type rueidisMeta struct {
 	batchFlushTicker *time.Ticker  // timer for periodic flush
 
 	// Batch write metrics
-	batchOpsQueued       *prometheus.CounterVec // by type
-	batchOpsFlushed      *prometheus.CounterVec // by type
-	batchCoalesceSaved   *prometheus.CounterVec // by type
-	batchFlushDuration   prometheus.Histogram   // flush duration
-	batchQueueDepthGauge prometheus.Gauge       // current queue depth
-	batchSizeHistogram   prometheus.Histogram   // actual ops per flush
-	batchErrors          *prometheus.CounterVec // by error type
-	batchPoisonOps       prometheus.Counter     // poison operations
-	batchMsetConversions prometheus.Counter     // MSET conversions total
-	batchMsetOpsSaved    prometheus.Counter     // ops saved via MSET
+	batchOpsQueued        *prometheus.CounterVec // by type
+	batchOpsFlushed       *prometheus.CounterVec // by type
+	batchCoalesceSaved    *prometheus.CounterVec // by type
+	batchFlushDuration    prometheus.Histogram   // flush duration
+	batchQueueDepthGauge  prometheus.Gauge       // current queue depth
+	batchSizeHistogram    prometheus.Histogram   // actual ops per flush
+	batchErrors           *prometheus.CounterVec // by error type
+	batchPoisonOps        prometheus.Counter     // poison operations
+	batchMsetConversions  prometheus.Counter     // MSET conversions total
+	batchMsetOpsSaved     prometheus.Counter     // ops saved via MSET
+	batchHmsetConversions prometheus.Counter     // HMSET conversions total
+	batchHsetCoalesced    prometheus.Counter     // HSET ops coalesced into HMSET
 }
 
 // Temporary Rueidis registration that delegates to the Redis implementation.
@@ -391,6 +393,14 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 			Name: "rueidis_batch_mset_ops_saved_total",
 			Help: "Total number of individual SET operations saved by MSET optimization.",
 		}),
+		batchHmsetConversions: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_batch_hmset_conversions_total",
+			Help: "Total number of times multiple HSET operations were converted to HMSET.",
+		}),
+		batchHsetCoalesced: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_batch_hset_coalesced_total",
+			Help: "Total number of HSET operations coalesced into HMSET commands.",
+		}),
 	}
 	m.redisMeta.en = m
 
@@ -448,6 +458,8 @@ func (m *rueidisMeta) InitMetrics(reg prometheus.Registerer) {
 		reg.MustRegister(m.batchPoisonOps)
 		reg.MustRegister(m.batchMsetConversions)
 		reg.MustRegister(m.batchMsetOpsSaved)
+		reg.MustRegister(m.batchHmsetConversions)
+		reg.MustRegister(m.batchHsetCoalesced)
 	}
 }
 func (m *rueidisMeta) Shutdown() error {

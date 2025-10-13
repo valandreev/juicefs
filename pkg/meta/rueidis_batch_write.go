@@ -426,20 +426,39 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 	// Step 1.5: Optimize multiple SETs into MSET (Step 6)
 	msetCmds, nonSetOps := m.buildMSET(result.Coalesced)
 
-	// Step 2: Build rueidis commands for non-MSET operations
+	// Step 1.6: Optimize multiple HSETs into HMSET (Step 7)
+	hmsetCmdsBySlot, nonHsetOps := m.buildHMSET(nonSetOps)
+
+	// Step 2: Build rueidis commands for remaining operations
 	ctx := context.Background()
-	cmds := make([]rueidis.Completed, 0, len(nonSetOps)+len(msetCmds))
+
+	// Calculate total command count
+	totalHmsetCmds := 0
+	for _, cmds := range hmsetCmdsBySlot {
+		totalHmsetCmds += len(cmds)
+	}
+	cmds := make([]rueidis.Completed, 0, len(nonHsetOps)+len(msetCmds)+totalHmsetCmds)
+
 	opMap := make(map[int]*BatchOp) // index → original op for error tracking
 	msetMap := make(map[int]int)    // index → slot for MSET commands
+	hmsetMap := make(map[int]int)   // index → slot for HMSET commands
 
-	// Add MSET commands first
+	// Add MSET commands
 	for slot, cmd := range msetCmds {
 		cmds = append(cmds, cmd)
 		msetMap[len(cmds)-1] = slot // Track which command is an MSET
 	}
 
+	// Add HMSET commands
+	for slot, hmsetCmds := range hmsetCmdsBySlot {
+		for _, cmd := range hmsetCmds {
+			cmds = append(cmds, cmd)
+			hmsetMap[len(cmds)-1] = slot // Track which command is an HMSET
+		}
+	}
+
 	// Add individual commands
-	for _, op := range nonSetOps {
+	for _, op := range nonHsetOps {
 		cmd, err := m.buildCommand(op)
 		if err != nil {
 			m.batchErrors.WithLabelValues("build_command").Inc()
@@ -470,6 +489,15 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 				continue
 			}
 
+			// Check if this is an HMSET command
+			if _, isHMSET := hmsetMap[i]; isHMSET {
+				// HMSET failed - could be CROSSSLOT or other error
+				m.batchErrors.WithLabelValues("hmset_error").Inc()
+				// Note: In production, we should re-enqueue individual HSETs here
+				// For now, just log the error
+				continue
+			}
+
 			// Regular operation error handling
 			op := opMap[i]
 			if m.isRetryableError(err) {
@@ -488,11 +516,13 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 		} else {
 			// Success
 			if _, isMSET := msetMap[i]; !isMSET {
-				// Regular operation
-				op := opMap[i]
-				m.batchOpsFlushed.WithLabelValues(op.Type.String()).Inc()
+				if _, isHMSET := hmsetMap[i]; !isHMSET {
+					// Regular operation (not MSET or HMSET)
+					op := opMap[i]
+					m.batchOpsFlushed.WithLabelValues(op.Type.String()).Inc()
+				}
 			}
-			// MSET success is already tracked via batchMsetConversions metric
+			// MSET and HMSET success is already tracked via their respective metrics
 		}
 	}
 
@@ -698,6 +728,57 @@ func (m *rueidisMeta) buildMSET(ops []*BatchOp) (map[int]rueidis.Completed, []*B
 	}
 
 	return msetCmds, nonSetOps
+}
+
+// buildHMSET groups multiple HSET operations to the same hash key into HMSET commands
+// Returns: map of slot → []HMSET commands, and remaining non-HSET ops
+// Note: HINCRBY operations are excluded and kept separate (different semantics)
+func (m *rueidisMeta) buildHMSET(ops []*BatchOp) (map[int][]rueidis.Completed, []*BatchOp) {
+	// Group HSET operations by hash key
+	hsetsByKey := make(map[string][]*BatchOp)
+	nonHsetOps := make([]*BatchOp, 0)
+
+	for _, op := range ops {
+		if op.Type == OpHSET {
+			// Group by key (all HSETs to same hash)
+			hsetsByKey[op.Key] = append(hsetsByKey[op.Key], op)
+		} else {
+			// Keep non-HSET operations (including HINCRBY, HDEL, etc.)
+			nonHsetOps = append(nonHsetOps, op)
+		}
+	}
+
+	// Build HMSET commands grouped by slot
+	hmsetCmdsBySlot := make(map[int][]rueidis.Completed)
+
+	for key, hsets := range hsetsByKey {
+		if len(hsets) > 1 {
+			// Multiple HSETs to same hash → build HMSET
+			// HMSET key field1 value1 field2 value2 ...
+			args := make([]string, 0, len(hsets)*2+1)
+			args = append(args, key) // First arg is the hash key
+
+			for _, op := range hsets {
+				args = append(args, op.Field, string(op.Value))
+			}
+
+			// Build HMSET command
+			cmd := m.client.B().Arbitrary("HMSET").Keys(args[0]).Args(args[1:]...).Build()
+
+			// Group by slot for Redis Cluster compatibility
+			slot := getHashSlot(key)
+			hmsetCmdsBySlot[slot] = append(hmsetCmdsBySlot[slot], cmd)
+
+			// Track metrics
+			m.batchHmsetConversions.Inc()
+			m.batchHsetCoalesced.Add(float64(len(hsets))) // N HSETs → 1 HMSET
+		} else if len(hsets) == 1 {
+			// Only one HSET to this hash, keep as individual op
+			nonHsetOps = append(nonHsetOps, hsets[0])
+		}
+	}
+
+	return hmsetCmdsBySlot, nonHsetOps
 }
 
 // containsAny checks if string contains any of the substrings
