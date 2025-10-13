@@ -17,7 +17,13 @@
 package meta
 
 import (
+	"context"
+	"fmt"
+	"syscall"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/redis/rueidis"
 )
 
 // OpType represents the type of Redis operation for batching
@@ -284,6 +290,359 @@ func shouldPreserveOrder(op1, op2 *BatchOp) bool {
 	// Operations on the same inode must preserve FIFO order
 	if op1.Inode > 0 && op1.Inode == op2.Inode {
 		return true
+	}
+	return false
+}
+
+// enqueueBatchOp enqueues a batch operation with back-pressure
+func (m *rueidisMeta) enqueueBatchOp(op *BatchOp) error {
+	if !m.batchEnabled {
+		return syscall.ENOSYS // Not implemented when batching disabled
+	}
+
+	// Check queue capacity for back-pressure
+	currentSize := m.batchQueueSize.Load()
+	if currentSize >= int64(m.maxQueueSize) {
+		// Queue is full, apply back-pressure
+		m.batchErrors.WithLabelValues("queue_full").Inc()
+		return syscall.EAGAIN
+	}
+
+	// Non-blocking send with timeout
+	select {
+	case m.batchQueue <- op:
+		// Update metrics
+		m.batchQueueSize.Add(1)
+		m.batchQueueBytes.Add(int64(len(op.Value)))
+		m.batchOpsQueued.WithLabelValues(op.Type.String()).Inc()
+		return nil
+	case <-time.After(100 * time.Millisecond):
+		// Timeout - queue might be congested
+		m.batchErrors.WithLabelValues("enqueue_timeout").Inc()
+		return syscall.ETIMEDOUT
+	}
+}
+
+// batchFlusher is the background goroutine that periodically flushes batched operations
+func (m *rueidisMeta) batchFlusher() {
+	defer close(m.batchDoneChan)
+
+	pendingOps := make([]*BatchOp, 0, m.batchSize)
+
+	for {
+		select {
+		case <-m.batchStopChan:
+			// Shutdown requested - flush any remaining ops
+			if len(pendingOps) > 0 {
+				_ = m.flushBatch(pendingOps)
+			}
+			return
+
+		case <-m.batchFlushTicker.C:
+			// Timer fired - flush if we have pending ops
+			if len(pendingOps) > 0 {
+				_ = m.flushBatch(pendingOps)
+				pendingOps = pendingOps[:0] // Reset slice
+			}
+
+		case op := <-m.batchQueue:
+			// New operation arrived
+			pendingOps = append(pendingOps, op)
+			m.batchQueueSize.Add(-1)
+			m.batchQueueBytes.Add(-int64(len(op.Value)))
+
+			// Check flush triggers
+			shouldFlush := false
+
+			// Policy 1: Size-based flush
+			if len(pendingOps) >= m.batchSize {
+				shouldFlush = true
+			}
+
+			// Policy 2: Byte-based flush
+			totalBytes := 0
+			for _, o := range pendingOps {
+				totalBytes += len(o.Value)
+			}
+			if totalBytes >= m.batchBytes {
+				shouldFlush = true
+			}
+
+			// Drain more ops if available (batch opportunistically)
+			if !shouldFlush {
+				for len(pendingOps) < m.batchSize {
+					select {
+					case nextOp := <-m.batchQueue:
+						pendingOps = append(pendingOps, nextOp)
+						m.batchQueueSize.Add(-1)
+						m.batchQueueBytes.Add(-int64(len(nextOp.Value)))
+					default:
+						// No more ops available
+						goto checkFlush
+					}
+				}
+			}
+
+		checkFlush:
+			if shouldFlush {
+				_ = m.flushBatch(pendingOps)
+				pendingOps = pendingOps[:0] // Reset slice
+			}
+		}
+
+		// Update queue depth gauge
+		m.batchQueueDepthGauge.Set(float64(m.batchQueueSize.Load()))
+	}
+}
+
+// flushBatch flushes accumulated operations to Redis using DoMulti (pipeline)
+func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
+	if len(ops) == 0 {
+		return nil
+	}
+
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start).Seconds()
+		m.batchFlushDuration.Observe(duration)
+		m.batchSizeHistogram.Observe(float64(len(ops)))
+	}()
+
+	// Step 1: Coalesce operations
+	result := coalesceOps(ops)
+	if result.SavedCount > 0 {
+		// Track coalescing savings by type
+		savedByType := make(map[OpType]int)
+		for _, op := range ops {
+			if !containsOp(result.Coalesced, op) {
+				savedByType[op.Type]++
+			}
+		}
+		for opType, count := range savedByType {
+			m.batchCoalesceSaved.WithLabelValues(opType.String()).Add(float64(count))
+		}
+	}
+
+	// Step 2: Build rueidis commands
+	ctx := context.Background()
+	cmds := make([]rueidis.Completed, 0, len(result.Coalesced))
+	opMap := make(map[int]*BatchOp) // index → original op for error tracking
+
+	for _, op := range result.Coalesced {
+		cmd, err := m.buildCommand(op)
+		if err != nil {
+			m.batchErrors.WithLabelValues("build_command").Inc()
+			continue
+		}
+		cmds = append(cmds, cmd)
+		opMap[len(cmds)-1] = op // Map command index to op
+	}
+
+	if len(cmds) == 0 {
+		return nil
+	}
+
+	// Step 3: Execute batch with DoMulti
+	results := m.client.DoMulti(ctx, cmds...)
+
+	// Step 4: Process results and handle errors
+	failedOps := make([]*BatchOp, 0)
+	for i, result := range results {
+		op := opMap[i]
+		if err := result.Error(); err != nil {
+			// Check if error is retryable
+			if m.isRetryableError(err) {
+				op.RetryCount++
+				if op.RetryCount < 3 { // Max 3 retries
+					failedOps = append(failedOps, op)
+					m.batchErrors.WithLabelValues("retryable").Inc()
+				} else {
+					// Poison operation - log and drop
+					m.handlePoisonOp(op, err)
+				}
+			} else {
+				// Permanent error - log and drop
+				m.batchErrors.WithLabelValues("permanent").Inc()
+			}
+		} else {
+			// Success
+			m.batchOpsFlushed.WithLabelValues(op.Type.String()).Inc()
+		}
+	}
+
+	// Step 5: Re-enqueue failed operations for retry
+	if len(failedOps) > 0 {
+		go m.retryFailedOps(failedOps)
+	}
+
+	return nil
+}
+
+// buildCommand converts a BatchOp to a rueidis.Completed command
+func (m *rueidisMeta) buildCommand(op *BatchOp) (rueidis.Completed, error) {
+	switch op.Type {
+	case OpSET:
+		return m.client.B().Set().Key(op.Key).Value(rueidis.BinaryString(op.Value)).Build(), nil
+
+	case OpHSET:
+		return m.client.B().Hset().Key(op.Key).FieldValue().FieldValue(op.Field, rueidis.BinaryString(op.Value)).Build(), nil
+
+	case OpHDEL:
+		return m.client.B().Hdel().Key(op.Key).Field(op.Field).Build(), nil
+
+	case OpHINCRBY:
+		return m.client.B().Hincrby().Key(op.Key).Field(op.Field).Increment(op.Delta).Build(), nil
+
+	case OpDEL:
+		return m.client.B().Del().Key(op.Key).Build(), nil
+
+	case OpINCRBY:
+		return m.client.B().Incrby().Key(op.Key).Increment(op.Delta).Build(), nil
+
+	case OpRPUSH:
+		return m.client.B().Rpush().Key(op.Key).Element(rueidis.BinaryString(op.Value)).Build(), nil
+
+	case OpZADD:
+		return m.client.B().Zadd().Key(op.Key).ScoreMember().ScoreMember(op.Score, string(op.Value)).Build(), nil
+
+	case OpSADD:
+		return m.client.B().Sadd().Key(op.Key).Member(string(op.Value)).Build(), nil
+
+	default:
+		return rueidis.Completed{}, fmt.Errorf("unsupported operation type: %v", op.Type)
+	}
+}
+
+// isRetryableError determines if an error should trigger a retry
+func (m *rueidisMeta) isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Network errors
+	if err == syscall.ETIMEDOUT ||
+		err == syscall.ECONNRESET ||
+		err == syscall.ECONNREFUSED {
+		return true
+	}
+
+	// Redis temporary errors
+	if containsAny(errStr, []string{
+		"BUSY",
+		"LOADING",
+		"TIMEOUT",
+		"connection",
+		"broken pipe",
+	}) {
+		return true
+	}
+
+	return false
+}
+
+// handlePoisonOp logs and tracks poison operations (failed after max retries)
+func (m *rueidisMeta) handlePoisonOp(op *BatchOp, err error) {
+	m.batchPoisonOps.Inc()
+
+	// Log detailed error for debugging
+	logger := utils.GetLogger("juicefs")
+	logger.Errorf("Poison operation after %d retries: type=%v key=%s error=%v",
+		op.RetryCount, op.Type, op.Key, err)
+
+	// Notify via result channel if someone is waiting
+	if op.ResultChan != nil {
+		select {
+		case op.ResultChan <- err:
+		default:
+			// Channel full or closed, ignore
+		}
+	}
+}
+
+// retryFailedOps re-enqueues failed operations for retry
+func (m *rueidisMeta) retryFailedOps(ops []*BatchOp) {
+	for _, op := range ops {
+		// Try to re-enqueue with a small delay to avoid tight retry loop
+		time.Sleep(10 * time.Millisecond)
+
+		if err := m.enqueueBatchOp(op); err != nil {
+			// If re-enqueue fails, treat as poison
+			m.handlePoisonOp(op, fmt.Errorf("retry enqueue failed: %w", err))
+		}
+	}
+}
+
+// containsAny checks if string contains any of the substrings
+func containsAny(s string, substrs []string) bool {
+	for _, substr := range substrs {
+		if containsSubstring(s, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsSubstring checks if string contains substring (case-insensitive)
+func containsSubstring(s, substr string) bool {
+	s = toLower(s)
+	substr = toLower(substr)
+	return indexOf(s, substr) >= 0
+}
+
+// toLower converts string to lowercase
+func toLower(s string) string {
+	result := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		result[i] = c
+	}
+	return string(result)
+}
+
+// indexOf returns the index of substr in s, or -1 if not found
+func indexOf(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+
+// executeSingleOp is deprecated - replaced by DoMulti batch execution
+// Kept for backward compatibility only
+func (m *rueidisMeta) executeSingleOp(ctx context.Context, op *BatchOp) error {
+	switch op.Type {
+	case OpSET:
+		return m.compat.Set(ctx, op.Key, op.Value, 0).Err()
+	case OpHSET:
+		return m.compat.HSet(ctx, op.Key, op.Field, op.Value).Err()
+	case OpHDEL:
+		return m.compat.HDel(ctx, op.Key, op.Field).Err()
+	case OpHINCRBY:
+		return m.compat.HIncrBy(ctx, op.Key, op.Field, op.Delta).Err()
+	case OpDEL:
+		return m.compat.Del(ctx, op.Key).Err()
+	case OpINCRBY:
+		return m.compat.IncrBy(ctx, op.Key, op.Delta).Err()
+	case OpRPUSH:
+		return m.compat.RPush(ctx, op.Key, op.Value).Err()
+	default:
+		return fmt.Errorf("unsupported operation type: %v", op.Type)
+	}
+}
+
+// containsOp checks if an operation is in the slice
+func containsOp(ops []*BatchOp, target *BatchOp) bool {
+	for _, op := range ops {
+		if op == target {
+			return true
+		}
 	}
 	return false
 }

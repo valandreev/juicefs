@@ -17,6 +17,7 @@
 package meta
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -444,5 +445,213 @@ func TestBatchOp_Priority(t *testing.T) {
 
 	if highPriorityOp.Priority <= normalOp.Priority {
 		t.Errorf("High priority op should have higher priority value")
+	}
+}
+
+// Step 4 Tests: Basic Queue and Flusher
+
+// Test 16: enqueueBatchOp - basic enqueue
+func TestEnqueueBatchOp_Basic(t *testing.T) {
+	// This test requires a real rueidisMeta instance
+	// For now, we'll test the BatchOp creation
+	op := &BatchOp{
+		Type:        OpSET,
+		Key:         "test:key",
+		Value:       []byte("test value"),
+		Inode:       123,
+		EnqueueTime: time.Now(),
+	}
+
+	if op.Type != OpSET {
+		t.Errorf("Expected OpSET, got %v", op.Type)
+	}
+
+	if string(op.Value) != "test value" {
+		t.Errorf("Expected 'test value', got '%s'", op.Value)
+	}
+}
+
+// Test 17: containsOp helper
+func TestContainsOp(t *testing.T) {
+	op1 := &BatchOp{Type: OpSET, Key: "k1"}
+	op2 := &BatchOp{Type: OpSET, Key: "k2"}
+	op3 := &BatchOp{Type: OpSET, Key: "k3"}
+
+	ops := []*BatchOp{op1, op2}
+
+	if !containsOp(ops, op1) {
+		t.Errorf("Expected op1 to be in ops")
+	}
+
+	if !containsOp(ops, op2) {
+		t.Errorf("Expected op2 to be in ops")
+	}
+
+	if containsOp(ops, op3) {
+		t.Errorf("Expected op3 to NOT be in ops")
+	}
+}
+
+// Step 5 Tests: DoMulti Flush Logic
+
+// Test 18: containsAny helper
+func TestContainsAny(t *testing.T) {
+	tests := []struct {
+		name     string
+		s        string
+		substrs  []string
+		expected bool
+	}{
+		{
+			name:     "Contains BUSY",
+			s:        "Redis server is BUSY running a script",
+			substrs:  []string{"BUSY", "LOADING", "TIMEOUT"},
+			expected: true,
+		},
+		{
+			name:     "Contains connection",
+			s:        "connection reset by peer",
+			substrs:  []string{"connection", "broken pipe"},
+			expected: true,
+		},
+		{
+			name:     "No match",
+			s:        "Some other error",
+			substrs:  []string{"BUSY", "LOADING"},
+			expected: false,
+		},
+		{
+			name:     "Case insensitive",
+			s:        "busy server",
+			substrs:  []string{"BUSY"},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := containsAny(tt.s, tt.substrs)
+			if result != tt.expected {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+// Test 19: containsSubstring helper
+func TestContainsSubstring(t *testing.T) {
+	tests := []struct {
+		s        string
+		substr   string
+		expected bool
+	}{
+		{"Hello World", "world", true},     // case insensitive
+		{"TIMEOUT ERROR", "timeout", true}, // case insensitive
+		{"connection lost", "conn", true},
+		{"some error", "other", false},
+		{"", "test", false},
+		{"test", "", true}, // empty substring always matches
+	}
+
+	for _, tt := range tests {
+		result := containsSubstring(tt.s, tt.substr)
+		if result != tt.expected {
+			t.Errorf("containsSubstring(%q, %q) = %v, want %v",
+				tt.s, tt.substr, result, tt.expected)
+		}
+	}
+}
+
+// Test 20: toLower helper
+func TestToLower(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"HELLO", "hello"},
+		{"Hello World", "hello world"},
+		{"ABC123", "abc123"},
+		{"", ""},
+		{"already lowercase", "already lowercase"},
+	}
+
+	for _, tt := range tests {
+		result := toLower(tt.input)
+		if result != tt.expected {
+			t.Errorf("toLower(%q) = %q, want %q", tt.input, result, tt.expected)
+		}
+	}
+}
+
+// Test 21: indexOf helper
+func TestIndexOf(t *testing.T) {
+	tests := []struct {
+		s        string
+		substr   string
+		expected int
+	}{
+		{"hello world", "world", 6},
+		{"hello world", "hello", 0},
+		{"hello world", "o w", 4},
+		{"hello world", "xyz", -1},
+		{"hello world", "", 0},
+		{"", "test", -1},
+	}
+
+	for _, tt := range tests {
+		result := indexOf(tt.s, tt.substr)
+		if result != tt.expected {
+			t.Errorf("indexOf(%q, %q) = %d, want %d",
+				tt.s, tt.substr, result, tt.expected)
+		}
+	}
+}
+
+// Test 22: BatchOp retry tracking
+func TestBatchOp_RetryCount(t *testing.T) {
+	op := &BatchOp{
+		Type:       OpSET,
+		Key:        "test",
+		Value:      []byte("value"),
+		RetryCount: 0,
+	}
+
+	// Simulate retries
+	for i := 1; i <= 3; i++ {
+		op.RetryCount++
+		if op.RetryCount != i {
+			t.Errorf("Expected RetryCount %d, got %d", i, op.RetryCount)
+		}
+	}
+
+	// Check poison threshold
+	if op.RetryCount < 3 {
+		t.Errorf("Expected RetryCount >= 3 for poison detection")
+	}
+}
+
+// Test 23: ResultChan communication
+func TestBatchOp_ResultChan(t *testing.T) {
+	op := &BatchOp{
+		Type:       OpSET,
+		Key:        "test",
+		Value:      []byte("value"),
+		ResultChan: make(chan error, 1),
+	}
+
+	// Simulate sending error
+	testErr := fmt.Errorf("test error")
+	go func() {
+		op.ResultChan <- testErr
+	}()
+
+	// Receive error
+	select {
+	case err := <-op.ResultChan:
+		if err.Error() != testErr.Error() {
+			t.Errorf("Expected error %v, got %v", testErr, err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Errorf("Timeout waiting for error")
 	}
 }

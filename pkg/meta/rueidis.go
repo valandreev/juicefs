@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -77,6 +78,29 @@ type rueidisMeta struct {
 	chunkIDsServed     prometheus.Counter // total chunk IDs served from pool
 	inodePrefetchAsync prometheus.Counter // number of async inode prefetch operations
 	chunkPrefetchAsync prometheus.Counter // number of async chunk prefetch operations
+
+	// Batch write support (Phase 2)
+	batchEnabled     bool          // enable batch writes (default: true, disable with ?batchwrite=0)
+	batchQueue       chan *BatchOp // operation queue
+	batchSize        int           // max ops per batch (default: 512)
+	batchBytes       int           // max bytes per batch (default: 256KB)
+	flushInterval    time.Duration // max time between flushes (default: 2ms)
+	maxQueueSize     int           // max queue capacity (default: 100K)
+	batchStopChan    chan struct{} // signal to stop flusher goroutine
+	batchDoneChan    chan struct{} // signal that flusher has stopped
+	batchQueueSize   atomic.Int64  // current queue depth (for metrics)
+	batchQueueBytes  atomic.Int64  // current queue size in bytes
+	batchFlushTicker *time.Ticker  // timer for periodic flush
+
+	// Batch write metrics
+	batchOpsQueued       *prometheus.CounterVec // by type
+	batchOpsFlushed      *prometheus.CounterVec // by type
+	batchCoalesceSaved   *prometheus.CounterVec // by type
+	batchFlushDuration   prometheus.Histogram   // flush duration
+	batchQueueDepthGauge prometheus.Gauge       // current queue depth
+	batchSizeHistogram   prometheus.Histogram   // actual ops per flush
+	batchErrors          *prometheus.CounterVec // by error type
+	batchPoisonOps       prometheus.Counter     // poison operations
 }
 
 // Temporary Rueidis registration that delegates to the Redis implementation.
@@ -110,6 +134,12 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	//   ?chunk_batch=N - Chunk ID batch size (default: 2048)
 	//   ?inode_low_watermark=N - Inode pool prefetch watermark in % (default: 25)
 	//   ?chunk_low_watermark=N - Chunk pool prefetch watermark in % (default: 25)
+	//
+	// Batch Write parameters (Phase 2):
+	//   ?batchwrite=0 - Disable batch writes (default: enabled)
+	//   ?batch_size=N - Max operations per batch (default: 512)
+	//   ?batch_bytes=N - Max bytes per batch (default: 262144 = 256KB)
+	//   ?batch_interval=Xms - Max time between flushes (default: 2ms)
 	cacheTTL := 1 * time.Hour
 	enablePrime := true
 	metaPrimeEnabled := true
@@ -117,6 +147,11 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	chunkBatch := uint64(2048)
 	inodeLowWMPercent := uint64(25)
 	chunkLowWMPercent := uint64(25)
+	batchWriteEnabled := true
+	batchSize := 512
+	batchBytes := 262144 // 256KB
+	batchInterval := 2 * time.Millisecond
+	maxQueueSize := 100000
 	cleanAddr := addr
 
 	if u, err := url.Parse(uri); err == nil {
@@ -165,6 +200,32 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 			}
 		}
 
+		// Extract batchwrite parameter (batch write on/off)
+		if batchWriteStr := u.Query().Get("batchwrite"); batchWriteStr == "0" || batchWriteStr == "false" {
+			batchWriteEnabled = false
+		}
+
+		// Extract batch_size parameter
+		if batchSizeStr := u.Query().Get("batch_size"); batchSizeStr != "" {
+			if val, err := strconv.Atoi(batchSizeStr); err == nil && val >= 16 && val <= 4096 {
+				batchSize = val
+			}
+		}
+
+		// Extract batch_bytes parameter
+		if batchBytesStr := u.Query().Get("batch_bytes"); batchBytesStr != "" {
+			if val, err := strconv.Atoi(batchBytesStr); err == nil && val >= 4096 && val <= 1048576 {
+				batchBytes = val
+			}
+		}
+
+		// Extract batch_interval parameter
+		if batchIntervalStr := u.Query().Get("batch_interval"); batchIntervalStr != "" {
+			if parsed, err := time.ParseDuration(batchIntervalStr); err == nil && parsed >= 100*time.Microsecond && parsed <= 50*time.Millisecond {
+				batchInterval = parsed
+			}
+		}
+
 		// Strip custom params from query for rueidis.ParseURL
 		q := u.Query()
 		q.Del("ttl")
@@ -174,6 +235,10 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		q.Del("chunk_batch")
 		q.Del("inode_low_watermark")
 		q.Del("chunk_low_watermark")
+		q.Del("batchwrite")
+		q.Del("batch_size")
+		q.Del("batch_bytes")
+		q.Del("batch_interval")
 		u.RawQuery = q.Encode()
 
 		// Extract just the address part (without scheme)
@@ -238,6 +303,14 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		chunkBatch:       chunkBatch,
 		inodeLowWM:       inodeLowWM,
 		chunkLowWM:       chunkLowWM,
+		batchEnabled:     batchWriteEnabled,
+		batchQueue:       make(chan *BatchOp, maxQueueSize),
+		batchSize:        batchSize,
+		batchBytes:       batchBytes,
+		flushInterval:    batchInterval,
+		maxQueueSize:     maxQueueSize,
+		batchStopChan:    make(chan struct{}),
+		batchDoneChan:    make(chan struct{}),
 		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "rueidis_cache_hits_total",
 			Help: "Total number of successful client-side cache hits (data served from local cache).",
@@ -274,8 +347,49 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 			Name: "rueidis_chunk_prefetch_async_total",
 			Help: "Number of asynchronous chunk pool prefetch operations triggered by low watermark.",
 		}),
+		batchOpsQueued: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "rueidis_batch_ops_queued_total",
+			Help: "Total number of operations queued for batching, by operation type.",
+		}, []string{"type"}),
+		batchOpsFlushed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "rueidis_batch_ops_flushed_total",
+			Help: "Total number of operations flushed to Redis, by operation type.",
+		}, []string{"type"}),
+		batchCoalesceSaved: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "rueidis_batch_coalesce_saved_total",
+			Help: "Total number of operations saved by coalescing, by operation type.",
+		}, []string{"type"}),
+		batchFlushDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "rueidis_batch_flush_duration_seconds",
+			Help:    "Duration of batch flush operations in seconds.",
+			Buckets: prometheus.ExponentialBuckets(0.0001, 2, 15), // 100µs to ~1.6s
+		}),
+		batchQueueDepthGauge: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "rueidis_batch_queue_depth",
+			Help: "Current number of operations in the batch queue.",
+		}),
+		batchSizeHistogram: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "rueidis_batch_size_ops",
+			Help:    "Actual number of operations per batch flush.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 12), // 1 to 4096
+		}),
+		batchErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "rueidis_batch_errors_total",
+			Help: "Total number of batch operation errors, by error type.",
+		}, []string{"type"}),
+		batchPoisonOps: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_batch_poison_ops_total",
+			Help: "Total number of poison operations (failed after max retries).",
+		}),
 	}
 	m.redisMeta.en = m
+
+	// Start batch flusher goroutine if batching is enabled
+	if batchWriteEnabled {
+		m.batchFlushTicker = time.NewTicker(batchInterval)
+		go m.batchFlusher()
+	}
+
 	return m, nil
 }
 
@@ -312,9 +426,28 @@ func (m *rueidisMeta) InitMetrics(reg prometheus.Registerer) {
 		reg.MustRegister(m.chunkIDsServed)
 		reg.MustRegister(m.inodePrefetchAsync)
 		reg.MustRegister(m.chunkPrefetchAsync)
+
+		// Register batch write metrics
+		reg.MustRegister(m.batchOpsQueued)
+		reg.MustRegister(m.batchOpsFlushed)
+		reg.MustRegister(m.batchCoalesceSaved)
+		reg.MustRegister(m.batchFlushDuration)
+		reg.MustRegister(m.batchQueueDepthGauge)
+		reg.MustRegister(m.batchSizeHistogram)
+		reg.MustRegister(m.batchErrors)
+		reg.MustRegister(m.batchPoisonOps)
 	}
 }
 func (m *rueidisMeta) Shutdown() error {
+	// Stop batch flusher goroutine if running
+	if m.batchEnabled {
+		close(m.batchStopChan)
+		<-m.batchDoneChan // Wait for flusher to finish
+		if m.batchFlushTicker != nil {
+			m.batchFlushTicker.Stop()
+		}
+	}
+
 	if m.client != nil {
 		m.client.Close()
 	}
