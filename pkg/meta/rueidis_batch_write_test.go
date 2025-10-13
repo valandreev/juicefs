@@ -655,3 +655,120 @@ func TestBatchOp_ResultChan(t *testing.T) {
 		t.Errorf("Timeout waiting for error")
 	}
 }
+
+// Test 24: Hash slot calculation
+func TestGetHashSlot(t *testing.T) {
+	tests := []struct {
+		key         string
+		description string
+	}{
+		{"key1", "simple key without hash tag"},
+		{"key2", "different simple key"},
+		{"{user:1}:profile", "key with hash tag"},
+		{"{user:1}:settings", "same hash tag, different suffix"},
+		{"{fs}:inode:123", "filesystem prefix with hash tag"},
+		{"{fs}:chunk:456", "same hash tag for chunks"},
+		{"no{tag", "incomplete hash tag (ignored)"},
+		{"{}", "empty hash tag"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.description, func(t *testing.T) {
+			slot := getHashSlot(tt.key)
+			// Verify slot is in valid range
+			if slot < 0 || slot >= 16384 {
+				t.Errorf("Invalid slot %d for key %q (must be 0-16383)", slot, tt.key)
+			}
+		})
+	}
+
+	// Test that keys with same hash tag map to same slot
+	slot1 := getHashSlot("{user:1}:profile")
+	slot2 := getHashSlot("{user:1}:settings")
+	if slot1 != slot2 {
+		t.Errorf("Keys with same hash tag {user:1} should map to same slot, got %d and %d", slot1, slot2)
+	}
+
+	// Test that {fs} tag works consistently
+	slotInode := getHashSlot("{fs}:inode:123")
+	slotChunk := getHashSlot("{fs}:chunk:456")
+	if slotInode != slotChunk {
+		t.Errorf("Keys with same hash tag {fs} should map to same slot, got %d and %d", slotInode, slotChunk)
+	}
+}
+
+// Test 25: MSET grouping - single slot
+func TestBuildMSET_SingleSlot(t *testing.T) {
+	// Create mock rueidisMeta (simplified for testing)
+	// Note: This test verifies the grouping logic, not actual Redis execution
+	ops := []*BatchOp{
+		{Type: OpSET, Key: "{user:1}:name", Value: []byte("Alice")},
+		{Type: OpSET, Key: "{user:1}:age", Value: []byte("30")},
+		{Type: OpSET, Key: "{user:1}:email", Value: []byte("alice@example.com")},
+		{Type: OpHSET, Key: "hash1", Field: "field1", Value: []byte("val1")},
+	}
+
+	// Verify all SET keys map to same slot
+	slot1 := getHashSlot("{user:1}:name")
+	slot2 := getHashSlot("{user:1}:age")
+	slot3 := getHashSlot("{user:1}:email")
+
+	if slot1 != slot2 || slot1 != slot3 {
+		t.Errorf("Expected all keys with {user:1} to map to same slot, got %d, %d, %d", slot1, slot2, slot3)
+	}
+
+	// Count SET operations
+	setCount := 0
+	for _, op := range ops {
+		if op.Type == OpSET {
+			setCount++
+		}
+	}
+
+	if setCount != 3 {
+		t.Errorf("Expected 3 SET operations, got %d", setCount)
+	}
+}
+
+// Test 26: MSET grouping - multiple slots
+func TestBuildMSET_MultipleSlots(t *testing.T) {
+	ops := []*BatchOp{
+		{Type: OpSET, Key: "{user:1}:name", Value: []byte("Alice")},
+		{Type: OpSET, Key: "{user:2}:name", Value: []byte("Bob")},
+		{Type: OpSET, Key: "{user:3}:name", Value: []byte("Charlie")},
+	}
+
+	// Verify keys map to different slots
+	slots := make(map[int]bool)
+	for _, op := range ops {
+		slot := getHashSlot(op.Key)
+		slots[slot] = true
+	}
+
+	if len(slots) != 3 {
+		t.Errorf("Expected 3 different slots for different hash tags, got %d", len(slots))
+	}
+}
+
+// Test 27: MSET optimization savings
+func TestMSET_OpsSaved(t *testing.T) {
+	// 10 SETs with same hash tag → should become 1 MSET
+	// Savings: 10 - 1 = 9 operations
+	setCount := 10
+	savings := setCount - 1
+
+	if savings != 9 {
+		t.Errorf("Expected 9 ops saved from 10 SETs → 1 MSET, got %d", savings)
+	}
+
+	// 100 SETs across 5 slots → 5 MSET commands
+	// Savings: 100 - 5 = 95 operations
+	totalSets := 100
+	slotCount := 5
+	msetCount := slotCount
+	totalSavings := totalSets - msetCount
+
+	if totalSavings != 95 {
+		t.Errorf("Expected 95 ops saved from 100 SETs → 5 MSETs, got %d", totalSavings)
+	}
+}

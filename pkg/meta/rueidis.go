@@ -101,6 +101,8 @@ type rueidisMeta struct {
 	batchSizeHistogram   prometheus.Histogram   // actual ops per flush
 	batchErrors          *prometheus.CounterVec // by error type
 	batchPoisonOps       prometheus.Counter     // poison operations
+	batchMsetConversions prometheus.Counter     // MSET conversions total
+	batchMsetOpsSaved    prometheus.Counter     // ops saved via MSET
 }
 
 // Temporary Rueidis registration that delegates to the Redis implementation.
@@ -381,6 +383,14 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 			Name: "rueidis_batch_poison_ops_total",
 			Help: "Total number of poison operations (failed after max retries).",
 		}),
+		batchMsetConversions: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_batch_mset_conversions_total",
+			Help: "Total number of times multiple SET operations were converted to MSET.",
+		}),
+		batchMsetOpsSaved: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "rueidis_batch_mset_ops_saved_total",
+			Help: "Total number of individual SET operations saved by MSET optimization.",
+		}),
 	}
 	m.redisMeta.en = m
 
@@ -436,6 +446,8 @@ func (m *rueidisMeta) InitMetrics(reg prometheus.Registerer) {
 		reg.MustRegister(m.batchSizeHistogram)
 		reg.MustRegister(m.batchErrors)
 		reg.MustRegister(m.batchPoisonOps)
+		reg.MustRegister(m.batchMsetConversions)
+		reg.MustRegister(m.batchMsetOpsSaved)
 	}
 }
 func (m *rueidisMeta) Shutdown() error {
