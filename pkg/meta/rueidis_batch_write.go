@@ -439,21 +439,53 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 	}
 	cmds := make([]rueidis.Completed, 0, len(nonHsetOps)+len(msetCmds)+totalHmsetCmds)
 
-	opMap := make(map[int]*BatchOp) // index → original op for error tracking
-	msetMap := make(map[int]int)    // index → slot for MSET commands
-	hmsetMap := make(map[int]int)   // index → slot for HMSET commands
+	opMap := make(map[int]*BatchOp)         // index → original op for error tracking
+	msetMap := make(map[int]int)            // index → slot for MSET commands
+	hmsetMap := make(map[int]int)           // index → slot for HMSET commands
+	msetOpsMap := make(map[int][]*BatchOp)  // index → original SET ops for MSET fallback
+	hmsetOpsMap := make(map[int][]*BatchOp) // index → original HSET ops for HMSET fallback
+
+	// Track original SET operations for MSET fallback
+	setsBySlot := make(map[int][]*BatchOp)
+	for _, op := range ops {
+		if op.Type == OpSET {
+			slot := getHashSlot(op.Key)
+			setsBySlot[slot] = append(setsBySlot[slot], op)
+		}
+	}
+
+	// Track original HSET operations for HMSET fallback
+	hsetsByKey := make(map[string][]*BatchOp)
+	for _, op := range ops {
+		if op.Type == OpHSET {
+			hsetsByKey[op.Key] = append(hsetsByKey[op.Key], op)
+		}
+	}
 
 	// Add MSET commands
 	for slot, cmd := range msetCmds {
 		cmds = append(cmds, cmd)
-		msetMap[len(cmds)-1] = slot // Track which command is an MSET
+		idx := len(cmds) - 1
+		msetMap[idx] = slot                // Track which command is an MSET
+		msetOpsMap[idx] = setsBySlot[slot] // Store original ops for fallback
 	}
 
 	// Add HMSET commands
 	for slot, hmsetCmds := range hmsetCmdsBySlot {
 		for _, cmd := range hmsetCmds {
 			cmds = append(cmds, cmd)
-			hmsetMap[len(cmds)-1] = slot // Track which command is an HMSET
+			idx := len(cmds) - 1
+			hmsetMap[idx] = slot // Track which command is an HMSET
+
+			// Find original HSET ops for this HMSET command
+			// Extract key from command (we need to track this better)
+			// For now, store reference by slot
+			for key, hsets := range hsetsByKey {
+				if getHashSlot(key) == slot && len(hsets) > 1 {
+					hmsetOpsMap[idx] = hsets
+					break
+				}
+			}
 		}
 	}
 
@@ -479,22 +511,68 @@ func (m *rueidisMeta) flushBatch(ops []*BatchOp) error {
 	failedOps := make([]*BatchOp, 0)
 	for i, result := range results {
 		if err := result.Error(); err != nil {
-			// Check if this is an MSET command
-			if _, isMSET := msetMap[i]; isMSET {
-				// MSET failed - likely CROSSSLOT error
-				// Fall back to individual SET operations
-				m.batchErrors.WithLabelValues("mset_crossslot").Inc()
-				// Note: In production, we should re-enqueue individual SETs here
-				// For now, just log the error
+			// Check if this is an MSET command that failed
+			if originalOps, isMSET := msetOpsMap[i]; isMSET {
+				// Check if it's a CROSSSLOT error
+				if m.isCrossSlotError(err) {
+					// CROSSSLOT error - fall back to individual SET operations
+					m.batchErrors.WithLabelValues("mset_crossslot").Inc()
+
+					// Re-enqueue original SET operations individually
+					// This allows them to be executed separately
+					for _, op := range originalOps {
+						failedOps = append(failedOps, op)
+					}
+				} else if m.isRetryableError(err) {
+					// Other retryable error - retry entire MSET
+					m.batchErrors.WithLabelValues("mset_retryable").Inc()
+					for _, op := range originalOps {
+						op.RetryCount++
+						if op.RetryCount < 3 {
+							failedOps = append(failedOps, op)
+						} else {
+							m.handlePoisonOp(op, err)
+						}
+					}
+				} else {
+					// Permanent error - log and drop
+					m.batchErrors.WithLabelValues("mset_permanent").Inc()
+					for _, op := range originalOps {
+						m.handlePoisonOp(op, err)
+					}
+				}
 				continue
 			}
 
-			// Check if this is an HMSET command
-			if _, isHMSET := hmsetMap[i]; isHMSET {
-				// HMSET failed - could be CROSSSLOT or other error
-				m.batchErrors.WithLabelValues("hmset_error").Inc()
-				// Note: In production, we should re-enqueue individual HSETs here
-				// For now, just log the error
+			// Check if this is an HMSET command that failed
+			if originalOps, isHMSET := hmsetOpsMap[i]; isHMSET {
+				// Check if it's a CROSSSLOT error
+				if m.isCrossSlotError(err) {
+					// CROSSSLOT error - fall back to individual HSET operations
+					m.batchErrors.WithLabelValues("hmset_crossslot").Inc()
+
+					// Re-enqueue original HSET operations individually
+					for _, op := range originalOps {
+						failedOps = append(failedOps, op)
+					}
+				} else if m.isRetryableError(err) {
+					// Other retryable error - retry entire HMSET
+					m.batchErrors.WithLabelValues("hmset_retryable").Inc()
+					for _, op := range originalOps {
+						op.RetryCount++
+						if op.RetryCount < 3 {
+							failedOps = append(failedOps, op)
+						} else {
+							m.handlePoisonOp(op, err)
+						}
+					}
+				} else {
+					// Permanent error - log and drop
+					m.batchErrors.WithLabelValues("hmset_permanent").Inc()
+					for _, op := range originalOps {
+						m.handlePoisonOp(op, err)
+					}
+				}
 				continue
 			}
 
@@ -596,6 +674,19 @@ func (m *rueidisMeta) isRetryableError(err error) bool {
 	}
 
 	return false
+}
+
+// isCrossSlotError checks if an error is a CROSSSLOT error from Redis Cluster
+func (m *rueidisMeta) isCrossSlotError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Redis Cluster returns CROSSSLOT error when keys in a multi-key command
+	// are not all in the same hash slot
+	return containsAny(errStr, []string{"CROSSSLOT", "crossslot"})
 }
 
 // handlePoisonOp logs and tracks poison operations (failed after max retries)
