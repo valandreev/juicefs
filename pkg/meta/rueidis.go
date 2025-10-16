@@ -879,6 +879,41 @@ func replaceErrnoCompat(txf func(tx rueidiscompat.Tx) error) func(tx rueidiscomp
 	}
 }
 
+// toStdContext safely converts JuiceFS Context to standard context.Context.
+// Returns context.Background() if ctx is nil or invalid.
+//
+// This is needed because Rueidis APIs require standard context.Context,
+// while JuiceFS uses a custom Context interface that embeds context.Context.
+//
+// IMPORTANT: This conversion does NOT affect client-side caching!
+// Rueidis CSC (Client-Side Cache) is controlled by:
+//   - Cache(ttl) method on commands (enables CSC for that operation)
+//   - CLIENT TRACKING BCAST mode on Redis server
+//   - Server-side INVALIDATE messages sent to clients
+//
+// The context type does NOT control caching behavior. Context is used only for:
+//   - Cancellation (ctx.Done() channel)
+//   - Deadlines (ctx.Deadline())
+//   - Request-scoped values (ctx.Value())
+//
+// Since JuiceFS Context embeds context.Context (interface embedding), Go
+// automatically extracts the embedded interface when assigned to context.Context.
+// This conversion preserves all context properties including cancellation and deadlines.
+//
+// Background operations (trash cleanup, slice cleanup, session cleanup) may pass
+// nil context. This function provides a safe fallback to context.Background().
+func toStdContext(ctx Context) context.Context {
+	if ctx == nil {
+		// Background operations (trash cleanup, etc.) may pass nil
+		// Use Background() as safe fallback - no cancellation, no deadline
+		return context.Background()
+	}
+	// JuiceFS Context embeds context.Context via interface embedding.
+	// Go automatically extracts the embedded interface on assignment.
+	// This preserves all context properties (cancellation, deadlines, values).
+	return ctx
+}
+
 // txn wraps rueidiscompat.Watch with retry logic and pessimistic locking
 // to match redisMeta.txn behavior. This ensures transaction consistency
 // and handles optimistic lock failures (TxFailedErr) with exponential backoff.
@@ -984,8 +1019,12 @@ func (m *rueidisMeta) doSyncVolumeStat(ctx Context) error {
 		return syscall.EROFS
 	}
 
+	// Convert JuiceFS Context to standard context.Context for helper functions.
+	// doSyncVolumeStat may be called from background operations.
+	stdCtx := toStdContext(ctx)
+
 	var used, inodes int64
-	if err := m.hscan(ctx, m.dirUsedSpaceKey(), func(keys []string) error {
+	if err := m.hscan(stdCtx, m.dirUsedSpaceKey(), func(keys []string) error {
 		for i := 0; i < len(keys); i += 2 {
 			v, err := strconv.ParseInt(keys[i+1], 10, 64)
 			if err != nil {
@@ -999,7 +1038,7 @@ func (m *rueidisMeta) doSyncVolumeStat(ctx Context) error {
 		return err
 	}
 
-	if err := m.hscan(ctx, m.dirUsedInodesKey(), func(keys []string) error {
+	if err := m.hscan(stdCtx, m.dirUsedInodesKey(), func(keys []string) error {
 		for i := 0; i < len(keys); i += 2 {
 			v, err := strconv.ParseInt(keys[i+1], 10, 64)
 			if err != nil {
@@ -1014,14 +1053,14 @@ func (m *rueidisMeta) doSyncVolumeStat(ctx Context) error {
 	}
 
 	var inoKeys []string
-	if err := m.scan(ctx, m.prefix+"session*", func(keys []string) error {
+	if err := m.scan(stdCtx, m.prefix+"session*", func(keys []string) error {
 		for i := 0; i < len(keys); i += 2 {
 			key := keys[i]
 			if key == "sessions" {
 				continue
 			}
 
-			sustInodes, err := m.compat.SMembers(ctx, key).Result()
+			sustInodes, err := m.compat.SMembers(stdCtx, key).Result()
 			if err != nil {
 				logger.Warnf("SMembers %s: %v", key, err)
 				continue
@@ -1046,7 +1085,7 @@ func (m *rueidisMeta) doSyncVolumeStat(ctx Context) error {
 		if end > len(inoKeys) {
 			end = len(inoKeys)
 		}
-		values, err := m.compat.MGet(ctx, inoKeys[i:end]...).Result()
+		values, err := m.compat.MGet(stdCtx, inoKeys[i:end]...).Result()
 		if err != nil {
 			return err
 		}
@@ -1858,13 +1897,17 @@ func (m *rueidisMeta) doCleanupSlices(ctx Context) {
 		return
 	}
 
+	// Convert JuiceFS Context to standard context.Context for Rueidis API.
+	// Background slice cleanup may pass nil context.
+	stdCtx := toStdContext(ctx)
+
 	var (
 		cursor uint64
 		key    = m.sliceRefs()
 	)
 
 	for {
-		kvs, next, err := m.compat.HScan(ctx, key, cursor, "*", 10000).Result()
+		kvs, next, err := m.compat.HScan(stdCtx, key, cursor, "*", 10000).Result()
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				return
@@ -2217,6 +2260,9 @@ func (m *rueidisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, scanPendin
 		return m.redisMeta.ListSlices(ctx, slices, scanPending, delete, showProgress)
 	}
 
+	// Convert JuiceFS Context to standard context.Context for scan operations.
+	stdCtx := toStdContext(ctx)
+
 	m.cleanupLeakedInodes(delete)
 	m.cleanupLeakedChunks(delete)
 	m.cleanupOldSliceRefs(delete)
@@ -2224,7 +2270,7 @@ func (m *rueidisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, scanPendin
 		m.doCleanupSlices(ctx)
 	}
 
-	err := m.scan(ctx, "c*_*", func(keys []string) error {
+	err := m.scan(stdCtx, "c*_*", func(keys []string) error {
 		if len(keys) == 0 {
 			return nil
 		}
@@ -2232,9 +2278,9 @@ func (m *rueidisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, scanPendin
 		chunkKeys := make([]string, 0, len(keys))
 		for _, key := range keys {
 			chunkKeys = append(chunkKeys, key)
-			pipe.LRange(ctx, key, 0, -1)
+			pipe.LRange(stdCtx, key, 0, -1)
 		}
-		cmds, execErr := pipe.Exec(ctx)
+		cmds, execErr := pipe.Exec(stdCtx)
 		if execErr != nil {
 			for i, c := range cmds {
 				if c.Err() != nil {
@@ -3204,6 +3250,10 @@ func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, erro
 		return m.redisMeta.doCleanupDelayedSlices(ctx, edge)
 	}
 
+	// Convert JuiceFS Context to standard context.Context for Rueidis API.
+	// Background delayed slices cleanup may pass nil context.
+	stdCtx := toStdContext(ctx)
+
 	var (
 		count  int
 		ss     []Slice
@@ -3213,7 +3263,7 @@ func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, erro
 	)
 
 	for {
-		keys, next, err := m.compat.HScan(ctx, delKey, cursor, "*", 10000).Result()
+		keys, next, err := m.compat.HScan(stdCtx, delKey, cursor, "*", 10000).Result()
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				break
@@ -3775,6 +3825,10 @@ func (m *rueidisMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*
 		return m.redisMeta.doLoadQuotas(ctx)
 	}
 
+	// Convert JuiceFS Context to standard context.Context for Rueidis API.
+	// Quota loading may be called from background operations.
+	stdCtx := toStdContext(ctx)
+
 	quotaTypes := []struct {
 		qtype uint32
 		name  string
@@ -3794,7 +3848,7 @@ func (m *rueidisMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*
 		quotas := make(map[uint64]*Quota)
 		var cursor uint64
 		for {
-			kvs, next, err := m.compat.HScan(ctx, config.quotaKey, cursor, "*", 10000).Result()
+			kvs, next, err := m.compat.HScan(stdCtx, config.quotaKey, cursor, "*", 10000).Result()
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -4044,6 +4098,12 @@ func (m *rueidisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*
 		return m.redisMeta.doReaddir(ctx, inode, plus, entries, limit)
 	}
 
+	// Convert JuiceFS Context to standard context.Context for Rueidis API.
+	// This is critical for background operations (trash cleanup) which may pass nil context.
+	// The conversion preserves client-side caching (CSC) - caching is controlled by
+	// Cache(ttl) and CLIENT TRACKING BCAST, not by context type.
+	stdCtx := toStdContext(ctx)
+
 	var (
 		cursor  uint64
 		reached bool
@@ -4051,7 +4111,7 @@ func (m *rueidisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*
 	)
 
 	for {
-		kvs, next, err := m.compat.HScan(ctx, key, cursor, "*", 10000).Result()
+		kvs, next, err := m.compat.HScan(stdCtx, key, cursor, "*", 10000).Result()
 		if err != nil {
 			return errno(err)
 		}
