@@ -55,15 +55,15 @@ type rueidisMeta struct {
 	cacheMisses prometheus.Counter // cache misses requiring Redis fetch
 
 	// ID batching (pre-allocation pools to reduce INCR RTTs)
-	metaPrimeEnabled bool       // enable ID batching (default: true, disable with ?metaprime=0)
+	metaPrimeEnabled bool       // enable ID batching (default: false, enable with ?metaprime=1 or any inode_batch/chunk_batch param)
 	inodePoolBase    uint64     // next inode ID to serve from local pool
 	inodePoolRem     uint64     // remaining inode IDs in local pool
-	inodeBatch       uint64     // batch size for inode allocation (default: 256)
+	inodeBatch       uint64     // batch size for inode allocation (default: 8)
 	inodeLowWM       uint64     // low watermark for async prefetch (default: 25% of batch)
 	inodePoolLock    sync.Mutex // protects inode pool state
 	chunkPoolBase    uint64     // next chunk ID to serve from local pool
 	chunkPoolRem     uint64     // remaining chunk IDs in local pool
-	chunkBatch       uint64     // batch size for chunk allocation (default: 2048)
+	chunkBatch       uint64     // batch size for chunk allocation (default: 64)
 	chunkLowWM       uint64     // low watermark for async prefetch (default: 25% of batch)
 	chunkPoolLock    sync.Mutex // protects chunk pool state
 	inodePrefetching bool       // true if async inode prefetch is in progress
@@ -145,9 +145,9 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	//   Note: Server-side invalidation is usually sufficient; priming adds overhead
 	//
 	// ID Batching parameters:
-	//   ?metaprime=0 - Disable ID batching (default: enabled)
-	//   ?inode_batch=N - Inode ID batch size (default: 256)
-	//   ?chunk_batch=N - Chunk ID batch size (default: 2048)
+	//   ?metaprime=1 - Enable ID batching (default: disabled)
+	//   ?inode_batch=N - Inode ID batch size (default: 8; also enables ID batching if set)
+	//   ?chunk_batch=N - Chunk ID batch size (default: 64; also enables ID batching if set)
 	//   ?inode_low_watermark=N - Inode pool prefetch watermark in % (default: 25)
 	//   ?chunk_low_watermark=N - Chunk pool prefetch watermark in % (default: 25)
 	//
@@ -158,9 +158,9 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	//   ?batch_interval=Xms - Max time between flushes (default: 2ms)
 	cacheTTL := 1 * time.Hour
 	enablePrime := true
-	metaPrimeEnabled := true
-	inodeBatch := uint64(256)
-	chunkBatch := uint64(2048)
+	metaPrimeEnabled := false // default: DISABLED, enable with ?metaprime=1 or any inode_batch/chunk_batch param
+	inodeBatch := uint64(8)   // new default: 8 (was 256)
+	chunkBatch := uint64(64)  // new default: 64 (was 2048)
 	inodeLowWMPercent := uint64(25)
 	chunkLowWMPercent := uint64(25)
 	batchWriteEnabled := true
@@ -184,21 +184,27 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		}
 
 		// Extract metaprime parameter (ID batching on/off)
-		if metaPrimeStr := u.Query().Get("metaprime"); metaPrimeStr == "0" || metaPrimeStr == "false" {
-			metaPrimeEnabled = false
+		// Enabled if: explicitly set to 1/true OR if inode_batch/chunk_batch are specified
+		metaPrimeStr := u.Query().Get("metaprime")
+		if metaPrimeStr == "1" || metaPrimeStr == "true" {
+			metaPrimeEnabled = true
 		}
 
 		// Extract inode_batch parameter
+		// If specified, also enable metaprime automatically
 		if inodeBatchStr := u.Query().Get("inode_batch"); inodeBatchStr != "" {
 			if val, err := strconv.ParseUint(inodeBatchStr, 10, 64); err == nil && val > 0 {
 				inodeBatch = val
+				metaPrimeEnabled = true // auto-enable when batch size is explicitly set
 			}
 		}
 
 		// Extract chunk_batch parameter
+		// If specified, also enable metaprime automatically
 		if chunkBatchStr := u.Query().Get("chunk_batch"); chunkBatchStr != "" {
 			if val, err := strconv.ParseUint(chunkBatchStr, 10, 64); err == nil && val > 0 {
 				chunkBatch = val
+				metaPrimeEnabled = true // auto-enable when batch size is explicitly set
 			}
 		}
 
@@ -914,6 +920,26 @@ func toStdContext(ctx Context) context.Context {
 	return ctx
 }
 
+// isCanceled safely checks if context is canceled, handling nil context.
+// Nil context is treated as never canceled, matching context.Background() semantics.
+// This prevents panics in background goroutines that may pass nil context.
+func isCanceled(ctx Context) bool {
+	if ctx == nil {
+		return false
+	}
+	return ctx.Canceled()
+}
+
+// contextErr safely returns context error, handling nil context.
+// Nil context is treated as having no error, matching context.Background() semantics.
+// This prevents panics in background goroutines that may pass nil context.
+func contextErr(ctx Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
+
 // txn wraps rueidiscompat.Watch with retry logic and pessimistic locking
 // to match redisMeta.txn behavior. This ensures transaction consistency
 // and handles optimistic lock failures (TxFailedErr) with exponential backoff.
@@ -957,7 +983,7 @@ func (m *rueidisMeta) txn(ctx Context, txf func(tx rueidiscompat.Tx) error, keys
 	)
 
 	for i := 0; i < 50; i++ {
-		if ctx.Canceled() {
+		if isCanceled(ctx) {
 			return syscall.EINTR
 		}
 
@@ -1916,7 +1942,7 @@ func (m *rueidisMeta) doCleanupSlices(ctx Context) {
 			return
 		}
 		for i := 0; i < len(kvs); i += 2 {
-			if ctx.Canceled() {
+			if isCanceled(ctx) {
 				return
 			}
 			field, val := kvs[i], kvs[i+1]
@@ -3273,8 +3299,8 @@ func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, erro
 		}
 		if len(keys) > 0 {
 			for i := 0; i < len(keys); i += 2 {
-				if ctx.Canceled() {
-					return count, ctx.Err()
+				if isCanceled(ctx) {
+					return count, contextErr(ctx)
 				}
 				key := keys[i]
 				ps := strings.Split(key, "_")
@@ -3323,8 +3349,8 @@ func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, erro
 						m.deleteSlice(s.Id, s.Size)
 						count++
 					}
-					if ctx.Canceled() {
-						return count, ctx.Err()
+					if isCanceled(ctx) {
+						return count, contextErr(ctx)
 					}
 				}
 			}
@@ -3335,7 +3361,7 @@ func (m *rueidisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, erro
 		cursor = next
 	}
 
-	if err := ctx.Err(); err != nil {
+	if err := contextErr(ctx); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return count, nil
 		}
