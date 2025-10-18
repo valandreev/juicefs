@@ -23,6 +23,7 @@ cmd/cmd
 .vscode
 .idea
 *.exe
+tmp
 
 # lang
 __pycache__
@@ -48,3 +49,5 @@ pkg/meta/jfs-load-dump/00002.mem
 pkg/meta/jfs-load-dump/DISCARD
 pkg/meta/jfs-load-dump/KEYREGISTRY
 pkg/meta/jfs-load-dump/MANIFEST
+tmp/bench.test
+tmp/test.binary
