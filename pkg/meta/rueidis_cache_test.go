@@ -22,9 +22,33 @@ func TestRueidisDefaultCacheTTL(t *testing.T) {
 		t.Errorf("Expected default cache TTL to be 1 hour (%v), got %v", expectedTTL, rm.cacheTTL)
 	}
 
-	// Verify broadcast mode is enabled
+	// Verify OPTIN mode is used by default (ClientTrackingOptions should be nil/empty)
+	if len(rm.option.ClientTrackingOptions) > 0 {
+		t.Errorf("Expected ClientTrackingOptions to be empty for OPTIN mode, got %v", rm.option.ClientTrackingOptions)
+	}
+
+	// Verify subscribeMode is set to "optin"
+	if rm.subscribeMode != "optin" {
+		t.Errorf("Expected subscribeMode to be 'optin', got '%s'", rm.subscribeMode)
+	}
+}
+
+func TestRueidisDefaultCacheTTLBCAST(t *testing.T) {
+	addr := "rueidis://100.121.51.13:6379/7?subscribe=bcast"
+	m := NewClient(addr, &Config{Retries: 10})
+	if m == nil {
+		t.Fatal("Failed to create Rueidis client")
+	}
+
+	rm := m.(*rueidisMeta)
+	expectedTTL := 1 * time.Hour
+	if rm.cacheTTL != expectedTTL {
+		t.Errorf("Expected default cache TTL to be 1 hour (%v), got %v", expectedTTL, rm.cacheTTL)
+	}
+
+	// Verify BCAST mode is enabled when explicitly requested
 	if len(rm.option.ClientTrackingOptions) == 0 {
-		t.Error("Expected ClientTrackingOptions to be configured for broadcast mode")
+		t.Error("Expected ClientTrackingOptions to be configured for BCAST mode")
 	}
 
 	// Check for BCAST option
@@ -37,6 +61,11 @@ func TestRueidisDefaultCacheTTL(t *testing.T) {
 	}
 	if !hasBcast {
 		t.Error("Expected BCAST option in ClientTrackingOptions")
+	}
+
+	// Verify subscribeMode is set to "bcast"
+	if rm.subscribeMode != "bcast" {
+		t.Errorf("Expected subscribeMode to be 'bcast', got '%s'", rm.subscribeMode)
 	}
 }
 
@@ -52,7 +81,30 @@ func TestRueidisCustomCacheTTL(t *testing.T) {
 		t.Errorf("Expected cache TTL to be 5s, got %v", rm.cacheTTL)
 	}
 
-	// Broadcast mode should still be enabled even with custom TTL
+	// OPTIN mode should be used by default (even with custom TTL)
+	if len(rm.option.ClientTrackingOptions) > 0 {
+		t.Errorf("Expected ClientTrackingOptions to be empty for OPTIN mode, got %v", rm.option.ClientTrackingOptions)
+	}
+
+	// Verify subscribeMode is set to "optin"
+	if rm.subscribeMode != "optin" {
+		t.Errorf("Expected subscribeMode to be 'optin', got '%s'", rm.subscribeMode)
+	}
+}
+
+func TestRueidisCustomCacheTTLBCAST(t *testing.T) {
+	addr := "rueidis://100.121.51.13:6379/8?ttl=5s&subscribe=bcast"
+	m := NewClient(addr, &Config{Retries: 10})
+	if m == nil {
+		t.Fatal("Failed to create Rueidis client")
+	}
+
+	rm := m.(*rueidisMeta)
+	if rm.cacheTTL != 5*time.Second {
+		t.Errorf("Expected cache TTL to be 5s, got %v", rm.cacheTTL)
+	}
+
+	// BCAST mode should be enabled when explicitly requested (even with custom TTL)
 	hasBcast := false
 	for _, opt := range rm.option.ClientTrackingOptions {
 		if opt == "BCAST" {
@@ -61,7 +113,12 @@ func TestRueidisCustomCacheTTL(t *testing.T) {
 		}
 	}
 	if !hasBcast {
-		t.Error("Expected BCAST option in ClientTrackingOptions even with custom TTL")
+		t.Error("Expected BCAST option in ClientTrackingOptions")
+	}
+
+	// Verify subscribeMode is set to "bcast"
+	if rm.subscribeMode != "bcast" {
+		t.Errorf("Expected subscribeMode to be 'bcast', got '%s'", rm.subscribeMode)
 	}
 }
 

@@ -50,6 +50,11 @@ type rueidisMeta struct {
 	cacheTTL    time.Duration // client-side cache TTL for read operations
 	enablePrime bool          // post-write cache priming (disabled by default, use ?prime=1 to enable)
 
+	// Client-side cache subscription mode
+	subscribeMode string // "bcast" (broadcast mode) or "optin" (opt-in mode, default)
+	// BCAST: Redis broadcasts all changes to keys matching prefixes to all clients
+	// OPTIN: Client subscribes to changes of specific keys it has read (lower traffic, higher server memory)
+
 	// Client-side cache metrics
 	cacheHits   prometheus.Counter // successful cache hits
 	cacheMisses prometheus.Counter // cache misses requiring Redis fetch
@@ -156,8 +161,14 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	//   ?batch_size=N - Max operations per batch (default: 512)
 	//   ?batch_bytes=N - Max bytes per batch (default: 262144 = 256KB)
 	//   ?batch_interval=Xms - Max time between flushes (default: 2ms)
+	//
+	// Subscription Mode parameter (?subscribe=):
+	//   ?subscribe=bcast - Use BCAST mode (broadcast all key changes to all clients)
+	//   ?subscribe=optin - Use OPTIN mode (subscribe only to specific keys client reads)
+	//   Default: optin (lower traffic, trade-off with slightly higher Redis memory)
 	cacheTTL := 1 * time.Hour
 	enablePrime := true
+	subscribeMode := "optin"  // default to OPTIN mode (lower network traffic)
 	metaPrimeEnabled := false // default: DISABLED, enable with ?metaprime=1 or any inode_batch/chunk_batch param
 	inodeBatch := uint64(8)   // new default: 8 (was 256)
 	chunkBatch := uint64(64)  // new default: 64 (was 2048)
@@ -181,6 +192,11 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		// Extract prime parameter
 		if primeStr := u.Query().Get("prime"); primeStr == "1" || primeStr == "true" {
 			enablePrime = true
+		}
+
+		// Extract subscribe mode parameter (BCAST or OPTIN)
+		if subscribeStr := u.Query().Get("subscribe"); subscribeStr == "bcast" || subscribeStr == "optin" {
+			subscribeMode = subscribeStr // use only valid values, otherwise keep default
 		}
 
 		// Extract metaprime parameter (ID batching on/off)
@@ -252,6 +268,7 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		q := u.Query()
 		q.Del("ttl")
 		q.Del("prime")
+		q.Del("subscribe")
 		q.Del("metaprime")
 		q.Del("inode_batch")
 		q.Del("chunk_batch")
@@ -292,18 +309,29 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 
 	// Enable server-assisted client-side caching with broadcast mode
 	// This enables automatic cache invalidation when keys change on the server
-	// We track all keys with the metadata prefix to ensure proper invalidation
 	prefix := base.prefix
 	// Note: prefix is empty for standalone Redis, or "{DB}" for cluster mode
 	// We must track keys as they are actually stored, not with a default "jfs" prefix
-	opt.ClientTrackingOptions = []string{
-		"PREFIX", prefix + "i", // inode keys
-		"PREFIX", prefix + "d", // directory entry keys
-		"PREFIX", prefix + "c", // chunk keys
-		"PREFIX", prefix + "x", // xattr keys
-		"PREFIX", prefix + "p", // parent keys
-		"PREFIX", prefix + "s", // symlink keys
-		"BCAST", // broadcast mode - automatic invalidation notifications
+
+	// Configure subscription mode for client-side cache invalidation
+	// BCAST mode: Server broadcasts changes to all keys matching prefixes to all clients (higher traffic)
+	// OPTIN mode: Server tracks specific keys each client reads and only notifies of their changes (lower traffic)
+	if subscribeMode == "bcast" {
+		// Broadcast mode: subscribe to all key patterns
+		opt.ClientTrackingOptions = []string{
+			"PREFIX", prefix + "i", // inode keys
+			"PREFIX", prefix + "d", // directory entry keys
+			"PREFIX", prefix + "c", // chunk keys
+			"PREFIX", prefix + "x", // xattr keys
+			"PREFIX", prefix + "p", // parent keys
+			"PREFIX", prefix + "s", // symlink keys
+			"BCAST", // broadcast mode - automatic invalidation notifications
+		}
+	} else {
+		// OPTIN mode (default): Rueidis automatically sends CLIENT CACHING YES before each DoCache() call
+		// This enables per-key tracking instead of prefix-based broadcast
+		// Empty ClientTrackingOptions lets Rueidis handle OPTIN automatically
+		opt.ClientTrackingOptions = nil
 	}
 
 	client, err := rueidis.NewClient(opt)
@@ -320,6 +348,7 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		compat:           rueidiscompat.NewAdapter(client),
 		cacheTTL:         cacheTTL,
 		enablePrime:      enablePrime,
+		subscribeMode:    subscribeMode,
 		metaPrimeEnabled: metaPrimeEnabled,
 		inodeBatch:       inodeBatch,
 		chunkBatch:       chunkBatch,
