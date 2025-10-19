@@ -281,7 +281,17 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		u.RawQuery = q.Encode()
 
 		// Extract just the address part (without scheme)
-		cleanAddr = u.Host + u.Path
+		// Preserve userinfo (username[:password]@) if present so authentication
+		// credentials in the URI are passed through to rueidis.ParseURL.
+		// Previously we dropped u.User which removed credentials and caused
+		// servers requiring AUTH to reject HELLO with NOAUTH.
+		userInfo := ""
+		if u.User != nil {
+			// u.User.String() returns "username:password" if password present,
+			// otherwise just the username. Use this raw form and append '@'.
+			userInfo = u.User.String() + "@"
+		}
+		cleanAddr = userInfo + u.Host + u.Path
 		if u.RawQuery != "" {
 			cleanAddr += "?" + u.RawQuery
 		}
