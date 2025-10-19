@@ -340,6 +340,16 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 		atimeMode = meta.NoAtime
 	}
 	conf.AtimeMode = atimeMode
+
+	// Parse network interfaces
+	if ifaces := c.String("network-interfaces"); ifaces != "" {
+		conf.NetworkInterfaces = strings.Split(ifaces, ",")
+		// Trim whitespace from each interface name
+		for i := range conf.NetworkInterfaces {
+			conf.NetworkInterfaces[i] = strings.TrimSpace(conf.NetworkInterfaces[i])
+		}
+	}
+
 	return conf
 }
 
@@ -532,7 +542,7 @@ func mount(c *cli.Context) error {
 
 	var err error
 	if stage == 0 || supervisor == "test" {
-		err = utils.WithTimeout(func(context.Context) error {
+		err = utils.WithTimeout(context.TODO(), func(context.Context) error {
 			mp, err = filepath.Abs(mp)
 			return err
 		}, time.Second*3)

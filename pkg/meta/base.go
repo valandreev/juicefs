@@ -482,7 +482,7 @@ func (m *baseMeta) newSessionInfo() []byte {
 	if err != nil {
 		logger.Warnf("Failed to get hostname: %s", err)
 	}
-	ips, err := utils.FindLocalIPs()
+	ips, err := utils.FindLocalIPs(m.conf.NetworkInterfaces...)
 	if err != nil {
 		logger.Warnf("Failed to get local IP: %s", err)
 	}
@@ -827,7 +827,7 @@ func (m *baseMeta) statRootFs(ctx Context, totalspace, availspace, iused, iavail
 	var err error
 	if !m.conf.FastStatfs || used == unknownUsage || inodes == unknownUsage {
 		var remoteUsed int64 // using an additional variable here to ensure the assignment inside `utils.WithTimeout` does not change the `used` variable again after a timeout.
-		err = utils.WithTimeout(func(context.Context) error {
+		err = utils.WithTimeout(ctx, func(context.Context) error {
 			remoteUsed, err = m.en.getCounter(usedSpace)
 			return err
 		}, time.Millisecond*150)
@@ -835,7 +835,7 @@ func (m *baseMeta) statRootFs(ctx Context, totalspace, availspace, iused, iavail
 			used = remoteUsed
 		}
 		var remoteInodes int64
-		err = utils.WithTimeout(func(context.Context) error {
+		err = utils.WithTimeout(ctx, func(context.Context) error {
 			remoteInodes, err = m.en.getCounter(totalInodes)
 			return err
 		}, time.Millisecond*150)
@@ -1073,7 +1073,7 @@ func (m *baseMeta) GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 	if inode == RootInode || inode == TrashInode {
 		// doGetAttr could overwrite the `attr` after timeout
 		var a Attr
-		e := utils.WithTimeout(func(context.Context) error {
+		e := utils.WithTimeout(ctx, func(context.Context) error {
 			err = m.en.doGetAttr(ctx, inode, &a)
 			return nil
 		}, time.Millisecond*300)
@@ -2582,8 +2582,8 @@ func (m *baseMeta) cleanupTrash(ctx Context) {
 		} else if ok {
 			if cCtx != nil {
 				cCtx.Cancel()
-				cCtx = WrapWithTimeout(ctx, 50*time.Minute)
 			}
+			cCtx = WrapWithTimeout(ctx, 50*time.Minute)
 			days := m.getFormat().TrashDays
 			go m.doCleanupTrash(cCtx, days, false)
 			go m.cleanupDelayedSlices(cCtx, days)
