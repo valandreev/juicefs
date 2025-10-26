@@ -156,11 +156,11 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	//   ?inode_low_watermark=N - Inode pool prefetch watermark in % (default: 25)
 	//   ?chunk_low_watermark=N - Chunk pool prefetch watermark in % (default: 25)
 	//
-	// Batch Write parameters (Phase 2):
+	// Batch Write parameters:
 	//   ?batchwrite=0 - Disable batch writes (default: enabled)
 	//   ?batch_size=N - Max operations per batch (default: 512)
 	//   ?batch_bytes=N - Max bytes per batch (default: 262144 = 256KB)
-	//   ?batch_interval=Xms - Max time between flushes (default: 2ms)
+	//   ?batch_interval=Xms - Max time between flushes (default: 200ms)
 	//
 	// Subscription Mode parameter (?subscribe=):
 	//   ?subscribe=bcast - Use BCAST mode (broadcast all key changes to all clients)
@@ -177,7 +177,7 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	batchWriteEnabled := true
 	batchSize := 512
 	batchBytes := 262144 // 256KB
-	batchInterval := 2 * time.Millisecond
+	batchInterval := 200 * time.Millisecond
 	maxQueueSize := 100000
 	cleanAddr := addr
 
