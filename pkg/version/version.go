@@ -50,7 +50,7 @@ func (s *Semver) String() string {
 		// left the placeholder), show a readable identifier rather than
 		// "unknown". Use "+rueidis" to indicate this build includes the
 		// Rueidis client-side caching feature branch.
-		s.build = "rueidis-0.1.7"
+		s.build = "rueidis-0.1.8"
 	}
 	return fmt.Sprintf("%d.%d.%d%s+%s", s.major, s.minor, s.patch, pr, s.build)
 }

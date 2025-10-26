@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math/rand"
+	"net"
 	"net/url"
 	"os"
 	"runtime"
@@ -347,10 +348,166 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	inodeLowWM := (inodeBatch * inodeLowWMPercent) / 100
 	chunkLowWM := (chunkBatch * chunkLowWMPercent) / 100
 
-	cleanURI := canonical + "://" + cleanAddr
-	opt, err := rueidis.ParseURL(cleanURI)
-	if err != nil {
-		return nil, fmt.Errorf("rueidis parse %s: %w", cleanURI, err)
+	// Sentinel mode detection and configuration (Steps 1-7)
+	//
+	// JuiceFS supports Redis Sentinel for high availability using the same address format as redis.go
+	// for 100% UX compatibility:
+	//
+	// Format: rueidis://[user:pass@]master-name,sentinel1[:port],sentinel2[:port]/db[?params]
+	// Example: rueidis://mymaster,192.168.1.1:26379,192.168.1.2:26379/0
+	//
+	// Detection logic (same as redis.go line 168):
+	// - Contains comma AND comma appears before first colon
+	// - First part before comma = master name
+	// - All parts after comma = sentinel addresses
+	//
+	// Default Sentinel port: 26379
+	// Sentinel authentication: SENTINEL_PASSWORD env variable
+	// Sentinel username (ACL): SENTINEL_USERNAME env variable
+	//
+	// How it works:
+	// 1. Parse master name and sentinel addresses from URI
+	// 2. Create ClientOption with Sentinel configuration
+	// 3. rueidis.NewClient() auto-detects Sentinel mode
+	// 4. Client queries sentinels for current master address
+	// 5. Client connects to master and handles failover automatically
+	//
+	// Example URIs:
+	// - rueidis://mymaster,sentinel1:26379/0
+	// - rueidis://mymaster,s1:26379,s2:26379/1?ttl=1h
+	// - ruediss://user:pass@mymaster,s1:26379/0  (TLS + auth)
+
+	// Step 1: Detect Sentinel mode (same logic as redis.go line 168)
+	isSentinel := strings.Contains(cleanAddr, ",") && strings.Index(cleanAddr, ",") < strings.Index(cleanAddr, ":")
+
+	var opt rueidis.ClientOption
+	var err error
+
+	if isSentinel {
+		// Sentinel mode detected - Steps 2-7
+		logger.Debugf("Sentinel mode detected in address: %s", cleanAddr)
+
+		// Step 2: Parse master name and sentinel addresses
+		ps := strings.Split(cleanAddr, ",")
+		masterNamePart := ps[0] // may include userinfo like "user:pass@mymaster"
+		sentinelAddrs := ps[1:] // sentinel addresses
+
+		// Step 12: Extract credentials from master name part (support user:pass@mymaster format)
+		var username, password string
+		if atIdx := strings.LastIndex(masterNamePart, "@"); atIdx >= 0 {
+			userInfo := masterNamePart[:atIdx]
+			masterNamePart = masterNamePart[atIdx+1:]
+
+			if colonIdx := strings.Index(userInfo, ":"); colonIdx >= 0 {
+				username = userInfo[:colonIdx]
+				password = userInfo[colonIdx+1:]
+			} else {
+				username = userInfo
+			}
+		}
+
+		masterName := masterNamePart
+
+		// Step 3: Process ports (add default 26379 if missing)
+		_, port, _ := net.SplitHostPort(sentinelAddrs[len(sentinelAddrs)-1])
+		if port == "" {
+			port = "26379"
+		}
+
+		// Normalize all sentinel addresses with default port
+		for i, addr := range sentinelAddrs {
+			h, p, e := net.SplitHostPort(addr)
+			if e != nil {
+				// No ':' delimiter - add default port
+				sentinelAddrs[i] = net.JoinHostPort(addr, port)
+			} else if p == "" {
+				// Has ':' but port is empty
+				sentinelAddrs[i] = net.JoinHostPort(h, port)
+			}
+			// Otherwise port already specified - keep as is
+		}
+
+		// Step 4: Extract DB number from path
+		var db int = 0
+		parts := strings.Split(cleanAddr, "/")
+		if len(parts) > 1 {
+			if dbNum, err := strconv.Atoi(parts[len(parts)-1]); err == nil {
+				db = dbNum
+			}
+		}
+
+		// Remove '/db' from sentinel addresses
+		for i, addr := range sentinelAddrs {
+			if idx := strings.LastIndex(addr, "/"); idx > 0 {
+				sentinelAddrs[i] = addr[:idx]
+			}
+		}
+
+		// Step 5: Create temporary URL for rueidis.ParseURL to extract basic parameters
+		// We use the first sentinel address as pseudo-host to get proper option parsing
+		// Format: rueidis://sentinel1:26379/db?params
+		tempURL := fmt.Sprintf("%s://%s/%d", canonical, sentinelAddrs[0], db)
+
+		// Add query parameters from original URI
+		if u, err := url.Parse(canonical + "://" + cleanAddr); err == nil && u.RawQuery != "" {
+			tempURL += "?" + u.RawQuery
+		}
+
+		opt, err = rueidis.ParseURL(tempURL)
+		if err != nil {
+			return nil, fmt.Errorf("rueidis parse sentinel config %s: %w", tempURL, err)
+		}
+
+		// Step 6: Configure Sentinel options
+		opt.Sentinel.MasterSet = masterName
+		opt.InitAddress = sentinelAddrs
+
+		// Sentinel authentication from environment variable (same as redis.go)
+		opt.Sentinel.Password = os.Getenv("SENTINEL_PASSWORD")
+
+		// Sentinel username for ACL (if needed)
+		if sentinelUser := os.Getenv("SENTINEL_USERNAME"); sentinelUser != "" {
+			opt.Sentinel.Username = sentinelUser
+		}
+
+		// Apply Redis master credentials if provided in URI
+		if username != "" {
+			opt.Username = username
+		}
+		if password != "" {
+			opt.Password = password
+		}
+
+		// Copy TLS config to Sentinel if main connection uses TLS
+		if opt.TLSConfig != nil {
+			opt.Sentinel.TLSConfig = opt.TLSConfig
+		}
+
+		// Step 13: Validate Sentinel configuration
+		if masterName == "" {
+			return nil, fmt.Errorf("sentinel master name is empty")
+		}
+
+		if len(sentinelAddrs) == 0 {
+			return nil, fmt.Errorf("no sentinel addresses provided")
+		}
+
+		// Validate each sentinel address
+		for _, addr := range sentinelAddrs {
+			if _, _, err := net.SplitHostPort(addr); err != nil {
+				return nil, fmt.Errorf("invalid sentinel address %s: %w", addr, err)
+			}
+		}
+
+		logger.Debugf("Sentinel config: master=%s, sentinels=%v, db=%d", masterName, sentinelAddrs, db)
+
+	} else {
+		// Step 7: Non-Sentinel mode - use standard parsing
+		cleanURI := canonical + "://" + cleanAddr
+		opt, err = rueidis.ParseURL(cleanURI)
+		if err != nil {
+			return nil, fmt.Errorf("rueidis parse %s: %w", cleanURI, err)
+		}
 	}
 
 	// Apply TLS configuration (match redis.go logic)
@@ -478,6 +635,12 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		} else {
 			return nil, fmt.Errorf("rueidis connect %s: %w", uri, err)
 		}
+	}
+
+	// Step 10: Log Sentinel mode activation (if enabled)
+	if opt.Sentinel.MasterSet != "" {
+		logger.Infof("Sentinel mode enabled: master=%s, sentinels=%v",
+			opt.Sentinel.MasterSet, opt.InitAddress)
 	}
 
 	// Log CSC (Client-Side Caching) status
