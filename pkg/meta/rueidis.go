@@ -133,6 +133,7 @@ type rueidisMeta struct {
 func init() {
 	Register("rueidis", newRueidisMeta)
 	Register("ruediss", newRueidisMeta)
+	Register("rueidiss", newRueidisMeta) // TLS variant with three 's'
 }
 
 func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
@@ -424,7 +425,13 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		return nil, fmt.Errorf("unexpected meta implementation %T", delegate)
 	}
 
-	// Enable server-assisted client-side caching with broadcast mode
+	// Disable client-side caching for servers that don't support CLIENT TRACKING (e.g., Upstash)
+	// Note: DisableCache prevents Rueidis from trying to use CLIENT TRACKING at all
+	// For compatibility with all Redis servers, disable caching by default
+	// Users can enable caching with ?ttl=<duration> if their Redis server supports RESP3 + CLIENT TRACKING
+	opt.DisableCache = true
+
+	// Enable server-assisted client-side caching with broadcast mode if explicitly requested
 	// This enables automatic cache invalidation when keys change on the server
 	prefix := base.prefix
 	// Note: prefix is empty for standalone Redis, or "{DB}" for cluster mode
@@ -433,7 +440,9 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	// Configure subscription mode for client-side cache invalidation
 	// BCAST mode: Server broadcasts changes to all keys matching prefixes to all clients (higher traffic)
 	// OPTIN mode: Server tracks specific keys each client reads and only notifies of their changes (lower traffic)
-	if subscribeMode == "bcast" {
+	// Note: CLIENT TRACKING is not available on all Redis servers (e.g., Upstash)
+	// When cacheTTL is 0 or client tracking not supported, disable tracking options
+	if cacheTTL > 0 && subscribeMode == "bcast" {
 		// Broadcast mode: subscribe to all key patterns
 		opt.ClientTrackingOptions = []string{
 			"PREFIX", prefix + "i", // inode keys
@@ -444,16 +453,32 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 			"PREFIX", prefix + "s", // symlink keys
 			"BCAST", // broadcast mode - automatic invalidation notifications
 		}
-	} else {
+	} else if cacheTTL > 0 {
 		// OPTIN mode (default): Rueidis automatically sends CLIENT CACHING YES before each DoCache() call
 		// This enables per-key tracking instead of prefix-based broadcast
 		// Empty ClientTrackingOptions lets Rueidis handle OPTIN automatically
 		opt.ClientTrackingOptions = nil
+	} else {
+		// Caching disabled (ttl=0): disable client tracking completely
+		opt.ClientTrackingOptions = []string{"OFF"}
 	}
 
 	client, err := rueidis.NewClient(opt)
 	if err != nil {
 		return nil, fmt.Errorf("rueidis connect %s: %w", uri, err)
+	}
+
+	// Log CSC (Client-Side Caching) status
+	if opt.DisableCache {
+		logger.Infof("Client-side caching (CSC) disabled (DisableCache=true) - all operations will fetch from Redis")
+	} else if cacheTTL > 0 {
+		trackingMode := "OPTIN"
+		if subscribeMode == "bcast" {
+			trackingMode = "BCAST"
+		}
+		logger.Infof("Client-side caching (CSC) enabled with %s mode, TTL: %v", trackingMode, cacheTTL)
+	} else {
+		logger.Infof("Client-side caching (CSC) disabled (TTL=0) - all operations will fetch from Redis")
 	}
 
 	m := &rueidisMeta{
@@ -599,6 +624,8 @@ func mapRueidisScheme(driver string) string {
 	case "rueidis":
 		return "redis"
 	case "ruediss":
+		return "rediss"
+	case "rueidiss": // TLS variant with three 's'
 		return "rediss"
 	default:
 		return driver
