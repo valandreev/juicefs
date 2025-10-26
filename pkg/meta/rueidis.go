@@ -14,12 +14,15 @@ package meta
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"math/rand"
 	"net/url"
+	"os"
 	"runtime"
 	"sort"
 	"strconv"
@@ -166,6 +169,19 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	//   ?subscribe=bcast - Use BCAST mode (broadcast all key changes to all clients)
 	//   ?subscribe=optin - Use OPTIN mode (subscribe only to specific keys client reads)
 	//   Default: optin (lower traffic, trade-off with slightly higher Redis memory)
+	//
+	// TLS/mTLS parameters (for rediss:// scheme):
+	//   ?insecure-skip-verify=1 - Skip TLS certificate verification (INSECURE, for testing only)
+	//   ?tls-cert-file=/path/to/cert.pem - Client certificate file for mTLS authentication
+	//   ?tls-key-file=/path/to/key.pem - Client private key file for mTLS authentication
+	//   ?tls-ca-cert-file=/path/to/ca.pem - CA certificate file for custom CA verification
+	//   ?tls-server-name=example.com - Server name for SNI (Server Name Indication)
+	//
+	//   Examples:
+	//     rediss://user:pass@host:6379  (basic TLS with system CA)
+	//     rediss://host:6379?insecure-skip-verify=1  (TLS without verification - testing only)
+	//     rediss://host:6379?tls-cert-file=/certs/client.pem&tls-key-file=/certs/client-key.pem  (mTLS)
+	//     rediss://host:6379?tls-ca-cert-file=/certs/ca.pem  (TLS with custom CA)
 	cacheTTL := 1 * time.Hour
 	enablePrime := true
 	subscribeMode := "optin"  // default to OPTIN mode (lower network traffic)
@@ -180,6 +196,13 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	batchInterval := 200 * time.Millisecond
 	maxQueueSize := 100000
 	cleanAddr := addr
+
+	// TLS parameters (match redis.go implementation)
+	skipVerify := ""
+	certFile := ""
+	keyFile := ""
+	caCertFile := ""
+	tlsServerName := ""
 
 	if u, err := url.Parse(uri); err == nil {
 		// Extract ttl parameter
@@ -264,6 +287,23 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 			}
 		}
 
+		// Extract TLS parameters (match redis.go implementation)
+		if skipVerifyStr := u.Query().Get("insecure-skip-verify"); skipVerifyStr != "" {
+			skipVerify = skipVerifyStr
+		}
+		if certFileStr := u.Query().Get("tls-cert-file"); certFileStr != "" {
+			certFile = certFileStr
+		}
+		if keyFileStr := u.Query().Get("tls-key-file"); keyFileStr != "" {
+			keyFile = keyFileStr
+		}
+		if caCertFileStr := u.Query().Get("tls-ca-cert-file"); caCertFileStr != "" {
+			caCertFile = caCertFileStr
+		}
+		if tlsServerNameStr := u.Query().Get("tls-server-name"); tlsServerNameStr != "" {
+			tlsServerName = tlsServerNameStr
+		}
+
 		// Strip custom params from query for rueidis.ParseURL
 		q := u.Query()
 		q.Del("ttl")
@@ -278,6 +318,11 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		q.Del("batch_size")
 		q.Del("batch_bytes")
 		q.Del("batch_interval")
+		q.Del("insecure-skip-verify")
+		q.Del("tls-cert-file")
+		q.Del("tls-key-file")
+		q.Del("tls-ca-cert-file")
+		q.Del("tls-server-name")
 		u.RawQuery = q.Encode()
 
 		// Extract just the address part (without scheme)
@@ -305,6 +350,68 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	opt, err := rueidis.ParseURL(cleanURI)
 	if err != nil {
 		return nil, fmt.Errorf("rueidis parse %s: %w", cleanURI, err)
+	}
+
+	// Apply TLS configuration (match redis.go logic)
+	// Validate mTLS configuration (both cert and key must be provided together)
+	if certFile != "" && keyFile == "" {
+		return nil, fmt.Errorf("tls-cert-file provided but tls-key-file is missing")
+	}
+	if keyFile != "" && certFile == "" {
+		return nil, fmt.Errorf("tls-key-file provided but tls-cert-file is missing")
+	}
+
+	// Validate file existence before attempting to load
+	if certFile != "" {
+		if _, err := os.Stat(certFile); os.IsNotExist(err) {
+			return nil, fmt.Errorf("tls-cert-file does not exist: %s", certFile)
+		}
+		if _, err := os.Stat(keyFile); os.IsNotExist(err) {
+			return nil, fmt.Errorf("tls-key-file does not exist: %s", keyFile)
+		}
+	}
+	if caCertFile != "" {
+		if _, err := os.Stat(caCertFile); os.IsNotExist(err) {
+			return nil, fmt.Errorf("tls-ca-cert-file does not exist: %s", caCertFile)
+		}
+	}
+
+	// Warn if TLS parameters provided without rediss scheme
+	if (skipVerify != "" || certFile != "" || caCertFile != "" || tlsServerName != "") && opt.TLSConfig == nil {
+		logger.Warnf("TLS parameters provided but scheme is not rediss:// - TLS parameters will be ignored")
+	}
+
+	// Apply TLS configuration if enabled
+	if opt.TLSConfig != nil {
+		// Apply server name for SNI if provided
+		if tlsServerName != "" {
+			opt.TLSConfig.ServerName = tlsServerName
+		}
+
+		// Apply insecure skip verify if requested
+		if skipVerify != "" {
+			opt.TLSConfig.InsecureSkipVerify = true
+		}
+
+		// Load client certificate/key for mTLS
+		if certFile != "" {
+			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				return nil, fmt.Errorf("get certificate error certFile:%s keyFile:%s error:%s", certFile, keyFile, err)
+			}
+			opt.TLSConfig.Certificates = []tls.Certificate{cert}
+		}
+
+		// Load CA certificate for custom CA verification
+		if caCertFile != "" {
+			caCert, err := os.ReadFile(caCertFile)
+			if err != nil {
+				return nil, fmt.Errorf("read ca cert file error path:%s error:%s", caCertFile, err)
+			}
+			caCertPool := x509.NewCertPool()
+			caCertPool.AppendCertsFromPEM(caCert)
+			opt.TLSConfig.RootCAs = caCertPool
+		}
 	}
 
 	delegate, err := newRedisMeta(canonical, cleanAddr, conf)
