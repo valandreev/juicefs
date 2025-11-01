@@ -44,6 +44,7 @@ type Config struct {
 	OpenCacheLimit     uint64 // max number of files to cache (soft limit)
 	Heartbeat          time.Duration
 	MountPoint         string
+	CacheDir           string // data cache directory path (for metacache storage)
 	Subdir             string
 	AtimeMode          string
 	DirStatFlushPeriod time.Duration

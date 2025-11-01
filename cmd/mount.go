@@ -328,6 +328,7 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 	conf.OpenCacheLimit = c.Uint64("open-cache-limit")
 	conf.Heartbeat = utils.Duration(c.String("heartbeat"))
 	conf.MountPoint = mp
+	conf.CacheDir = c.String("cache-dir")
 	conf.Subdir = c.String("subdir")
 	conf.SkipDirMtime = utils.Duration(c.String("skip-dir-mtime"))
 	conf.Sid, _ = strconv.ParseUint(os.Getenv("_JFS_META_SID"), 10, 64)

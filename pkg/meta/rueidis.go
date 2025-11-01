@@ -922,15 +922,17 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 
 	// Initialize MetaCache (fast-meta mode) when enabled
 	if fastMetaEnabled {
-		// Create metacache subdirectory in the system temp or a known location
-		// For now, use a directory in /tmp or system temp directory
+		// Create metacache subdirectory in the data cache directory
 		var localCachePath string
 
-		// Try to use mount point for local cache (best if available)
-		if conf.MountPoint != "" {
+		// Prefer data cache directory (where chunk data is cached)
+		if conf.CacheDir != "" {
+			localCachePath = filepath.Join(conf.CacheDir, ".juicefs", "metacache")
+		} else if conf.MountPoint != "" {
+			// Fallback to mount point
 			localCachePath = filepath.Join(conf.MountPoint, ".juicefs", "metacache")
 		} else {
-			// Fallback to system temp directory
+			// Last resort: use system temp directory
 			tempDir := os.TempDir()
 			localCachePath = filepath.Join(tempDir, "juicefs-metacache", fmt.Sprintf("meta-%d", os.Getpid()))
 		}
@@ -1017,7 +1019,7 @@ func mapRueidisScheme(driver string) string {
 		return "redis"
 	case "ruediss":
 		return "rediss"
-	case "rueidiss": // TLS variant with three 's'
+	case "rueidiss": // TLS variant with rueidis 's'
 		return "rediss"
 	default:
 		return driver
