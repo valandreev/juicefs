@@ -28,120 +28,59 @@ Use `pkg/meta/Context` (NOT `context.Context` directly) for metadata operations.
 func (m *baseMeta) Operation(ctx Context, ...) syscall.Errno {
     if !ctx.CheckPermission() { ... }
 }
-```
+## JuiceFS — Agent instructions (concise)
 
-Create contexts with `meta.Background()` or `meta.WrapContext(stdCtx)`.
+Use this file when you're an automated coding agent working on JuiceFS. Stay focused, preserve repository conventions, and prefer small, verifiable edits.
 
-### 3. Build Tags for Optional Features
+- Big picture: JuiceFS separates metadata (Redis/MySQL/TiKV/etc.) from data (object storage). Main areas:
+  - CLI & mount: `cmd/`, `pkg/fuse/`, `pkg/vfs/`
+  - Metadata engines: `pkg/meta/` (implement `Meta` and engine `do*` methods)
+  - Chunk/data layer: `pkg/chunk/` (cache, eviction, async upload)
+  - Object backends: `pkg/object/` (implement `ObjectStorage`, register in `object_storage.go`)
 
-JuiceFS uses build tags extensively to create minimal binaries:
+- Critical conventions (use these exactly):
+  - Metadata APIs use `pkg/meta/Context` and return `syscall.Errno`. Object code uses `error`.
+  - Chunk size constant: `meta.ChunkSize = 1 << 26` (64MB). Inode batch: `inodeBatch = 1 << 10`.
+  - Build tags control optional engines (`juicefs.lite`, `ceph`, `fdb`, `gluster`). Add `//go:build` tags as other files do.
+  - Do NOT change metadata storage directly — use `Meta` methods for locking/transactions.
 
-**Common build targets:**
-- `juicefs` - full binary (default)
-- `juicefs.lite` - minimal binary excluding most object storage/metadata engines
-- `juicefs.ceph` - with Ceph support (requires `ceph` tag)
-- `juicefs.fdb` - with FoundationDB support (requires `fdb` tag)
-- `juicefs.gluster` - with Gluster support (requires `gluster` tag)
+- Developer workflows (quick commands):
+  - Build: `make juicefs` (or `make juicefs.lite`). For platform-specific builds see `Makefile`.
+  - Tests: `make test.meta.core`, `make test.pkg`, `make test.cmd`. Many tests need external services (see `.github/workflows/unittests.yml`).
+  - Format: `go fmt ./...`; pre-commit hooks expected (`pre-commit install`).
 
-When adding object storage backends, use build tags like `//go:build !noXXX` (see `pkg/object/s3.go` for examples).
+- Example patterns to follow:
+  - Adding an object backend: implement `ObjectStorage` in `pkg/object/<name>.go`, then add a creator in `pkg/object/object_storage.go`.
+  - Metadata operation: update `pkg/meta/interface.go`, then implement `do*` in each backend (`pkg/meta/redis.go`, `pkg/meta/sql.go`, ...).
 
-### 4. Testing Structure
+- Small contract for PRs you create:
+  - Inputs: modified files and small unit tests. Outputs: passing `go test` for touched packages and `go fmt`ed code.
+  - Error modes: return `syscall.Errno` in meta packages; propagate context cancellation for object ops.
 
-**Run tests using Makefile targets:**
-```bash
-make test.meta.core      # Core metadata tests (Redis/SQLite)
-make test.meta.non-core  # External metadata engines (etcd/TiKV/Postgres)
-make test.pkg            # All package tests except meta
-make test.cmd            # Command-line tests (requires sudo for some)
-```
+- Helpful entry points when investigating behavior:
+  - `cmd/mount.go` — mount lifecycle and args handling
+  - `pkg/meta/base.go` — session management and shared meta helpers
+  - `pkg/chunk/cached_store.go` — cache + writeback logic
+  - `pkg/object/object_storage.go` — registration of backends
 
-Tests require external services (Redis, MySQL, MinIO, etc.). See `.github/workflows/unittests.yml` for the full setup with environment variables like `REDIS_ADDR=redis://127.0.0.1:6379/13`.
+  Short call graphs (quick reference)
 
-### 5. CLI Command Structure
+  - mount (high-level):
+    1. `cmd/cmdMount()` (CLI flags parsing)
+    2. `mount()` in `cmd/mount.go` — builds `meta.Config`, loads `meta.Format`, creates `chunk.Config` and `vfs.Config`
+    3. `NewReloadableStorage()` → `createStorage()` for object backend
+    4. `meta.NewClient()` and `metaCli.Load()` — metadata client initialization
+    5. `chunk.NewCachedStore()` — create chunk store (local cache + writer/reader)
+    6. `vfs.NewVFS()` — construct VFS with Meta + ChunkStore
+    7. `mountMain()` / fuse serve loop — hand off to kernel-facing layer
 
-All commands in `cmd/` follow this pattern:
-1. Define with `func cmd<Name>() *cli.Command`
-2. Register in `cmd/main.go::Main()`
-3. Parse flags, create metadata/chunk configs
-4. Call core logic in `pkg/` packages
+  - vfs (common hot-paths):
+    1. `NewVFS(conf, m, store, ...)` sets up reader, writer, cache filler
+    2. Kernel FUSE ops → VFS methods (e.g., `Lookup`, `Open`, `Read`, `Write`, `Flush`)
+    3. VFS delegates metadata calls to `v.Meta.*` (returns `syscall.Errno`) and data ops to `writer`/`reader` (chunk layer)
+    4. Writer/Reader interact with `chunk.ChunkStore` to stage/upload blocks to object storage
+    5. VFS maintains handles, invalidation and background flush/backup tasks (see `FlushAll`, `Backup` integration)
 
-Example flow for `mount`:
-```
-cmd/mount.go::cmdMount() 
-  → getMetaConf() + getChunkConf() 
-  → meta.NewClient(addr) 
-  → vfs.NewVFS() 
-  → fuse.Serve()
-```
+If anything here is ambiguous or you want the agent to adopt a different editing style (e.g., longer PR bodies, more tests), tell me and I'll iterate.
 
-### 6. Data Flow: File Read/Write
-
-**Write:** VFS → Chunk Store → (local cache) → Object Storage  
-**Read:** VFS → Chunk Store → (check cache) → Object Storage → (populate cache)
-
-The chunk store (`pkg/chunk/cached_store.go`) manages:
-- Local disk cache with configurable eviction policies
-- Async upload to object storage (controlled by `--writeback` flag)
-- Block-level deduplication and compression
-
-### 7. Object Storage Registration
-
-Register new object storage in `pkg/object/<name>.go`:
-1. Implement the `ObjectStorage` interface (Head, Get, Put, Delete, List, etc.)
-2. Add creator function in `pkg/object/object_storage.go`
-3. Update docs at `docs/en/reference/how_to_set_up_object_storage.md`
-
-All object operations should support context cancellation and respect timeout settings.
-
-### 8. Error Handling Convention
-
-Metadata operations return `syscall.Errno` (e.g., `syscall.ENOENT`, `syscall.EACCES`).  
-Object operations return standard Go `error`.  
-VFS layer translates errors between these conventions.
-
-### 9. Metrics and Observability
-
-- Prometheus metrics exposed via `--metrics` flag (default: random port)
-- Use `pkg/utils.GetLogger("component")` for structured logging
-- Profiling available via `--debug` flag (enables pprof endpoints)
-
-## Development Workflow
-
-**Build:**
-```bash
-make juicefs              # Standard build
-make juicefs.lite         # Minimal build
-CGO_ENABLED=1 make ...    # Required for Ceph/Gluster/FoundationDB
-```
-
-**Before committing:**
-1. Run `go fmt ./...` 
-2. Install and run `pre-commit install` for static checks
-3. Run relevant test suites (`make test.meta.core test.pkg`)
-4. Update tests if adding new commands or modifying interfaces
-
-**Cross-compilation:**
-- Linux from macOS: `make juicefs.linux` (requires musl-cross)
-- Windows from macOS: `make juicefs.exe` (requires mingw-w64)
-
-## Common Gotchas
-
-- **Don't modify metadata directly**: Always use the Meta interface methods which handle locking and transactions
-- **Chunk size is fixed at 64MB**: `meta.ChunkSize = 1 << 26`, this is a core assumption throughout the codebase
-- **Session management is critical**: The metadata layer maintains active sessions to detect stale mounts (see `pkg/meta/base.go::doRefreshSession`)
-- **Cache coherence**: JuiceFS provides close-to-open consistency but not perfect coherence; understand the trade-offs in `docs/en/guide/cache.md`
-- **Inode allocation is batched**: Inodes are allocated in batches of 1024 (`inodeBatch = 1 << 10`) to reduce metadata roundtrips
-
-## Key Files to Reference
-
-- `pkg/meta/interface.go` - Core metadata interface definition
-- `pkg/meta/base.go` - Shared metadata implementation (3000+ lines, read selectively)
-- `pkg/vfs/vfs.go` - VFS layer that ties everything together
-- `cmd/mount.go` - Mount command showing full initialization flow
-- `README.md` - Architecture diagrams and high-level concepts
-
-## Additional Resources
-
-- Official docs: https://juicefs.com/docs/community/
-- Architecture guide: https://juicefs.com/docs/community/architecture
-- Hadoop SDK: Separate Java implementation in `sdk/java/`
+Requested review: is the level-of-detail appropriate and are there specific files or patterns you want called out further?
