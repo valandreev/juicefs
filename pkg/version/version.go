@@ -46,7 +46,7 @@ func (s *Semver) String() string {
 		pr = "-" + pr
 	}
 	if strings.Contains(s.build, "Format") {
-		s.build = "unknown"
+		s.build = "lf-0.1.0"
 	}
 	return fmt.Sprintf("%d.%d.%d%s+%s", s.major, s.minor, s.patch, pr, s.build)
 }
