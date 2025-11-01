@@ -49,6 +49,15 @@ Use this file when you're an automated coding agent working on JuiceFS. Stay foc
   - Tests: `make test.meta.core`, `make test.pkg`, `make test.cmd`. Many tests need external services (see `.github/workflows/unittests.yml`).
   - Format: `go fmt ./...`; pre-commit hooks expected (`pre-commit install`).
 
+Coding style
+
+- Follow the project's `CONTRIBUTING.md` coding style:
+  - Follow "Effective Go" and "Go Code Review Comments" conventions.
+  - Run `go fmt ./...` before committing code.
+  - Every new source file must begin with the project's license header.
+  - Install and use `pre-commit` and run `pre-commit install` to enable static checks.
+  - Prefer small, well-scoped PRs with clear commit messages and unit tests for changed behavior.
+
 - Example patterns to follow:
   - Adding an object backend: implement `ObjectStorage` in `pkg/object/<name>.go`, then add a creator in `pkg/object/object_storage.go`.
   - Metadata operation: update `pkg/meta/interface.go`, then implement `do*` in each backend (`pkg/meta/redis.go`, `pkg/meta/sql.go`, ...).
