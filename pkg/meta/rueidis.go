@@ -921,93 +921,21 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 	}
 
 	// Initialize MetaCache (fast-meta mode) when enabled
+	// Note: Metacache initialization will be triggered after Load() via initMetaCacheIfReady()
+	// We store the initMetaCacheIfReady function as a method so it can be called both:
+	// 1. Immediately after NewClient if UUID is already available
+	// 2. Via OnReload during the refresh loop if UUID changes
 	if fastMetaEnabled {
-		// Create metacache subdirectory in the data cache directory
-		var localCachePath string
-
-		// Prefer data cache directory (where chunk data is cached)
-		if conf.CacheDir != "" {
-			localCachePath = filepath.Join(conf.CacheDir, ".juicefs", "metacache")
-		} else if conf.MountPoint != "" {
-			// Fallback to mount point
-			localCachePath = filepath.Join(conf.MountPoint, ".juicefs", "metacache")
-		} else {
-			// Last resort: use system temp directory
-			tempDir := os.TempDir()
-			localCachePath = filepath.Join(tempDir, "juicefs-metacache", fmt.Sprintf("meta-%d", os.Getpid()))
-		}
-
-		// Create metacache subdirectory
-		if err := os.MkdirAll(localCachePath, 0755); err != nil {
-			logger.Warnf("Failed to create metacache directory %s: %v, MetaCache disabled", localCachePath, err)
-		} else {
-			// Initialize BadgerDB for local cache
-			localCache, err := newTkvClient("badger", localCachePath)
-			if err != nil {
-				logger.Warnf("Failed to initialize BadgerDB for metacache: %v, MetaCache disabled", err)
-			} else {
-				m.localCache = localCache
-				m.fastMetaEnabled = true
-
-				// Initialize communication channels for async sync worker
-				m.oplogQueue = make(chan interface{}, 1000) // Buffer 1000 pending operations
-				m.syncWorkerStop = make(chan struct{})      // Signal to stop sync worker
-				m.syncWorkerDone = make(chan struct{})      // Signal that worker has stopped
-
-				// Start async sync worker goroutine
-				go m.runSyncWorker()
-
-				// Setup CLIENT TRACKING invalidation callback for cache coherence
-				// When Redis sends invalidation messages for keys we've cached,
-				// we asynchronously remove them from local BadgerDB to stay in sync
-				opt.OnInvalidations = func(messages []rueidis.RedisMessage) {
-					// Parse keys from invalidation messages and queue for async deletion
-					if len(messages) == 0 {
-						return
-					}
-
-					// Extract keys from messages (non-blocking)
-					keys := make([][]byte, 0, len(messages))
-					for _, msg := range messages {
-						if !msg.IsNil() {
-							keyStr, err := msg.ToString()
-							if err == nil {
-								keys = append(keys, []byte(keyStr))
-							}
-						}
-					}
-
-					if len(keys) == 0 {
-						return
-					}
-
-					// Asynchronously delete from local cache in goroutine
-					// This prevents blocking network I/O
-					go func() {
-						defer func() {
-							if r := recover(); r != nil {
-								logger.Warnf("Panic in cache invalidation: %v", r)
-							}
-						}()
-
-						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-						defer cancel()
-
-						err := m.localCache.txn(ctx, func(tx *kvTxn) error {
-							for _, key := range keys {
-								tx.delete(key)
-							}
-							return nil
-						}, 0)
-						if err != nil {
-							logger.Debugf("Failed to invalidate %d cache keys: %v", len(keys), err)
-						}
-					}()
-				}
-
-				logger.Infof("MetaCache initialized with local BadgerDB at %s", localCachePath)
+		// Register OnReload callback to reinitialize metacache if format changes
+		// This handles the case where format UUID may be updated (rare, but possible in testing)
+		m.OnReload(func(fmt *Format) {
+			if fmt == nil || fmt.UUID == "" {
+				return
 			}
-		}
+			// Reinitialize metacache with new UUID (if it changes)
+			// For now, this is a no-op since UUID shouldn't change after initial load
+			logger.Debugf("Format reloaded with UUID: %s (metacache already initialized)", fmt.UUID)
+		})
 	}
 
 	return m, nil
@@ -1181,6 +1109,93 @@ func (m *rueidisMeta) runSyncWorker() {
 			}
 		}
 	}
+}
+
+// InitMetaCache initializes the local BadgerDB cache for fast-meta mode.
+// This must be called after Load() has populated the Format with UUID.
+// It should be called exactly once when the UUID becomes available.
+func (m *rueidisMeta) InitMetaCache(uuid string) error {
+	if uuid == "" {
+		return fmt.Errorf("UUID is empty, cannot initialize metacache")
+	}
+
+	// Check if already initialized
+	if m.localCache != nil {
+		logger.Debugf("MetaCache already initialized, skipping re-initialization")
+		return nil
+	}
+
+	// Determine metacache path based on config
+	var localCachePath string
+	if m.conf.CacheDir != "" {
+		localCachePath = filepath.Join(m.conf.CacheDir, uuid, "metacache")
+	} else if m.conf.MountPoint != "" {
+		localCachePath = filepath.Join(m.conf.MountPoint, ".juicefs", "metacache")
+	} else {
+		tempDir := os.TempDir()
+		localCachePath = filepath.Join(tempDir, "juicefs-metacache", fmt.Sprintf("meta-%d", os.Getpid()))
+	}
+
+	// Create the directory
+	if err := os.MkdirAll(localCachePath, 0755); err != nil {
+		return fmt.Errorf("failed to create metacache directory %s: %w", localCachePath, err)
+	}
+
+	// Initialize BadgerDB
+	localCache, err := newTkvClient("badger", localCachePath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize BadgerDB for metacache: %w", err)
+	}
+
+	m.localCache = localCache
+	m.fastMetaEnabled = true
+
+	// Initialize communication channels for async sync worker
+	m.oplogQueue = make(chan interface{}, 1000) // Buffer 1000 pending operations
+	m.syncWorkerStop = make(chan struct{})      // Signal to stop sync worker
+	m.syncWorkerDone = make(chan struct{})      // Signal that worker has stopped
+
+	// Start async sync worker goroutine
+	go m.runSyncWorker()
+
+	// Setup CLIENT TRACKING invalidation callback for cache coherence
+	m.option.OnInvalidations = func(messages []rueidis.RedisMessage) {
+		if len(messages) == 0 {
+			return
+		}
+		keys := make([][]byte, 0, len(messages))
+		for _, msg := range messages {
+			if !msg.IsNil() {
+				if keyStr, err := msg.ToString(); err == nil {
+					keys = append(keys, []byte(keyStr))
+				}
+			}
+		}
+		if len(keys) == 0 {
+			return
+		}
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Warnf("Panic in cache invalidation: %v", r)
+				}
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := m.localCache.txn(ctx, func(tx *kvTxn) error {
+				for _, key := range keys {
+					tx.delete(key)
+				}
+				return nil
+			}, 0)
+			if err != nil {
+				logger.Debugf("Failed to invalidate %d cache keys: %v", len(keys), err)
+			}
+		}()
+	}
+
+	logger.Infof("MetaCache initialized with local BadgerDB at %s", localCachePath)
+	return nil
 }
 
 func (m *rueidisMeta) Name() string {

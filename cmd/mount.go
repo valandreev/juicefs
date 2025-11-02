@@ -27,6 +27,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -587,6 +588,23 @@ func mount(c *cli.Context) error {
 		format, err = metaCli.Load(true)
 		if err != nil {
 			return err
+		}
+
+		// Initialize MetaCache for fast-meta mode if format UUID is available
+		// This must happen after Load() when the UUID is populated.
+		// We use reflection to check if the metaCli has InitMetaCache method.
+		if format.UUID != "" {
+			method := reflect.ValueOf(metaCli).MethodByName("InitMetaCache")
+			if method.IsValid() {
+				results := method.Call([]reflect.Value{reflect.ValueOf(format.UUID)})
+				if len(results) > 0 {
+					if errVal := results[0].Interface(); errVal != nil {
+						if e, ok := errVal.(error); ok {
+							logger.Warnf("Failed to initialize metacache: %v", e)
+						}
+					}
+				}
+			}
 		}
 	}
 
