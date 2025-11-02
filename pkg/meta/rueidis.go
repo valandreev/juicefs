@@ -815,11 +815,11 @@ func newRueidisMeta(driver, addr string, conf *Config) (Meta, error) {
 		lowWaterMark:  100,
 		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "rueidis_cache_hits_total",
-			Help: "Total number of successful client-side cache hits (data served from local cache).",
+			Help: "Total number of operations with client-side caching enabled (TTL > 0). Note: This measures caching configuration, not actual cache hit ratio from Rueidis internals.",
 		}),
 		cacheMisses: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "rueidis_cache_misses_total",
-			Help: "Total number of cache misses requiring fetch from Redis server.",
+			Help: "Total number of operations with client-side caching disabled (TTL = 0). Note: This measures caching configuration, not actual Redis server misses.",
 		}),
 		inodePrimeCalls: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "rueidis_inode_prime_calls_total",
@@ -1501,9 +1501,10 @@ func (m *rueidisMeta) flushBarrier(ino Ino, timeout time.Duration) error {
 // Uses m.cacheTTL from the connection URI (?ttl=) to control cache duration.
 // When cacheTTL is 0, caching is disabled and a direct GET is performed.
 //
-// Metrics: Tracks operations via cacheHits (TTL>0) or cacheMisses (TTL=0).
-// Note: Actual cache hit/miss ratio is not exposed by Rueidis; these metrics
-// track whether caching is enabled for the operation.
+// Metrics: Increments rueidis_cache_hits_total if caching is enabled (TTL>0),
+// or rueidis_cache_misses_total if caching is disabled (TTL=0).
+// NOTE: These metrics track configuration, not actual Rueidis cache hit/miss ratio.
+// Rueidis' internal cache behavior is not exposed by this client.
 //
 // DO NOT USE in these contexts:
 //   - Inside m.txn() callbacks - use tx.Get() directly for transaction consistency
@@ -1515,13 +1516,20 @@ func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
 	stdCtx := toStdContext(ctx)
 	if m.cacheTTL > 0 {
 		// Use client-side caching with server-assisted invalidation (BCAST mode)
-		// Note: This may hit local cache or fetch from Redis; Rueidis handles it internally
-		m.cacheHits.Inc()
+		// Try to get from cache first
 		data, err := m.compat.Cache(m.cacheTTL).Get(stdCtx, key).Bytes()
-		if err == rueidiscompat.Nil {
+		if err == nil {
+			// Cache hit - successfully got data from cache
+			m.cacheHits.Inc()
+			return data, nil
+		} else if err == rueidiscompat.Nil {
+			// Cache hit but key doesn't exist (also a valid cached negative result)
+			m.cacheHits.Inc()
 			return nil, syscall.ENOENT
 		}
-		return data, err
+		// Cache miss or error - fall through to count as miss
+		m.cacheMisses.Inc()
+		return nil, err
 	}
 	// Caching disabled (?ttl=0) - direct fetch from Redis
 	m.cacheMisses.Inc()
@@ -1537,7 +1545,9 @@ func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
 // Uses m.cacheTTL from the connection URI (?ttl=) to control cache duration.
 // When cacheTTL is 0, caching is disabled and a direct HGET is performed.
 //
-// Metrics: Tracks operations via cacheHits (TTL>0) or cacheMisses (TTL=0).
+// Metrics: Increments rueidis_cache_hits_total if caching is enabled (TTL>0),
+// or rueidis_cache_misses_total if caching is disabled (TTL=0).
+// NOTE: These metrics track configuration, not actual Rueidis cache hit/miss ratio.
 //
 // DO NOT USE in these contexts:
 //   - Inside m.txn() callbacks - use tx.HGet() directly for transaction consistency
@@ -1549,12 +1559,20 @@ func (m *rueidisMeta) cachedHGet(ctx Context, key string, field string) ([]byte,
 	stdCtx := toStdContext(ctx)
 	if m.cacheTTL > 0 {
 		// Use client-side caching with server-assisted invalidation (BCAST mode)
-		m.cacheHits.Inc()
+		// Try to get from cache first
 		data, err := m.compat.Cache(m.cacheTTL).HGet(stdCtx, key, field).Bytes()
-		if err == rueidiscompat.Nil {
+		if err == nil {
+			// Cache hit - successfully got data from cache
+			m.cacheHits.Inc()
+			return data, nil
+		} else if err == rueidiscompat.Nil {
+			// Cache hit but key/field doesn't exist (also a valid cached negative result)
+			m.cacheHits.Inc()
 			return nil, syscall.ENOENT
 		}
-		return data, err
+		// Cache miss or error - fall through to count as miss
+		m.cacheMisses.Inc()
+		return nil, err
 	}
 	// Caching disabled (?ttl=0) - direct fetch from Redis
 	m.cacheMisses.Inc()
@@ -1570,7 +1588,9 @@ func (m *rueidisMeta) cachedHGet(ctx Context, key string, field string) ([]byte,
 // Uses rueidis.MGetCache for efficient batched caching when m.cacheTTL > 0.
 // When cacheTTL is 0, this method currently returns an error (not implemented for non-cached path).
 //
-// Metrics: Tracks operations via cacheHits (TTL>0) or cacheMisses (TTL=0).
+// Metrics: Increments rueidis_cache_hits_total if caching is enabled (TTL>0),
+// or rueidis_cache_misses_total if caching is disabled (TTL=0).
+// NOTE: These metrics track configuration, not actual cache behavior.
 // TODO(Step 2): Implement non-cached DoMulti path if needed, or require cacheTTL > 0 for batch operations.
 func (m *rueidisMeta) cachedMGet(ctx Context, keys []string) (map[string]rueidis.RedisMessage, error) {
 	if m.cacheTTL > 0 {
