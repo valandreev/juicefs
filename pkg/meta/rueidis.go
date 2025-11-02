@@ -1511,11 +1511,13 @@ func (m *rueidisMeta) flushBarrier(ino Ino, timeout time.Duration) error {
 //   - Backup/restore (rueidis_bak.go) - require authoritative data
 //   - Any write path that needs read-modify-write atomicity
 func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
+	// Convert to standard context for Rueidis (always uses Background() on macOS to avoid EINTR)
+	stdCtx := toStdContext(ctx)
 	if m.cacheTTL > 0 {
 		// Use client-side caching with server-assisted invalidation (BCAST mode)
 		// Note: This may hit local cache or fetch from Redis; Rueidis handles it internally
 		m.cacheHits.Inc()
-		data, err := m.compat.Cache(m.cacheTTL).Get(ctx, key).Bytes()
+		data, err := m.compat.Cache(m.cacheTTL).Get(stdCtx, key).Bytes()
 		if err == rueidiscompat.Nil {
 			return nil, syscall.ENOENT
 		}
@@ -1523,7 +1525,7 @@ func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
 	}
 	// Caching disabled (?ttl=0) - direct fetch from Redis
 	m.cacheMisses.Inc()
-	data, err := m.compat.Get(ctx, key).Bytes()
+	data, err := m.compat.Get(stdCtx, key).Bytes()
 	if err == rueidiscompat.Nil {
 		return nil, syscall.ENOENT
 	}
@@ -1543,10 +1545,12 @@ func (m *rueidisMeta) cachedGet(ctx Context, key string) ([]byte, error) {
 //   - Backup/restore (rueidis_bak.go) - require authoritative data
 //   - Any write path that needs read-modify-write atomicity
 func (m *rueidisMeta) cachedHGet(ctx Context, key string, field string) ([]byte, error) {
+	// Convert to standard context for Rueidis (always uses Background() on macOS to avoid EINTR)
+	stdCtx := toStdContext(ctx)
 	if m.cacheTTL > 0 {
 		// Use client-side caching with server-assisted invalidation (BCAST mode)
 		m.cacheHits.Inc()
-		data, err := m.compat.Cache(m.cacheTTL).HGet(ctx, key, field).Bytes()
+		data, err := m.compat.Cache(m.cacheTTL).HGet(stdCtx, key, field).Bytes()
 		if err == rueidiscompat.Nil {
 			return nil, syscall.ENOENT
 		}
@@ -1554,7 +1558,7 @@ func (m *rueidisMeta) cachedHGet(ctx Context, key string, field string) ([]byte,
 	}
 	// Caching disabled (?ttl=0) - direct fetch from Redis
 	m.cacheMisses.Inc()
-	data, err := m.compat.HGet(ctx, key, field).Bytes()
+	data, err := m.compat.HGet(stdCtx, key, field).Bytes()
 	if err == rueidiscompat.Nil {
 		return nil, syscall.ENOENT
 	}
@@ -1660,16 +1664,22 @@ func replaceErrnoCompat(txf func(tx rueidiscompat.Tx) error) func(tx rueidiscomp
 //
 // Background operations (trash cleanup, slice cleanup, session cleanup) may pass
 // nil context. This function provides a safe fallback to context.Background().
+//
+// CRITICAL macOS/FUSE FIX: On macOS, FUSE operations frequently receive EINTR signals
+// which cancel the context. If we use the cancelled context for Redis operations,
+// ALL Redis commands fail with "interrupted system call", causing:
+// - ls: fts_read: Interrupted system call
+// - Empty filesystem
+// - Watchdog failures
+//
+// Solution: Use context.Background() for ALL Redis operations. This is safe because:
+// 1. Redis metadata operations are fast (milliseconds)
+// 2. They don't do long I/O - just quick key-value lookups
+// 3. FUSE will handle user cancellations at a higher level
+// 4. This matches how redis:// driver works (no context cancellation issues)
 func toStdContext(ctx Context) context.Context {
-	if ctx == nil {
-		// Background operations (trash cleanup, etc.) may pass nil
-		// Use Background() as safe fallback - no cancellation, no deadline
-		return context.Background()
-	}
-	// JuiceFS Context embeds context.Context via interface embedding.
-	// Go automatically extracts the embedded interface on assignment.
-	// This preserves all context properties (cancellation, deadlines, values).
-	return ctx
+	// ALWAYS use Background context to avoid EINTR/cancellation issues on macOS FUSE
+	return context.Background()
 }
 
 // isCanceled safely checks if context is canceled, handling nil context.
@@ -1739,7 +1749,8 @@ func (m *rueidisMeta) txn(ctx Context, txf func(tx rueidiscompat.Tx) error, keys
 			return syscall.EINTR
 		}
 
-		err := m.compat.Watch(ctx, replaceErrnoCompat(txf), keys...)
+		stdCtx := toStdContext(ctx)
+		err := m.compat.Watch(stdCtx, replaceErrnoCompat(txf), keys...)
 
 		// Handle errNo type (internal error wrapper)
 		if eno, ok := err.(errNo); ok {
@@ -4950,11 +4961,10 @@ func (m *rueidisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*
 		return m.redisMeta.doReaddir(ctx, inode, plus, entries, limit)
 	}
 
-	// Convert JuiceFS Context to standard context.Context for Rueidis API.
-	// This is critical for background operations (trash cleanup) which may pass nil context.
-	// The conversion preserves client-side caching (CSC) - caching is controlled by
-	// Cache(ttl) and CLIENT TRACKING BCAST, not by context type.
-	stdCtx := toStdContext(ctx)
+	// Use Background context for Redis operations on macOS - FUSE contexts get cancelled by signals (EINTR)
+	// causing "fts_read: Interrupted system call" errors in ls/readdir operations.
+	// Background context is never cancelled, allowing readdir to complete successfully.
+	// This is safe because HScan is a fast metadata operation (reading directory entries from Redis).
 
 	var (
 		cursor  uint64
@@ -4963,7 +4973,7 @@ func (m *rueidisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*
 	)
 
 	for {
-		kvs, next, err := m.compat.HScan(stdCtx, key, cursor, "*", 10000).Result()
+		kvs, next, err := m.compat.HScan(context.Background(), key, cursor, "*", 10000).Result()
 		if err != nil {
 			return errno(err)
 		}
@@ -5062,18 +5072,71 @@ func (m *rueidisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino,
 	)
 
 	if len(m.shaLookup) > 0 && attr != nil && !m.conf.CaseInsensi && m.prefix == "" {
-		cmd := m.compat.EvalSha(ctx, m.shaLookup, []string{entryKey, name})
+		// Use Background context for Lua scripts on macOS - FUSE contexts get cancelled by signals (EINTR)
+		// causing infinite retry loops. Background context is never cancelled, allowing scripts to complete.
+		// This is safe because Lua scripts are fast metadata operations that should always complete.
+		logger.Debugf("rueidis doLookup: parent=%d name=%s entryKey=%s shaLookup=%s", parent, name, entryKey, m.shaLookup)
+		cmd := m.compat.EvalSha(context.Background(), m.shaLookup, []string{entryKey, name})
 		res, evalErr := cmd.Result()
+		logger.Debugf("rueidis doLookup: cmd.Result() returned res=%v evalErr=%v", res, evalErr)
 		var (
 			returnedIno  int64
 			returnedAttr string
 		)
 		if st := m.handleLuaResult("lookup", res, evalErr, &returnedIno, &returnedAttr); st == 0 {
+			logger.Debugf("rueidis doLookup: SUCCESS returnedIno=%d", returnedIno)
 			foundIno = Ino(returnedIno)
 			encodedAttr = []byte(returnedAttr)
 		} else if st == syscall.EAGAIN {
-			return m.doLookup(ctx, parent, name, inode, attr)
+			logger.Warnf("rueidis doLookup: Got EAGAIN (NOSCRIPT or EINTR), will retry")
+			// EAGAIN from NOSCRIPT (script needs reload) or EINTR (signal interrupted)
+			// Retry with limited attempts to prevent infinite loops - max 3 attempts
+			// CRITICAL: Use context.Background() for retries - FUSE context is cancelled by EINTR!
+			retryCount := 0
+			lastStatus := st
+			for retryCount < 3 {
+				logger.Debugf("rueidis doLookup: retry attempt %d", retryCount+1)
+				// Use Background context - original ctx is cancelled by EINTR signal from FUSE!
+				// This allows the Redis command to complete without being interrupted again.
+				cmd2 := m.compat.EvalSha(context.Background(), m.shaLookup, []string{entryKey, name})
+				res2, evalErr2 := cmd2.Result()
+				logger.Debugf("rueidis doLookup: retry res2=%v evalErr2=%v", res2, evalErr2)
+				if st2 := m.handleLuaResult("lookup", res2, evalErr2, &returnedIno, &returnedAttr); st2 == 0 {
+					logger.Debugf("rueidis doLookup: RETRY SUCCESS returnedIno=%d", returnedIno)
+					foundIno = Ino(returnedIno)
+					encodedAttr = []byte(returnedAttr)
+					break
+				} else if st2 == syscall.EAGAIN {
+					logger.Warnf("rueidis doLookup: retry %d still EAGAIN", retryCount+1)
+					lastStatus = st2
+					retryCount++
+					// For NOSCRIPT, give time to reload; for EINTR, give OS time to settle
+					time.Sleep(time.Millisecond * time.Duration(1+retryCount))
+					continue
+				} else if st2 == syscall.ENOENT {
+					// ENOENT = file not found in Redis, this is normal - use fallback path
+					logger.Debugf("rueidis doLookup: retry got ENOENT (file not found), using fallback")
+					break
+				} else if st2 != syscall.ENOTSUP {
+					logger.Errorf("rueidis doLookup: retry failed with st2=%v", st2)
+					return st2
+				} else {
+					logger.Debugf("rueidis doLookup: retry got ENOTSUP, breaking")
+					break
+				}
+			}
+			// If we exhausted retries and still have EAGAIN, use fallback instead of returning error
+			// This allows the fallback cache read path to handle the lookup
+			if retryCount >= 3 && lastStatus == syscall.EAGAIN {
+				logger.Warnf("rueidis doLookup: exhausted retries with EAGAIN, using fallback")
+				// foundIno will be 0, triggering fallback to cachedHGet below
+			}
+		} else if st == syscall.ENOENT {
+			// ENOENT = file not found in Redis, this is normal - use fallback path
+			logger.Debugf("rueidis doLookup: got ENOENT (file not found), using fallback")
+			// foundIno will be 0, triggering fallback to cachedHGet below
 		} else if st != syscall.ENOTSUP {
+			logger.Errorf("rueidis doLookup: handleLuaResult returned st=%v (not EAGAIN, not 0, not ENOENT, not ENOTSUP)", st)
 			return st
 		}
 	}
@@ -5126,22 +5189,128 @@ func (m *rueidisMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, 
 		args = append(args, strconv.FormatUint(uint64(gid), 10))
 	}
 
-	cmd := m.compat.EvalSha(ctx, m.shaResolve, keys, args...)
+	// Use Background context for Lua scripts on macOS - FUSE contexts get cancelled by signals (EINTR)
+	cmd := m.compat.EvalSha(context.Background(), m.shaResolve, keys, args...)
 	res, err := cmd.Result()
+	logger.Debugf("rueidis Resolve: cmd.Result() returned res=%v err=%v", res, err)
 	var (
 		returnedIno  int64
 		returnedAttr string
 	)
 	st := m.handleLuaResult("resolve", res, err, &returnedIno, &returnedAttr)
 	if st == 0 {
+		logger.Debugf("rueidis Resolve: SUCCESS returnedIno=%d", returnedIno)
 		if inode != nil {
 			*inode = Ino(returnedIno)
 		}
 		m.parseAttr([]byte(returnedAttr), attr)
 	} else if st == syscall.EAGAIN {
-		return m.Resolve(ctx, parent, path, inode, attr)
+		logger.Warnf("rueidis Resolve: Got EAGAIN, will retry")
+		// EAGAIN from NOSCRIPT (script needs reload) or EINTR (signal interrupted)
+		// Retry with limited attempts to prevent infinite loops - max 3 attempts
+		// CRITICAL: Use context.Background() for retries - FUSE context is cancelled by EINTR!
+		retryCount := 0
+		for retryCount < 3 {
+			logger.Debugf("rueidis Resolve: retry attempt %d", retryCount+1)
+			// Use Background context - original ctx is cancelled by EINTR signal from FUSE!
+			// This allows the Redis command to complete without being interrupted again.
+			cmd2 := m.compat.EvalSha(context.Background(), m.shaResolve, keys, args...)
+			res2, err2 := cmd2.Result()
+			logger.Debugf("rueidis Resolve: retry res2=%v err2=%v", res2, err2)
+			if st2 := m.handleLuaResult("resolve", res2, err2, &returnedIno, &returnedAttr); st2 == 0 {
+				logger.Debugf("rueidis Resolve: RETRY SUCCESS returnedIno=%d", returnedIno)
+				if inode != nil {
+					*inode = Ino(returnedIno)
+				}
+				m.parseAttr([]byte(returnedAttr), attr)
+				return 0
+			} else if st2 == syscall.EAGAIN {
+				logger.Warnf("rueidis Resolve: retry %d still EAGAIN", retryCount+1)
+				retryCount++
+				// For NOSCRIPT, give time to reload; for EINTR, give OS time to settle
+				time.Sleep(time.Millisecond * time.Duration(1+retryCount))
+				continue
+			} else if st2 != syscall.ENOTSUP {
+				logger.Errorf("rueidis Resolve: retry failed with st2=%v", st2)
+				return st2
+			} else {
+				logger.Debugf("rueidis Resolve: retry got ENOTSUP, breaking")
+				break
+			}
+		}
+		logger.Warnf("rueidis Resolve: exhausted retries with EAGAIN")
 	}
 	return st
+}
+
+// handleLuaResult overrides the base redisMeta implementation to use m.compat instead of m.rdb
+// This ensures rueidis compatibility for Lua script error handling and retry logic
+func (m *rueidisMeta) handleLuaResult(op string, res interface{}, err error, returnedIno *int64, returnedAttr *string) syscall.Errno {
+	if m.compat == nil {
+		// Fallback to redisMeta implementation if compat is not initialized
+		return m.redisMeta.handleLuaResult(op, res, err, returnedIno, returnedAttr)
+	}
+
+	if err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "NOSCRIPT") {
+			var err2 error
+			switch op {
+			case "lookup":
+				m.shaLookup, err2 = m.compat.ScriptLoad(Background(), scriptLookup).Result()
+			case "resolve":
+				m.shaResolve, err2 = m.compat.ScriptLoad(Background(), scriptResolve).Result()
+			default:
+				return syscall.ENOTSUP
+			}
+			if err2 == nil {
+				logger.Infof("loaded script succeed for %s", op)
+				return syscall.EAGAIN
+			} else {
+				logger.Warnf("load script %s: %s", op, err2)
+				return syscall.ENOTSUP
+			}
+		} else if strings.Contains(msg, "interrupted") {
+			// EINTR on macOS/Linux from FUSE signals - retry the operation
+			return syscall.EAGAIN
+		} else if strings.Contains(msg, "ENOENT") {
+			return syscall.ENOENT
+		} else if strings.Contains(msg, "EACCESS") {
+			return syscall.EACCES
+		} else if strings.Contains(msg, "ENOTDIR") {
+			return syscall.ENOTDIR
+		} else if strings.Contains(msg, "ENOTSUP") {
+			return syscall.ENOTSUP
+		} else {
+			logger.Warnf("unexpected error for %s: %s", op, msg)
+			switch op {
+			case "lookup":
+				m.shaLookup = ""
+			case "resolve":
+				m.shaResolve = ""
+			}
+			return syscall.ENOTSUP
+		}
+	}
+	vals, ok := res.([]interface{})
+	if !ok {
+		logger.Errorf("invalid script result: %v", res)
+		return syscall.ENOTSUP
+	}
+	*returnedIno, ok = vals[0].(int64)
+	if !ok {
+		logger.Errorf("invalid script result: %v", res)
+		return syscall.ENOTSUP
+	}
+	if vals[1] == nil {
+		return syscall.ENOTSUP
+	}
+	*returnedAttr, ok = vals[1].(string)
+	if !ok {
+		logger.Errorf("invalid script result: %v", res)
+		return syscall.ENOTSUP
+	}
+	return 0
 }
 
 func (m *rueidisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
@@ -5174,12 +5343,14 @@ func (m *rueidisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errn
 		}
 
 		// Step 2: Cache miss or local read failed - fetch from Redis
+		// Use toStdContext to convert to Background() on macOS (avoid EINTR)
+		stdCtx := toStdContext(ctx)
 		var data []byte
 		var err error
 		if m.cacheTTL > 0 {
-			data, err = m.compat.Cache(m.cacheTTL).Get(ctx, keyStr).Bytes()
+			data, err = m.compat.Cache(m.cacheTTL).Get(stdCtx, keyStr).Bytes()
 		} else {
-			data, err = m.compat.Get(ctx, keyStr).Bytes()
+			data, err = m.compat.Get(stdCtx, keyStr).Bytes()
 		}
 
 		if err != nil {
@@ -5204,12 +5375,14 @@ func (m *rueidisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errn
 	}
 
 	// Standard path: use client-side caching without local cache
+	// Use toStdContext to convert to Background() on macOS (avoid EINTR)
+	stdCtx := toStdContext(ctx)
 	var data []byte
 	var err error
 	if m.cacheTTL > 0 {
-		data, err = m.compat.Cache(m.cacheTTL).Get(ctx, m.inodeKey(inode)).Bytes()
+		data, err = m.compat.Cache(m.cacheTTL).Get(stdCtx, m.inodeKey(inode)).Bytes()
 	} else {
-		data, err = m.compat.Get(ctx, m.inodeKey(inode)).Bytes()
+		data, err = m.compat.Get(stdCtx, m.inodeKey(inode)).Bytes()
 	}
 
 	if err != nil {

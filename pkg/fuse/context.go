@@ -19,7 +19,6 @@ package fuse
 import (
 	"context"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -132,8 +131,12 @@ func (c *fuseContext) WithValue(k, v interface{}) meta.Context {
 	return &wc
 }
 
+// CRITICAL FIX: On macOS with rueidis, returning syscall.EINTR causes ALL Redis operations to fail
+// because rueidis checks ctx.Err() and interprets EINTR as a real error ("interrupted system call").
+// This breaks ls, readdir, getattr, and all FUSE operations.
+// Solution: Return nil - FUSE operations are fast and don't need cancellation.
 func (c *fuseContext) Err() error {
-	return syscall.EINTR
+	return nil // Was: syscall.EINTR
 }
 
 // func (c *fuseContext) Done() <-chan struct{} {
