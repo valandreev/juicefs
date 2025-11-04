@@ -13,6 +13,7 @@
 package meta
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -991,6 +992,39 @@ func extractKeysFromOplog(oplog *metaOplog) []string {
 	return keys
 }
 
+// isConflictError detects if an error is due to Redis transaction conflict (WATCH failed)
+// This happens when another client modified the same keys we're trying to update
+func isConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Redis WATCH failure indicators
+	return strings.Contains(errStr, "WATCH") ||
+		strings.Contains(errStr, "TxFailed") ||
+		strings.Contains(errStr, "conflict") ||
+		strings.Contains(errStr, "aborted")
+}
+
+// isNetworkError detects if an error is due to network issues
+// This includes connection failures, timeouts, and I/O errors
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Common network error indicators
+	return strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		strings.Contains(errStr, "network") ||
+		strings.Contains(errStr, "EOF") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "ECONNREFUSED") ||
+		strings.Contains(errStr, "ECONNRESET")
+}
+
 // syncOplog synchronizes a single oplog to Redis using optimistic locking (WATCH/MULTI/EXEC)
 // If the oplog syncs successfully, it's removed from BadgerDB
 // If there's a conflict (WATCH fails), the oplog remains for retry/manual intervention
@@ -1049,8 +1083,37 @@ func (m *rueidisMeta) syncOplog(ctx Context, oplog *metaOplog) error {
 	}, keys...)
 
 	if err != nil {
-		// Transaction failed - return error to caller
-		// Error handling will be done in Phase 5
+		// Check error type and handle accordingly
+		if isConflictError(err) {
+			// WATCH failed - another client modified the same keys
+			logger.Errorf("Conflict detected for oplog %s: local changes lost (another client modified same keys)", oplog.ID)
+
+			// Rollback: remove local changes and the oplog
+			rollbackErr := m.rollbackOplog(ctx, oplog)
+			if rollbackErr != nil {
+				logger.Errorf("Failed to rollback oplog %s: %v", oplog.ID, rollbackErr)
+				return fmt.Errorf("conflict and rollback failed: %w", rollbackErr)
+			}
+
+			// Oplog was removed during rollback
+			return nil
+		}
+
+		if isNetworkError(err) {
+			// Network error - mark as read-only and keep oplog for retry
+			logger.Errorf("Network error syncing oplog %s: %v", oplog.ID, err)
+
+			if !m.isReadOnly.Load() {
+				m.isReadOnly.Store(true)
+				logger.Errorf("MetaCache entering READ-ONLY mode due to network failure")
+			}
+
+			// Keep oplog for retry (don't delete from BadgerDB)
+			return fmt.Errorf("network error (read-only mode): %w", err)
+		}
+
+		// Other error
+		logger.Errorf("Unknown error syncing oplog %s: %v", oplog.ID, err)
 		return fmt.Errorf("failed to sync oplog %s to Redis: %w", oplog.ID, err)
 	}
 
@@ -1069,6 +1132,144 @@ func (m *rueidisMeta) syncOplog(ctx Context, oplog *metaOplog) error {
 	return nil
 }
 
+// rollbackOplog removes local changes made by this oplog and deletes the oplog itself
+// This is called when a conflict is detected (another client modified same keys)
+func (m *rueidisMeta) rollbackOplog(ctx Context, oplog *metaOplog) error {
+	return m.localCache.txn(ctx, func(tx *kvTxn) error {
+		// Delete all keys that were modified by this oplog
+		for _, op := range oplog.Ops {
+			if op != nil && len(op.Key) > 0 {
+				tx.delete(op.Key)
+			}
+		}
+
+		// Delete the oplog itself
+		oplogKey := []byte(oplog.ID)
+		tx.delete(oplogKey)
+
+		return nil
+	}, 0)
+}
+
+// invalidateReadCache removes all cached data (except oplogs) from BadgerDB
+// This is called after network recovery to ensure consistency with Redis
+func (m *rueidisMeta) invalidateReadCache(ctx Context) error {
+	logger.Info("Invalidating metacache read data")
+
+	var keysToDelete [][]byte
+
+	// Scan all keys to find non-oplog entries
+	err := m.localCache.scan([]byte{}, func(key, value []byte) bool {
+		// Skip oplog keys (they need to be synced)
+		if bytes.HasPrefix(key, []byte("oplog:")) {
+			return true // continue scanning
+		}
+
+		// Collect regular cache keys for deletion
+		keysToDelete = append(keysToDelete, append([]byte(nil), key...))
+		return true
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to scan cache: %w", err)
+	}
+
+	// Delete collected keys
+	if len(keysToDelete) > 0 {
+		err = m.localCache.txn(ctx, func(tx *kvTxn) error {
+			for _, key := range keysToDelete {
+				tx.delete(key)
+			}
+			return nil
+		}, 0)
+		if err != nil {
+			return fmt.Errorf("failed to delete cache keys: %w", err)
+		}
+	}
+
+	logger.Infof("Invalidated %d cache entries", len(keysToDelete))
+	return nil
+}
+
+// bootstrapMetaCache performs recovery and initialization after mount with fast-meta enabled
+// It recovers unsent oplogs from previous session and invalidates read cache
+func (m *rueidisMeta) bootstrapMetaCache() {
+	ctx := Background()
+
+	logger.Info("MetaCache bootstrap starting")
+
+	// Start in read-only mode during bootstrap
+	m.isReadOnly.Store(true)
+
+	// Phase 1: Recover oplogs from BadgerDB
+	var oplogs []*metaOplog
+	err := m.localCache.scan([]byte("oplog:"), func(key, value []byte) bool {
+		var oplog metaOplog
+		if err := json.Unmarshal(value, &oplog); err != nil {
+			logger.Warnf("Failed to unmarshal oplog %s: %v", string(key), err)
+			return true // continue scanning
+		}
+		oplogs = append(oplogs, &oplog)
+		return true
+	})
+
+	if err != nil {
+		logger.Errorf("Failed to scan oplogs during bootstrap: %v", err)
+	}
+
+	if len(oplogs) > 0 {
+		logger.Infof("Found %d unsent oplogs from previous session, queuing for sync", len(oplogs))
+
+		// Sort by timestamp (oldest first) for consistent ordering
+		sort.Slice(oplogs, func(i, j int) bool {
+			return oplogs[i].Timestamp.Before(oplogs[j].Timestamp)
+		})
+
+		// Queue all oplogs for sync
+		for _, oplog := range oplogs {
+			select {
+			case m.oplogQueue <- oplog:
+				logger.Debugf("Queued oplog %s for recovery sync", oplog.ID)
+			default:
+				logger.Warnf("Oplog queue full during bootstrap, some oplogs may be delayed")
+			}
+		}
+	}
+
+	// Phase 2: Invalidate read cache (we missed CLIENT TRACKING updates during downtime)
+	logger.Info("Invalidating read cache (missed updates during offline period)")
+	if err := m.invalidateReadCache(ctx); err != nil {
+		logger.Errorf("Failed to invalidate cache during bootstrap: %v", err)
+	}
+
+	// Phase 3: Wait for oplog queue to drain before exiting read-only mode
+	// Give sync worker time to process recovered oplogs
+	go func() {
+		timeout := time.After(30 * time.Second)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-timeout:
+				logger.Warn("Bootstrap timeout (30s), exiting read-only mode anyway")
+				m.isReadOnly.Store(false)
+				logger.Info("Bootstrap complete, filesystem is writable")
+				return
+
+			case <-ticker.C:
+				// Check if queue is mostly empty (allow 1-2 items for new ops)
+				if len(m.oplogQueue) <= 1 {
+					logger.Info("Bootstrap complete: recovered oplogs synced, exiting read-only mode")
+					m.isReadOnly.Store(false)
+					logger.Info("MetaCache bootstrap finished, filesystem is writable")
+					return
+				}
+			}
+		}
+	}()
+}
+
 func (m *rueidisMeta) runSyncWorker() {
 	logger.Debugf("MetaCache sync worker started")
 	defer func() {
@@ -1079,12 +1280,56 @@ func (m *rueidisMeta) runSyncWorker() {
 	// Background context for sync operations
 	syncCtx := Background()
 
+	// Retry queue for failed oplogs
+	retryQueue := make([]*metaOplog, 0)
+	retryTicker := time.NewTicker(5 * time.Second)
+	defer retryTicker.Stop()
+
 	// Main event loop: process oplogs from queue and handle stop signal
 	for {
 		select {
 		case <-m.syncWorkerStop:
 			logger.Infof("MetaCache sync worker received stop signal, exiting")
 			return
+
+		case <-retryTicker.C:
+			// Retry failed oplogs every 5 seconds
+			if len(retryQueue) > 0 {
+				logger.Debugf("Retrying %d failed oplogs", len(retryQueue))
+
+				remaining := make([]*metaOplog, 0)
+				recoveryInProgress := false
+
+				for _, oplog := range retryQueue {
+					err := m.syncOplog(syncCtx, oplog)
+					if err != nil {
+						if isNetworkError(err) {
+							// Still network error - keep for next retry
+							remaining = append(remaining, oplog)
+						}
+						// If conflict, oplog is already rolled back and not in remaining
+					} else {
+						// First successful sync after failures
+						if !recoveryInProgress && m.isReadOnly.Load() {
+							recoveryInProgress = true
+						}
+					}
+				}
+
+				retryQueue = remaining
+
+				// If we had successful syncs and no more network errors, try recovery
+				if recoveryInProgress && len(retryQueue) == 0 {
+					logger.Info("All oplogs synced successfully, invalidating read cache and exiting read-only mode")
+
+					if err := m.invalidateReadCache(syncCtx); err != nil {
+						logger.Errorf("Failed to invalidate cache during recovery: %v", err)
+					}
+
+					m.isReadOnly.Store(false)
+					logger.Info("Exited READ-ONLY mode, filesystem is writable again")
+				}
+			}
 
 		case oplogInterface := <-m.oplogQueue:
 			if oplogInterface == nil {
@@ -1101,9 +1346,12 @@ func (m *rueidisMeta) runSyncWorker() {
 			// Sync oplog to Redis
 			err := m.syncOplog(syncCtx, oplog)
 			if err != nil {
-				logger.Errorf("Failed to sync oplog %s: %v", oplog.ID, err)
-				// TODO Phase 5: Implement retry logic and error handling
-				// For now, just log the error - the oplog remains in BadgerDB
+				if isNetworkError(err) {
+					// Add to retry queue for background retry
+					retryQueue = append(retryQueue, oplog)
+					logger.Warnf("Oplog %s queued for retry due to network error", oplog.ID)
+				}
+				// Conflicts are already handled in syncOplog - oplog is rolled back
 			} else {
 				logger.Debugf("Successfully synced oplog %s with %d operations to Redis", oplog.ID, len(oplog.Ops))
 			}
@@ -1195,6 +1443,10 @@ func (m *rueidisMeta) InitMetaCache(uuid string) error {
 	}
 
 	logger.Infof("MetaCache initialized with local BadgerDB at %s", localCachePath)
+
+	// Start bootstrap process: recover unsent oplogs and invalidate read cache
+	go m.bootstrapMetaCache()
+
 	return nil
 }
 
@@ -1739,6 +1991,11 @@ func (m *rueidisMeta) txn(ctx Context, txf func(tx rueidiscompat.Tx) error, keys
 	}
 
 	if m.conf.ReadOnly {
+		return syscall.EROFS
+	}
+
+	// Check if we're in read-only mode due to network failure
+	if m.isReadOnly.Load() {
 		return syscall.EROFS
 	}
 
