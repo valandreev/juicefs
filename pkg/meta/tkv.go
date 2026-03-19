@@ -3215,11 +3215,7 @@ func (m *kvMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Quota
 				} else {
 					id = binary.BigEndian.Uint64([]byte(k[2:])) // skip prefix
 				}
-				quota := m.parseQuota(v)
-				if quota.MaxSpace < 0 && quota.MaxInodes < 0 {
-					continue
-				}
-				quotas[id] = quota
+				quotas[id] =  m.parseQuota(v)
 			}
 		}
 		quotaMaps[i] = quotas
@@ -3284,17 +3280,26 @@ func (m *kvMeta) doSyncVolumeStat(ctx Context) error {
 func (m *kvMeta) doFlushQuotas(ctx Context, quotas []*iQuota) error {
 	return m.txn(ctx, func(tx *kvTxn) error {
 		keys := make([][]byte, 0, len(quotas))
-		qs := make([]*Quota, 0, len(quotas))
+		qs := make([]*iQuota, 0, len(quotas))
 		for _, q := range quotas {
 			key, err := m.getQuotaKey(q.qtype, q.qkey)
 			if err != nil {
 				return err
 			}
 			keys = append(keys, key)
-			qs = append(qs, q.quota)
+			qs = append(qs, q)
 		}
 		for i, v := range tx.gets(keys...) {
 			if len(v) == 0 {
+				if qs[i].qtype == UserQuotaType || qs[i].qtype == GroupQuotaType {
+					quota := &Quota{
+						MaxSpace:   -1,
+						MaxInodes:  -1,
+						UsedSpace:  qs[i].quota.newSpace,
+						UsedInodes: qs[i].quota.newInodes,
+					}
+					tx.set(keys[i], m.packQuota(quota))
+				}
 				continue
 			}
 			if len(v) != 32 {
@@ -3302,8 +3307,8 @@ func (m *kvMeta) doFlushQuotas(ctx Context, quotas []*iQuota) error {
 				continue
 			}
 			q := m.parseQuota(v)
-			q.UsedSpace += qs[i].newSpace
-			q.UsedInodes += qs[i].newInodes
+			q.UsedSpace += qs[i].quota.newSpace
+			q.UsedInodes += qs[i].quota.newInodes
 			tx.set(keys[i], m.packQuota(q))
 		}
 		return nil
