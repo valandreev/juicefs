@@ -4217,6 +4217,19 @@ func (m *dbMeta) doFlushQuotas(ctx Context, quotas []*iQuota) error {
 	})
 }
 
+func (m *dbMeta) cleanUgUsage(ctx Context, qtype uint32) error {
+	if qtype != UserQuotaType && qtype != GroupQuotaType {
+		return errors.Errorf("invalid quota type %d", qtype)
+	}
+
+	return m.txn(func(s *xorm.Session) error {
+		_, err := s.Cols("used_space", "used_inodes").
+			Update(&userGroupQuota{UsedSpace: 0, UsedInodes: 0},
+				&userGroupQuota{Qtype: qtype})
+		return err
+	})
+}
+
 func (m *dbMeta) dumpEntry(s *xorm.Session, inode Ino, typ uint8, e *DumpedEntry, showProgress func(totalIncr, currentIncr int64)) error {
 	n := &node{Inode: inode}
 	ok, err := s.Get(n)
