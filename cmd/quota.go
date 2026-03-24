@@ -229,12 +229,12 @@ func printQuotaResult(qtype uint32, qs map[string]*meta.Quota) {
 	}
 	result[0] = []string{firstCol, "Size", "Used", "Use%", "Inodes", "IUsed", "IUse%"}
 
-	paths := make([]string, 0, len(qs))
+	keys := make([]string, 0, len(qs))
 	for p := range qs {
-		paths = append(paths, p)
+		keys = append(keys, p)
 	}
-	sort.Strings(paths)
-	for _, p := range paths {
+	sort.Strings(keys)
+	for _, p := range keys {
 		q := qs[p]
 		if q.UsedSpace < 0 {
 			logger.Warnf("Used space of %s is negative (%d), please run `juicefs quota check` to fix it", p, q.UsedSpace)
@@ -257,13 +257,7 @@ func printQuotaResult(qtype uint32, qs map[string]*meta.Quota) {
 			iusedR = fmt.Sprintf("%d%%", q.UsedInodes*100/q.MaxInodes)
 		}
 
-		identifier := p
-		if qtype == meta.UserQuotaType {
-			identifier = fmt.Sprintf("UID:%s", p)
-		} else if qtype == meta.GroupQuotaType {
-			identifier = fmt.Sprintf("GID:%s", p)
-		}
-		result = append(result, []string{identifier, size, used, usedR, itotal, iused, iusedR})
+		result = append(result, []string{p, size, used, usedR, itotal, iused, iusedR})
 	}
 	printResult(result, 0, false)
 }
