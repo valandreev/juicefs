@@ -1285,8 +1285,25 @@ func clearSUGID(ctx Context, cur *Attr, set *Attr) {
 	}
 }
 
-func (r *baseMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, attr *Attr) syscall.Errno {
-	return syscall.ENOTSUP
+func (r *baseMeta) Resolve(ctx Context, parent Ino, dpath string, inode *Ino, attr *Attr, force bool) syscall.Errno {
+	if !force {
+		return syscall.ENOTSUP
+	}
+	*inode = RootInode
+	for dpath != "" {
+		ps := strings.SplitN(dpath, "/", 2)
+		if ps[0] != "" {
+			r := r.en.doLookup(ctx, *inode, ps[0], inode, attr)
+			if r != 0 {
+				return r
+			}
+		}
+		if len(ps) == 1 {
+			break
+		}
+		dpath = ps[1]
+	}
+	return 0
 }
 
 func (m *baseMeta) Access(ctx Context, inode Ino, mmask uint8, attr *Attr) syscall.Errno {
@@ -2014,7 +2031,11 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 	*slices = buildSlice(ss)
 	m.of.CacheChunk(inode, indx, *slices)
 	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
-		go m.compactChunk(inode, indx, false, false)
+		tierID := -1
+		if f != nil {
+			tierID = int(f.attr.Tier)
+		}
+		go m.compactChunk(inode, indx, false, false, tierID)
 	}
 	return 0
 }
@@ -2067,9 +2088,9 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
 		if numSlices%100 == 99 || numSlices > 350 {
 			if numSlices < maxSlices {
-				go m.compactChunk(inode, indx, false, false)
+				go m.compactChunk(inode, indx, false, false, int(attr.Tier))
 			} else {
-				m.compactChunk(inode, indx, true, false)
+				m.compactChunk(inode, indx, true, false, int(attr.Tier))
 			}
 		}
 	}
@@ -2640,7 +2661,7 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 		go func() {
 			for c := range ch {
 				logger.Debugf("Compacting chunk %d:%d (%d slices)", c.inode, c.indx, c.slices)
-				m.compactChunk(c.inode, c.indx, false, true)
+				m.compactChunk(c.inode, c.indx, false, true, -1)
 				bar.Increment()
 			}
 			wg.Done()
@@ -2657,7 +2678,7 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 	return 0
 }
 
-func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
+func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID int) {
 	// avoid too many or duplicated compaction
 	k := uint64(inode) + (uint64(indx) << 40)
 	m.Lock()
@@ -2718,7 +2739,14 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 		return
 	}
 	logger.Debugf("compact %d:%d: skipped %d slices (%d bytes) %d slices (%d bytes)", inode, indx, skipped, pos, len(compacted), size)
-	err := m.newMsg(CompactChunk, slices, id)
+	if tierID == -1 {
+		var attr Attr
+		if eno := m.GetAttr(Background(), inode, &attr); eno != 0 {
+			return
+		}
+		tierID = int(attr.Tier)
+	}
+	err := m.newMsg(CompactChunk, slices, id, uint8(tierID))
 	if err != nil {
 		if !strings.Contains(err.Error(), "not exist") && !strings.Contains(err.Error(), "not found") {
 			logger.Warnf("compact %d %d with %d slices: %s", inode, indx, len(compacted), err)
@@ -2754,7 +2782,7 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 		m.Lock()
 		delete(m.compacting, k)
 		m.Unlock()
-		m.compactChunk(inode, indx, once, force)
+		m.compactChunk(inode, indx, once, force, tierID)
 	}
 }
 
@@ -2764,7 +2792,6 @@ func (m *baseMeta) Compact(ctx Context, inode Ino, concurrency int, preFunc, pos
 		logger.Errorf("get attr error [inode %v]: %v", inode, st)
 		return st
 	}
-
 	var wg sync.WaitGroup
 	// compact
 	chunkChan := make(chan cchunk, 10000)
@@ -2773,7 +2800,7 @@ func (m *baseMeta) Compact(ctx Context, inode Ino, concurrency int, preFunc, pos
 		go func() {
 			defer wg.Done()
 			for c := range chunkChan {
-				m.compactChunk(c.inode, c.indx, false, true)
+				m.compactChunk(c.inode, c.indx, false, true, int(attr.Tier))
 				postFunc()
 				if ctx.Canceled() {
 					return
