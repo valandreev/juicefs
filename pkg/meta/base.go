@@ -1459,6 +1459,40 @@ func (m *baseMeta) allocateInodes() (freeID, error) {
 	return freeID{next: uint64(v) - inodeBatch, maxid: uint64(v)}, nil
 }
 
+func (m *baseMeta) inheritGid(ctx Context, _type uint8, parentGid uint32, parentMode uint16) uint32 {
+	if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" {
+		return parentGid
+	}
+	if runtime.GOOS == "linux" && parentMode&02000 != 0 {
+		return parentGid
+	}
+	return ctx.Gid()
+}
+
+func (m *baseMeta) inheritMode(ctx Context, _type uint8, parentGid uint32, parentMode, childMode uint16) uint16 {
+	if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" {
+		return childMode
+	}
+	if runtime.GOOS == "linux" && parentMode&02000 != 0 {
+		if _type == TypeDirectory {
+			childMode |= 02000
+		} else if childMode&02010 == 02010 && ctx.Uid() != 0 {
+			found := false
+			for _, g := range ctx.Gids() {
+				if g == parentGid {
+					found = true
+					break
+				}
+			}
+			if !found {
+				childMode &= ^uint16(02000)
+			}
+		}
+		return childMode
+	}
+	return childMode
+}
+
 func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, rdev uint32, path string, inode *Ino, attr *Attr) syscall.Errno {
 	if _type < TypeFile || _type > TypeSocket {
 		return syscall.EINVAL
@@ -1482,10 +1516,10 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 	defer m.timeit("Mknod", time.Now())
 	parent = m.checkRoot(parent)
 	var space, inodes int64 = align4K(0), 1
-	if err := m.checkQuota(ctx, space, inodes, ctx.Uid(), ctx.Gid(), parent); err != 0 {
+	// check group quota in transaction
+	if err := m.checkQuota(ctx, space, inodes, ctx.Uid(), 0, parent); err != 0 {
 		return err
 	}
-
 	ino, err := m.nextInode()
 	if err != nil {
 		return errno(err)

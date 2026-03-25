@@ -34,7 +34,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -1428,6 +1427,10 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 			return err
 		}
 		m.parseAttr(a, &pattr)
+		ihGid := m.inheritGid(ctx, _type, pattr.Gid, pattr.Mode)
+		if m.checkGroupQuota(ctx, uint64(ihGid), align4K(0), 1) {
+			return syscall.EDQUOT
+		}
 		if pattr.Typ != TypeDirectory {
 			return syscall.ENOTDIR
 		}
@@ -1477,7 +1480,6 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 				*inode = TrashInode + Ino(next)
 			}
 		}
-
 		mode &= 07777
 		if pattr.DefaultACL != aclAPI.None && _type != TypeSymlink {
 			// inherit default acl
@@ -1532,24 +1534,8 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 		attr.Mtimensec = uint32(now.Nanosecond())
 		attr.Ctime = now.Unix()
 		attr.Ctimensec = uint32(now.Nanosecond())
-		if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" {
-			attr.Gid = pattr.Gid
-		} else if runtime.GOOS == "linux" && pattr.Mode&02000 != 0 {
-			attr.Gid = pattr.Gid
-			if _type == TypeDirectory {
-				attr.Mode |= 02000
-			} else if attr.Mode&02010 == 02010 && ctx.Uid() != 0 {
-				var found bool
-				for _, gid := range ctx.Gids() {
-					if gid == pattr.Gid {
-						found = true
-					}
-				}
-				if !found {
-					attr.Mode &= ^uint16(02000)
-				}
-			}
-		}
+		attr.Gid = ihGid
+		attr.Mode = m.inheritMode(ctx, _type, pattr.Gid, pattr.Mode, attr.Mode)
 
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.Set(ctx, m.inodeKey(*inode), m.marshal(attr), 0)
