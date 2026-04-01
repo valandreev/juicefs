@@ -4021,11 +4021,11 @@ func (m *dbMeta) doGetQuota(ctx Context, qtype uint32, key uint64) (*Quota, erro
 
 func updateQuotaFields(quota *Quota, exist bool, maxSpace, maxInodes *int64, usedSpace, usedInodes *int64) []string {
 	updateColumns := make([]string, 0, 4)
-	if quota.MaxSpace >= 0 {
+	if quota.MaxSpace >= 0 || !exist {
 		*maxSpace = quota.MaxSpace
 		updateColumns = append(updateColumns, "max_space")
 	}
-	if quota.MaxInodes >= 0 {
+	if quota.MaxInodes >= 0 || !exist {
 		*maxInodes = quota.MaxInodes
 		updateColumns = append(updateColumns, "max_inodes")
 	}
@@ -4933,7 +4933,6 @@ func (m *dbMeta) LoadMeta(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	m.loadDumpedQuotas(Background(), dm)
 	if err = m.loadDumpedACLs(Background()); err != nil {
 		return err
 	}
@@ -4969,7 +4968,7 @@ func (m *dbMeta) LoadMeta(r io.Reader) error {
 	}
 
 	// update nlinks and parents for hardlinks
-	return m.txn(func(s *xorm.Session) error {
+	err = m.txn(func(s *xorm.Session) error {
 		for i, ps := range parents {
 			if len(ps) > 1 {
 				_, err := s.Cols("nlink", "parent").Update(&node{Nlink: uint32(len(ps))}, &node{Inode: i})
@@ -4980,6 +4979,8 @@ func (m *dbMeta) LoadMeta(r io.Reader) error {
 		}
 		return nil
 	})
+	m.loadDumpedQuotas(Background(), dm)
+	return err
 }
 
 type checkDupError func(error) bool
