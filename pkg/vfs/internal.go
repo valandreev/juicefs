@@ -483,16 +483,24 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 				}
 			}
 			if len(info.Objects) > 0 {
-				lastObjKey := strings.TrimPrefix(info.Objects[len(info.Objects)-1].Key, v.Conf.Format.Name+"/")
-				if objInfo, err := v.Store.BlobStorage().Head(context.Background(), lastObjKey); err != nil {
-					logger.Warnf("get restore status of %s: %s", lastObjKey, err)
-				} else {
-					info.RestoreStatus = objInfo.Status()
-					if info.TierID != 0 && objInfo.StorageClass() != info.TierStr {
-						info.TierStr = fmt.Sprintf("expected(%s),actual(%s)", info.TierStr, objInfo.StorageClass())
+				var lastObjKey string
+				for i := len(info.Objects) - 1; i >= 0; i-- {
+					if info.Objects[i].Key != "" {
+						lastObjKey = strings.TrimPrefix(info.Objects[i].Key, v.Conf.Format.Name+"/")
+						break
 					}
-					if info.TierID == 0 {
-						info.TierStr = fmt.Sprintf("actual(%s)", objInfo.StorageClass())
+				}
+				if lastObjKey != "" {
+					if objInfo, err := v.Store.BlobStorage().Head(context.Background(), lastObjKey); err == nil {
+						info.RestoreStatus = objInfo.Status()
+						if info.TierID != 0 && objInfo.StorageClass() != info.TierStr {
+							info.TierStr = fmt.Sprintf("expected(%s),actual(%s)", info.TierStr, objInfo.StorageClass())
+						}
+						if info.TierID == 0 {
+							info.TierStr = fmt.Sprintf("actual(%s)", objInfo.StorageClass())
+						}
+					} else {
+						logger.Warnf("Failed to get object info by Head for key %q (get restore status): %v", lastObjKey, err)
 					}
 				}
 			}
