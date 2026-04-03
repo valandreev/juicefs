@@ -191,6 +191,11 @@ func info(ctx *cli.Context) error {
 				if lastChunk != o.ChunkIndex {
 					chunkOffset = 0
 				}
+				pos := chunkOffset + o.ChunkIndex*meta.ChunkSize
+				if pos+uint64(o.Len) > resp.Summary.Length {
+					logger.Debugf("skip object %+v", o)
+					break
+				}
 				lastChunk = o.ChunkIndex
 				results = append(results, []string{
 					strconv.FormatUint(o.ChunkIndex, 10),
@@ -198,11 +203,13 @@ func info(ctx *cli.Context) error {
 					strconv.FormatUint(uint64(o.Size), 10),
 					strconv.FormatUint(uint64(o.Off), 10),
 					strconv.FormatUint(uint64(o.Len), 10),
-					strconv.FormatUint(chunkOffset+o.ChunkIndex*meta.ChunkSize, 10),
+					strconv.FormatUint(pos, 10),
 				})
 				chunkOffset += uint64(o.Len)
 			}
-			printResult(results, 1, false)
+			if len(results) > 1 {
+				printResult(results, 1, false)
+			}
 		}
 		if len(resp.FLocks) > 0 {
 			fmt.Println(" flocks:")
