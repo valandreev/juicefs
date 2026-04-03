@@ -4005,7 +4005,7 @@ func (m *dbMeta) doGetQuota(ctx Context, qtype uint32, key uint64) (*Quota, erro
 			return e
 		} else {
 			q := &userGroupQuota{Qtype: qtype, Qkey: key}
-			ok, e := s.Get(q)
+			ok, e := s.MustCols("qkey").Get(q)
 			if e == nil && ok {
 				quota = &Quota{
 					MaxSpace:   q.MaxSpace,
@@ -4059,21 +4059,21 @@ func (m *dbMeta) doSetQuota(ctx Context, qtype uint32, key uint64, quota *Quota)
 			created = !exist
 			updateColumns := updateQuotaFields(quota, exist, &origin.MaxSpace, &origin.MaxInodes, &origin.UsedSpace, &origin.UsedInodes)
 			if exist {
-				_, e = s.Cols(updateColumns...).Update(origin, &dirQuota{Inode: Ino(key)})
+				_, e = s.Cols(updateColumns...).Where("inode = ?", Ino(key)).Update(origin)
 			} else {
 				e = mustInsert(s, origin)
 			}
 			return e
 		} else if qtype == UserQuotaType || qtype == GroupQuotaType {
 			origin := &userGroupQuota{Qtype: qtype, Qkey: key}
-			exist, e := s.ForUpdate().Get(origin)
+			exist, e := s.ForUpdate().MustCols("qkey").Get(origin)
 			if e != nil {
 				return e
 			}
 			created = !exist
 			updateColumns := updateQuotaFields(quota, exist, &origin.MaxSpace, &origin.MaxInodes, &origin.UsedSpace, &origin.UsedInodes)
 			if exist {
-				_, e = s.Cols(updateColumns...).Update(origin, &userGroupQuota{Qtype: qtype, Qkey: key})
+				_, e = s.Cols(updateColumns...).Where("qtype = ? AND qkey = ?", qtype, key).Update(origin)
 			} else {
 				e = mustInsert(s, origin)
 			}
@@ -4096,9 +4096,7 @@ func (m *dbMeta) doDelQuota(ctx Context, qtype uint32, key uint64) error {
 			_, e := s.Delete(&dirQuota{Inode: Ino(key)})
 			return e
 		} else {
-			_, e := s.Cols("max_space", "max_inodes").
-				Update(&userGroupQuota{MaxSpace: -1, MaxInodes: -1},
-					&userGroupQuota{Qtype: qtype, Qkey: key})
+			_, e := s.Cols("max_space", "max_inodes").Where("qtype = ? AND qkey = ?", qtype, key).Update(&userGroupQuota{MaxSpace: -1, MaxInodes: -1})
 			return e
 		}
 	})
@@ -4198,9 +4196,7 @@ func (m *dbMeta) cleanUgUsage(ctx Context, qtype uint32) error {
 	}
 
 	return m.txn(func(s *xorm.Session) error {
-		_, err := s.Cols("used_space", "used_inodes").
-			Update(&userGroupQuota{UsedSpace: 0, UsedInodes: 0},
-				&userGroupQuota{Qtype: qtype})
+		_, err := s.Cols("used_space", "used_inodes").Where("qtype = ?", qtype).Update(&userGroupQuota{UsedSpace: 0, UsedInodes: 0})
 		return err
 	})
 }
