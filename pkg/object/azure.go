@@ -62,6 +62,13 @@ func (b *wasb) Create(ctx context.Context) error {
 	return err
 }
 
+func toValue[T any](p *T) (v T) {
+	if p == nil {
+		return v
+	}
+	return *p
+}
+
 func (b *wasb) Head(ctx context.Context, key string) (Object, error) {
 	properties, err := b.container.NewBlobClient(key).GetProperties(ctx, nil)
 	if err != nil {
@@ -70,14 +77,13 @@ func (b *wasb) Head(ctx context.Context, key string) (Object, error) {
 		}
 		return nil, err
 	}
-
 	return &obj{
 		key,
-		*properties.ContentLength,
-		*properties.LastModified,
+		toValue(properties.ContentLength),
+		toValue(properties.LastModified),
 		strings.HasSuffix(key, "/"),
-		*properties.AccessTier,
-		*properties.ArchiveStatus,
+		toValue(properties.AccessTier),
+		toValue(properties.ArchiveStatus),
 	}, nil
 }
 
@@ -193,13 +199,12 @@ func (b *wasb) List(ctx context.Context, prefix, startAfter, token, delimiter st
 		if *blob.Name <= startAfter {
 			continue
 		}
-		mtime := blob.Properties.LastModified
 		objs = append(objs, &obj{
 			*blob.Name,
-			*blob.Properties.ContentLength,
-			*mtime,
+			toValue(blob.Properties.ContentLength),
+			toValue(blob.Properties.LastModified),
 			strings.HasSuffix(*blob.Name, "/"),
-			string(*blob.Properties.AccessTier),
+			string(toValue(blob.Properties.AccessTier)),
 			"",
 		})
 	}
