@@ -1384,6 +1384,10 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 		if attr.Nlink > 0 {
 			tx.set(m.inodeKey(inode), m.marshal(attr))
 			if trash > 0 {
+				newSpace, newInode = align4K(0), 1
+				if _type == TypeFile {
+					newSpace = align4K(attr.Length)
+				}
 				tx.set(m.entryKey(trash, m.trashEntry(parent, inode, name)), buf)
 				if attr.Parent == 0 {
 					tx.incrBy(m.parentKey(inode, trash), 1)
@@ -1417,12 +1421,20 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 		}
 		return nil
 	}, parent)
-	if err == nil && trash == 0 {
-		if _type == TypeFile && attr.Nlink == 0 {
-			m.fileDeleted(opened, parent.IsTrash(), inode, attr.Length)
+	if err == nil {
+		if trash == 0 {
+			if _type == TypeFile && attr.Nlink == 0 {
+				m.fileDeleted(opened, parent.IsTrash(), inode, attr.Length)
+			}
+			m.updateStats(newSpace, newInode)
+			m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, newSpace, newInode)
+		} else {
+			if _type == TypeFile {
+				m.updateDirStat(ctx, trash, int64(attr.Length), newSpace, newInode)
+			} else {
+				m.updateDirStat(ctx, trash, 0, newSpace, newInode)
+			}
 		}
-		m.updateStats(newSpace, newInode)
-		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, newSpace, newInode)
 	}
 	return errno(err)
 }
@@ -1431,7 +1443,6 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 	if len(entries) == 0 {
 		return 0
 	}
-
 	// Each entry averages ~6 tx operations, so batch size should be 10000/6
 	maxOps := 10000
 	if m.Name() == "etcd" {
@@ -1452,7 +1463,6 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		opened bool
 		length uint64
 	}
-
 	for len(entries) > 0 {
 		batchSize := batchNum
 		if batchSize > len(entries) {
@@ -1460,7 +1470,6 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		}
 		batch := entries[:batchSize]
 		entries = entries[batchSize:]
-
 		var trash Ino
 		if len(skipCheckTrash) == 0 || !skipCheckTrash[0] {
 			if st := m.checkTrash(parent, &trash); st != 0 {
@@ -1470,12 +1479,14 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 
 		var entryInfos []*entryInfo
 		var batchDirLength, batchDirSpace, batchDirInodes int64
+		var batchTrashLength, batchTrashSpace, batchTrashInodes int64
 		var batchFsSpace, batchFsInodes int64
 		var deltas ugQuotaDeltas
 		var delNodes map[Ino]*dNode
 
 		err := m.txn(ctx, func(tx *kvTxn) error {
 			batchDirLength, batchDirSpace, batchDirInodes = 0, 0, 0
+			batchTrashLength, batchTrashSpace, batchTrashInodes = 0, 0, 0
 			batchFsSpace, batchFsInodes = 0, 0
 			deltas = make(ugQuotaDeltas)
 			delNodes = make(map[Ino]*dNode)
@@ -1680,6 +1691,13 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 					if info.attr.Parent == 0 {
 						tx.incrBy(m.parentKey(info.inode, info.trash), 1)
 					}
+					if info.typ == TypeFile {
+						batchTrashLength += int64(info.attr.Length)
+						batchTrashSpace += align4K(info.attr.Length)
+					} else {
+						batchTrashSpace += align4K(0)
+					}
+					batchTrashInodes++
 				}
 				if info.attr.Parent == 0 && info.attr.Nlink > 0 {
 					tx.incrBy(m.parentKey(info.inode, parent), -1)
@@ -1706,6 +1724,9 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		delta.length += batchDirLength
 		delta.space += batchDirSpace
 		delta.inodes += batchDirInodes
+		if trash > 0 && (batchTrashSpace != 0 || batchTrashInodes != 0) {
+			m.updateDirStat(ctx, trash, batchTrashLength, batchTrashSpace, batchTrashInodes)
+		}
 		m.updateStats(batchFsSpace, batchFsInodes)
 		for _, q := range deltas {
 			m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
@@ -1810,9 +1831,13 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 		}
 		return nil
 	}, parent)
-	if err == nil && trash == 0 {
-		m.updateStats(-align4K(0), -1)
-		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, -align4K(0), -1)
+	if err == nil {
+		if trash == 0 {
+			m.updateStats(-align4K(0), -1)
+			m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, -align4K(0), -1)
+		} else {
+			m.updateDirStat(ctx, trash, 0, align4K(0), 1)
+		}
 	}
 	return errno(err)
 }
@@ -2026,6 +2051,10 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 			tx.delete(m.entryKey(parentSrc, nameSrc))
 			if dino > 0 {
 				if trash > 0 {
+					newSpace, newInode = align4K(0), 1
+					if dtyp == TypeFile {
+						newSpace = align4K(tattr.Length)
+					}
 					tx.set(m.inodeKey(dino), m.marshal(&tattr))
 					tx.set(m.entryKey(trash, m.trashEntry(parentDst, dino, nameDst)), dbuf)
 					if tattr.Parent == 0 {
@@ -2080,12 +2109,21 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 		}
 		return nil
 	}, parentLocks...)
-	if err == nil && !exchange && trash == 0 {
-		if dino > 0 && dtyp == TypeFile && tattr.Nlink == 0 {
-			m.fileDeleted(opened, false, dino, tattr.Length)
+
+	if err == nil && !exchange && dino > 0 {
+		if trash > 0 {
+			if dtyp == TypeFile {
+				m.updateDirStat(ctx, trash, int64(tattr.Length), newSpace, newInode)
+			} else {
+				m.updateDirStat(ctx, trash, 0, newSpace, newInode)
+			}
+		} else if trash == 0 {
+			if dtyp == TypeFile && tattr.Nlink == 0 {
+				m.fileDeleted(opened, false, dino, tattr.Length)
+			}
+			m.updateStats(newSpace, newInode)
+			m.updateUserGroupStat(ctx, tattr.Uid, tattr.Gid, newSpace, newInode)
 		}
-		m.updateStats(newSpace, newInode)
-		m.updateUserGroupStat(ctx, tattr.Uid, tattr.Gid, newSpace, newInode)
 	}
 	return errno(err)
 }
@@ -3784,8 +3822,8 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 		for k, v := range pairs {
 			q := m.parseQuota(v)
 			if q.MaxSpace == -1 && q.MaxInodes == -1 {
-                continue
-            }
+				continue
+			}
 			quotas[binary.BigEndian.Uint64([]byte(k[2:]))] = &DumpedQuota{
 				MaxSpace:   q.MaxSpace,
 				MaxInodes:  q.MaxInodes,

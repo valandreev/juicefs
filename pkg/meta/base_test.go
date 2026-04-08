@@ -2128,6 +2128,24 @@ func testTrash(t *testing.T, m Meta) {
 	ctx := Background()
 	var inode, parent Ino
 	var attr = &Attr{}
+	getDirStat := func(ino Ino) *dirStat {
+		stat, st := m.GetDirStat(ctx, ino)
+		if st != 0 {
+			t.Fatalf("get dir stat %d: %s", ino, st)
+		}
+		return stat
+	}
+	waitDirStatInodes := func(ino Ino, expected int64, scene string) {
+		for i := 0; i < 20; i++ {
+			m.FlushSession()
+			if stat := getDirStat(ino); stat.inodes == expected {
+				return
+			}
+		}
+		stat := getDirStat(ino)
+		t.Fatalf("%s: expect inodes %d, got %d", scene, expected, stat.inodes)
+	}
+	var trashDir Ino
 	if st := m.Create(ctx, 1, "f1", 0644, 022, 0, &inode, attr); st != 0 {
 		t.Fatalf("create f1: %s", st)
 	}
@@ -2143,12 +2161,18 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Rename(ctx, 1, "f1", 1, "d", 0, &inode, attr); st != syscall.EISDIR {
 		t.Fatalf("rename f1 -> d: %s", st)
 	}
+	trashBeforeUnlink := int64(0)
+	if st := m.GetAttr(ctx, TrashInode+1, attr); st == 0 {
+		trashBeforeUnlink = getDirStat(TrashInode + 1).inodes
+	}
 	if st := m.Unlink(ctx, parent, "f"); st != 0 {
 		t.Fatalf("unlink d/f: %s", st)
 	}
 	if st := m.GetAttr(ctx, inode, attr); st != 0 || attr.Parent != TrashInode+1 {
 		t.Fatalf("getattr f(%d): %s, attr %+v", inode, st, attr)
 	}
+	trashDir = attr.Parent
+	waitDirStatInodes(trashDir, trashBeforeUnlink+1, "trash dir inodes after unlink d/f")
 	if st := m.Truncate(ctx, inode, 0, 1<<30, attr, false); st != syscall.EPERM {
 		t.Fatalf("should not truncate a file in trash")
 	}
@@ -2162,12 +2186,14 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Mkdir(ctx, 1, "d2", 0755, 022, 0, &parent2, attr); st != 0 {
 		t.Fatalf("mkdir d2: %s", st)
 	}
+	trashBeforeRmdir := getDirStat(trashDir)
 	if st := m.Rmdir(ctx, 1, "d2"); st != 0 {
 		t.Fatalf("rmdir d2: %s", st)
 	}
 	if st := m.GetAttr(ctx, parent2, attr); st != 0 || attr.Parent != TrashInode+1 {
 		t.Fatalf("getattr d2(%d): %s, attr %+v", parent2, st, attr)
 	}
+	waitDirStatInodes(trashDir, trashBeforeRmdir.inodes+1, "trash dir inodes after rmdir d2")
 	var tino Ino
 	if st := m.Mkdir(ctx, parent2, "d3", 0777, 022, 0, &tino, attr); st != syscall.ENOENT {
 		t.Fatalf("mkdir inside trash should fail")
@@ -2181,9 +2207,11 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Rename(ctx, 1, "d", parent2, "ttlink", 0, &tino, attr); st != syscall.ENOENT {
 		t.Fatalf("link inside trash should fail")
 	}
+	trashBeforeRmdirD := getDirStat(trashDir)
 	if st := m.Rmdir(ctx, 1, "d"); st != 0 {
 		t.Fatalf("rmdir d: %s", st)
 	}
+	waitDirStatInodes(trashDir, trashBeforeRmdirD.inodes+1, "trash dir inodes after rmdir d")
 	if st := m.Rename(ctx, 1, "f1", 1, "d", 0, &inode, attr); st != 0 {
 		t.Fatalf("rename f1 -> d: %s", st)
 	}
@@ -2193,9 +2221,11 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Rename(ctx, 1, "f2", TrashInode+1, "td", 0, &inode, attr); st != syscall.EPERM {
 		t.Fatalf("rename f2 -> td: %s", st)
 	}
+	trashBeforeRename := getDirStat(trashDir)
 	if st := m.Rename(ctx, 1, "f2", 1, "d", 0, &inode, attr); st != 0 {
 		t.Fatalf("rename f2 -> d: %s", st)
 	}
+	waitDirStatInodes(trashDir, trashBeforeRename.inodes+1, "trash dir inodes after rename overwrite")
 	if st := m.Link(ctx, inode, 1, "l", attr); st != 0 || attr.Nlink != 2 {
 		t.Fatalf("link d -> l1: %s", st)
 	}
@@ -2244,6 +2274,49 @@ func testTrash(t *testing.T, m Meta) {
 	if len(entries) != 9 {
 		t.Fatalf("entries: %d", len(entries))
 	}
+
+	// test BatchUnlink: entries should be moved into trash and update dir stats
+	var bu1, bu2 Ino
+	if st := m.Create(ctx, 1, "batch_u1", 0644, 022, 0, &bu1, attr); st != 0 {
+		t.Fatalf("create batch_u1: %s", st)
+	}
+	if st := m.Create(ctx, 1, "batch_u2", 0644, 022, 0, &bu2, attr); st != 0 {
+		t.Fatalf("create batch_u2: %s", st)
+	}
+	var buAttr1, buAttr2 Attr
+	if st := m.GetAttr(ctx, bu1, &buAttr1); st != 0 {
+		t.Fatalf("getattr batch_u1: %s", st)
+	}
+	if st := m.GetAttr(ctx, bu2, &buAttr2); st != 0 {
+		t.Fatalf("getattr batch_u2: %s", st)
+	}
+	batchEntries := []*Entry{
+		{Inode: bu1, Name: []byte("batch_u1"), Attr: &buAttr1},
+		{Inode: bu2, Name: []byte("batch_u2"), Attr: &buAttr2},
+	}
+	trashBeforeBatch := getDirStat(trashDir)
+	var batchCount uint64
+	if st := m.getBase().BatchUnlink(ctx, RootInode, batchEntries, &batchCount, false); st != 0 {
+		t.Fatalf("batch unlink under root: %s", st)
+	}
+	if batchCount != 2 {
+		t.Fatalf("batch unlink count: expect 2, got %d", batchCount)
+	}
+	m.FlushSession()
+	trashAfterBatch := getDirStat(trashDir)
+	if trashAfterBatch.inodes < trashBeforeBatch.inodes+2 {
+		t.Fatalf("trash dir inodes after BatchUnlink: expect at least %d, got %d", trashBeforeBatch.inodes+2, trashAfterBatch.inodes)
+	}
+	batchTrashName1 := fmt.Sprintf("1-%d-%s", bu1, "batch_u1")
+	batchTrashName2 := fmt.Sprintf("1-%d-%s", bu2, "batch_u2")
+	var trashIno Ino
+	if st := m.Lookup(ctx, trashDir, batchTrashName1, &trashIno, attr, true); st != 0 {
+		t.Fatalf("lookup trash/%s: %s", batchTrashName1, st)
+	}
+	if st := m.Lookup(ctx, trashDir, batchTrashName2, &trashIno, attr, true); st != 0 {
+		t.Fatalf("lookup trash/%s: %s", batchTrashName2, st)
+	}
+
 	// test Remove with skipTrash true/false
 	if st := m.Mkdir(ctx, 1, "d10", 0755, 022, 0, &parent, attr); st != 0 {
 		t.Fatalf("mkdir d10: %s", st)
@@ -2261,7 +2334,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 	if st := m.Mkdir(ctx, 1, "d10", 0755, 022, 0, &parent, attr); st != 0 {
@@ -2280,7 +2353,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 
@@ -2303,7 +2376,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 	entries = entries[:0]
@@ -2316,7 +2389,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 	entries = entries[:0]
@@ -2332,7 +2405,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 	entries = entries[:0]
@@ -3265,6 +3338,12 @@ func testRenameDirStatWithTrash(t *testing.T, m Meta) {
 		if statAfter.inodes != statBefore.inodes-1 {
 			t.Fatalf("Test trash failed: inodes %d != %d-1", statAfter.inodes, statBefore.inodes)
 		}
+		overwritten := Attr{}
+		if st := m.GetAttr(ctx, file2Inode, &overwritten); st != 0 && st != syscall.ENOENT {
+			t.Fatalf("Test trash overwrite: getattr overwritten inode %d: %s", file2Inode, st)
+		} else if st == 0 && overwritten.Parent <= TrashInode {
+			t.Fatalf("Test trash overwrite: overwritten inode %d should be moved to trash or deleted, parent=%d", file2Inode, overwritten.Parent)
+		}
 		t.Logf("Test trash overwrite passed")
 	}
 
@@ -3300,6 +3379,12 @@ func testRenameDirStatWithTrash(t *testing.T, m Meta) {
 		// dir2: one deleted (goes to trash), one added, net no change
 		if stat2After.inodes != stat2Before.inodes {
 			t.Fatalf("Test trash cross-dir failed: dir2 inodes %d != %d", stat2After.inodes, stat2Before.inodes)
+		}
+		overwritten := Attr{}
+		if st := m.GetAttr(ctx, file2Inode, &overwritten); st != 0 && st != syscall.ENOENT {
+			t.Fatalf("Test trash cross-dir overwrite: getattr overwritten inode %d: %s", file2Inode, st)
+		} else if st == 0 && overwritten.Parent <= TrashInode {
+			t.Fatalf("Test trash cross-dir overwrite: overwritten inode %d should be moved to trash or deleted, parent=%d", file2Inode, overwritten.Parent)
 		}
 		t.Logf("Test trash cross-dir overwrite passed")
 	}
