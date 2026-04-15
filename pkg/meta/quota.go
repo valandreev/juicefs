@@ -167,6 +167,13 @@ func (m *baseMeta) GetDirStat(ctx Context, inode Ino) (stat *dirStat, st syscall
 	}
 	if stat == nil {
 		stat, st = m.calcDirStat(ctx, inode)
+	} else {
+		m.dirStatsLock.RLock()
+		pending := m.dirStats[inode]
+		m.dirStatsLock.RUnlock()
+		stat.length += pending.length
+		stat.space += pending.space
+		stat.inodes += pending.inodes
 	}
 	return
 }
