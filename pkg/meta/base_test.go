@@ -3312,7 +3312,6 @@ func testRenameDirStatWithTrash(t *testing.T, m Meta) {
 	}
 	defer m.CloseSession()
 
-	/* TODO
 	// Test with trash enabled: overwrite should move to trash instead of delete
 	{
 		if st := m.Create(ctx, dir1, "trash_file1", 0644, 022, 0, &file1Inode, &attr); st != 0 {
@@ -3321,7 +3320,7 @@ func testRenameDirStatWithTrash(t *testing.T, m Meta) {
 		if st := m.Create(ctx, dir1, "trash_file2", 0644, 022, 0, &file2Inode, &attr); st != 0 {
 			t.Fatalf("create trash_file2: %s", st)
 		}
-		defer m.Unlink(ctx, dir1, "trash_file1")
+		defer m.Unlink(ctx, dir1, "trash_file2")
 
 		m.FlushSession()
 		statBefore, _ := m.GetDirStat(ctx, dir1)
@@ -3331,6 +3330,7 @@ func testRenameDirStatWithTrash(t *testing.T, m Meta) {
 			t.Fatalf("rename with trash enabled: %s", st)
 		}
 
+		m.FlushSession()
 		statAfter, _ := m.GetDirStat(ctx, dir1)
 
 		// with trash: deleted file doesn't reduce inode count, only goes to trash
@@ -3356,7 +3356,7 @@ func testRenameDirStatWithTrash(t *testing.T, m Meta) {
 			t.Fatalf("create cross_trash2: %s", st)
 		}
 		defer func() {
-			m.Unlink(ctx, dir2, "cross_trash1")
+			m.Unlink(ctx, dir2, "cross_trash2")
 		}()
 
 		m.FlushSession()
@@ -3368,6 +3368,7 @@ func testRenameDirStatWithTrash(t *testing.T, m Meta) {
 			t.Fatalf("rename cross_trash1 to cross_trash2 (overwrite with trash): %s", st)
 		}
 
+		m.FlushSession()
 		stat1After, _ := m.GetDirStat(ctx, dir1)
 		stat2After, _ := m.GetDirStat(ctx, dir2)
 
@@ -3387,7 +3388,6 @@ func testRenameDirStatWithTrash(t *testing.T, m Meta) {
 		}
 		t.Logf("Test trash cross-dir overwrite passed")
 	}
-	*/
 
 	// Test exchange with trash enabled
 	{
