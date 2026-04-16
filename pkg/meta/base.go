@@ -166,7 +166,7 @@ type engine interface {
 
 type trashSliceScan func(ss []Slice, ts int64) (clean bool, err error)
 type pendingSliceScan func(id uint64, size uint32) (clean bool, err error)
-type trashFileScan func(inode Ino, size uint64, ts time.Time) (clean bool, err error)
+type trashFileScan func(inode Ino, size uint64, ts time.Time, count int64) (clean bool, err error)
 type pendingFileScan func(ino Ino, size uint64, ts int64) (clean bool, err error)
 
 // fsStat aligned for atomic operations
@@ -3124,13 +3124,22 @@ func (m *baseMeta) scanTrashFiles(ctx Context, scan trashFileScan) error {
 	if st = m.en.doReaddir(ctx, TrashInode, 1, &entries, -1); st != 0 {
 		return errors.Wrap(st, "read trash")
 	}
-
 	var subEntries []*Entry
 	for _, entry := range entries {
 		ts, err := time.Parse("2006-01-02-15", string(entry.Name))
 		if err != nil {
 			logger.Warnf("bad entry as a subTrash: %s", entry.Name)
 			continue
+		}
+		if m.fmt.DirStats {
+			ds, st := m.GetDirStat(ctx, entry.Inode)
+			if st == 0 && ds != nil {
+				if _, err := scan(entry.Inode, uint64(ds.length), ts, ds.inodes); err != nil {
+					return errors.Wrap(err, "scan trash files")
+				}
+				continue
+			}
+			logger.Warnf("get dir stat %d: %s, fallback to readdir", entry.Inode, st)
 		}
 		subEntries = subEntries[:0]
 		if st = m.en.doReaddir(ctx, entry.Inode, 1, &subEntries, -1); st != 0 {
@@ -3139,7 +3148,7 @@ func (m *baseMeta) scanTrashFiles(ctx Context, scan trashFileScan) error {
 		}
 		for _, se := range subEntries {
 			if se.Attr.Typ == TypeFile {
-				clean, err := scan(se.Inode, se.Attr.Length, ts)
+				clean, err := scan(se.Inode, se.Attr.Length, ts, 1)
 				if err != nil {
 					return errors.Wrap(err, "scan trash files")
 				}
