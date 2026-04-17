@@ -108,6 +108,8 @@ If you haven't yet set up monitoring for JuiceFS, read [monitoring and data visu
 |----------------------------------------| -----------                          | ---- |
 | `juicefs_compact_size_histogram_bytes` | Size distributions of compacted data | byte |
 | `juicefs_used_read_buffer_size_bytes`  | size of currently used buffer for read |      |
+| `juicefs_bgjob_duration_seconds` | Duration of background cleanup jobs (labels: `job`, `status`) | second |
+| `juicefs_bgjob_deletions_total` | Total number of deletions performed by background jobs (label: `job`) | |
 
 ## Mount configuration {#mount-configuration}
 
