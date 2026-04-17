@@ -269,8 +269,8 @@ func (m *baseMeta) doFlushStats() {
 	m.fsStatsLock.Unlock()
 }
 
-func (m *baseMeta) syncVolumeStat(ctx Context) error {
-	return m.en.doSyncVolumeStat(ctx)
+func (m *baseMeta) syncVolumeStat(ctx Context, used, inodes int64) error {
+	return m.en.doSyncVolumeStat(ctx, used, inodes)
 }
 
 func (m *baseMeta) checkQuota(ctx Context, space, inodes int64, uid, gid uint32, parents ...Ino) syscall.Errno {

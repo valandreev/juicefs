@@ -3284,22 +3284,9 @@ func (m *kvMeta) cleanUgUsage(ctx Context, qtype uint32) error {
 	})
 }
 
-func (m *kvMeta) doSyncVolumeStat(ctx Context) error {
+func (m *kvMeta) doSyncVolumeStat(ctx Context, used, inodes int64) error {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
-	}
-	var used, inodes int64
-	if err := m.client.txn(ctx, func(tx *kvTxn) error {
-		prefix := m.fmtKey("U")
-		tx.scan(prefix, nextKey(prefix), false, func(k, v []byte) bool {
-			stat := m.parseDirStat(v)
-			used += stat.space
-			inodes += stat.inodes
-			return true
-		})
-		return nil
-	}, 0); err != nil {
-		return err
 	}
 	// need add sustained file size
 	vals, err := m.scanKeys(ctx, m.fmtKey("SS"))
@@ -3321,13 +3308,6 @@ func (m *kvMeta) doSyncVolumeStat(ctx Context) error {
 		}
 		used += align4K(attr.Length)
 		inodes += 1
-	}
-
-	if err := m.scanTrashEntry(ctx, func(_ Ino, length uint64) {
-		used += align4K(length)
-		inodes += 1
-	}); err != nil {
-		return err
 	}
 	logger.Debugf("Used space: %s, inodes: %d", humanize.IBytes(uint64(used)), inodes)
 	err = m.setValue(m.counterKey(totalInodes), packCounter(inodes))

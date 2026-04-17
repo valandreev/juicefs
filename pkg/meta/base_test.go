@@ -3155,19 +3155,39 @@ func testRenameDirStat(t *testing.T, m Meta) {
 		}
 
 		m.FlushSession()
-		statBefore, _ := m.GetDirStat(ctx, dir1)
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			statBefore, st := m.GetDirStat(ctx, dir1)
+			if st == 0 && statBefore != nil && statBefore.inodes == 2 {
+				break
+			}
+			if time.Now().After(deadline) {
+				if st != 0 {
+					t.Fatalf("Test 3 failed: get dir stat before rename: %s", st)
+				}
+				t.Fatalf("Test 3 failed: expected dir1 inodes 2 before rename, got %d", statBefore.inodes)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 
 		// rename file4 -> file5 (overwrite), trash is disabled
 		if st := m.Rename(ctx, dir1, "file4", dir1, "file5", 0, &file1Inode, &attr); st != 0 {
 			t.Fatalf("rename file4 to file5 (overwrite): %s", st)
 		}
 
-		time.Sleep(500 * time.Millisecond)
-		statAfter, _ := m.GetDirStat(ctx, dir1)
-
-		// one file deleted, should decrease by 1
-		if statAfter.inodes != statBefore.inodes-1 {
-			t.Fatalf("Test 3 failed: inodes %d != %d-1", statAfter.inodes, statBefore.inodes)
+		deadline = time.Now().Add(3 * time.Second)
+		for {
+			statAfter, st := m.GetDirStat(ctx, dir1)
+			if st == 0 && statAfter != nil && statAfter.inodes == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				if st != 0 {
+					t.Fatalf("Test 3 failed: get dir stat after rename: %s", st)
+				}
+				t.Fatalf("Test 3 failed: expected dir1 inodes 1 after overwrite rename, got %d", statAfter.inodes)
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
 		m.Unlink(ctx, dir1, "file4")
 		time.Sleep(500 * time.Millisecond)
@@ -5317,7 +5337,7 @@ func testQuotaUsageStatistics(t *testing.T, m Meta, ctx Context, parent Ino, uid
 	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("%d", gid): {MaxSpace: 2 << 30, MaxInodes: 20}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set group quota for gid %d: %s", gid, err)
 	}
-	time.Sleep(time.Second * 2)
+	m.getBase().doFlushQuotas()
 
 	qs := make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
