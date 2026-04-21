@@ -158,6 +158,235 @@ wait_gateway_ready(){
     fi
 }
 
+# ---- sync encryption / decryption tests (minio) ----
+
+setup_sync_encrypt_keys(){
+    openssl genrsa -out /tmp/sync-enc-nopass.pem 2048
+    openssl genrsa -out /tmp/sync-enc-wrong.pem 2048
+}
+setup_sync_encrypt_keys
+
+# Encrypt: JuiceFS(gateway/minio) -> minio, then decrypt back and verify
+test_sync_encrypt_minio_to_minio(){
+    prepare_test
+    # Put test data into JuiceFS via mount
+    echo "hello minio encrypt" > /jfs/enc_test1.txt
+    dd if=/dev/urandom of=/jfs/enc_large.bin bs=1M count=3 status=none
+    mkdir -p /jfs/enc_subdir
+    echo "nested" > /jfs/enc_subdir/nested.txt
+
+    # Encrypt sync: gateway(src) -> minio(dst)
+    (./mc rb myminio/enctest > /dev/null 2>&1 --force || true) && ./mc mb myminio/enctest
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/ minio://minioadmin:minioadmin@localhost:9000/enctest/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem
+
+    # Raw content in minio should not equal plaintext
+    ./mc cp myminio/enctest/enc_test1.txt /tmp/enc_raw.txt
+    if cmp -s /tmp/enc_raw.txt <(echo "hello minio encrypt"); then
+        echo "FAIL: enc_test1.txt should be encrypted" && exit 1
+    fi
+
+    # Decrypt sync: minio(encrypted) -> local dir
+    rm -rf /tmp/minio_dec && mkdir -p /tmp/minio_dec
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9000/enctest/ /tmp/minio_dec/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem
+
+    # Verify decrypted content
+    [ "$(cat /tmp/minio_dec/enc_test1.txt)" = "hello minio encrypt" ] || (echo "FAIL: decrypted text mismatch" && exit 1)
+    [ "$(cat /tmp/minio_dec/enc_subdir/nested.txt)" = "nested" ] || (echo "FAIL: nested decrypted mismatch" && exit 1)
+    cmp /jfs/enc_large.bin /tmp/minio_dec/enc_large.bin || (echo "FAIL: large binary mismatch" && exit 1)
+    echo "test_sync_encrypt_minio_to_minio passed"
+}
+
+# Encrypt sync: local -> minio with chacha20-rsa, decrypt back
+test_sync_encrypt_minio_chacha20(){
+    prepare_test
+    rm -rf /tmp/minio_enc_src && mkdir -p /tmp/minio_enc_src
+    echo "chacha20 test" > /tmp/minio_enc_src/file1.txt
+    dd if=/dev/urandom of=/tmp/minio_enc_src/file2.bin bs=1M count=2 status=none
+
+    (./mc rb myminio/enctest2 > /dev/null 2>&1 --force || true) && ./mc mb myminio/enctest2
+    ./juicefs sync /tmp/minio_enc_src/ minio://minioadmin:minioadmin@localhost:9000/enctest2/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem --encrypt-algo chacha20-rsa
+
+    rm -rf /tmp/minio_dec2 && mkdir -p /tmp/minio_dec2
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9000/enctest2/ /tmp/minio_dec2/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem --decrypt-algo chacha20-rsa
+
+    [ "$(cat /tmp/minio_dec2/file1.txt)" = "chacha20 test" ] || (echo "FAIL: chacha20 decrypted mismatch" && exit 1)
+    cmp /tmp/minio_enc_src/file2.bin /tmp/minio_dec2/file2.bin || (echo "FAIL: binary mismatch" && exit 1)
+    echo "test_sync_encrypt_minio_chacha20 passed"
+}
+
+# Decrypt with wrong key from minio should fail
+test_sync_encrypt_minio_wrong_key(){
+    prepare_test
+    echo "secret data" > /jfs/secret.txt
+
+    (./mc rb myminio/enctest3 > /dev/null 2>&1 --force || true) && ./mc mb myminio/enctest3
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/ minio://minioadmin:minioadmin@localhost:9000/enctest3/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem
+
+    rm -rf /tmp/minio_dec3 && mkdir -p /tmp/minio_dec3
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9000/enctest3/ /tmp/minio_dec3/ \
+        --decrypt-rsa-key /tmp/sync-enc-wrong.pem 2>&1 | tee /tmp/minio_enc_err.log || true
+
+    if [ -f /tmp/minio_dec3/secret.txt ] && [ "$(cat /tmp/minio_dec3/secret.txt)" = "secret data" ]; then
+        echo "FAIL: wrong key should not decrypt correctly" && exit 1
+    fi
+    echo "test_sync_encrypt_minio_wrong_key passed"
+}
+
+# Re-encrypt between minio buckets with different keys
+test_sync_reencrypt_minio(){
+    prepare_test
+    echo "reencrypt data" > /jfs/reenc.txt
+    dd if=/dev/urandom of=/jfs/reenc.bin bs=1M count=2 status=none
+
+    (./mc rb myminio/enctest4 > /dev/null 2>&1 --force || true) && ./mc mb myminio/enctest4
+    (./mc rb myminio/enctest5 > /dev/null 2>&1 --force || true) && ./mc mb myminio/enctest5
+
+    # Encrypt with key1
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/ minio://minioadmin:minioadmin@localhost:9000/enctest4/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem
+
+    # Re-encrypt: decrypt key1, encrypt key2
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9000/enctest4/ minio://minioadmin:minioadmin@localhost:9000/enctest5/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem --encrypt-rsa-key /tmp/sync-enc-wrong.pem
+
+    # Decrypt with key2
+    rm -rf /tmp/minio_dec4 && mkdir -p /tmp/minio_dec4
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9000/enctest5/ /tmp/minio_dec4/ \
+        --decrypt-rsa-key /tmp/sync-enc-wrong.pem
+
+    [ "$(cat /tmp/minio_dec4/reenc.txt)" = "reencrypt data" ] || (echo "FAIL: reencrypted text mismatch" && exit 1)
+    cmp /jfs/reenc.bin /tmp/minio_dec4/reenc.bin || (echo "FAIL: reencrypted binary mismatch" && exit 1)
+    echo "test_sync_reencrypt_minio passed"
+}
+
+# Encrypt sync minio -> jfs:// with --update
+test_sync_encrypt_minio_to_jfs(){
+    prepare_test
+    echo "minio to jfs" > /jfs/m2j.txt
+    dd if=/dev/urandom of=/jfs/m2j.bin bs=1M count=2 status=none
+
+    (./mc rb myminio/enctest6 > /dev/null 2>&1 --force || true) && ./mc mb myminio/enctest6
+    # Encrypt gateway -> minio
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/ minio://minioadmin:minioadmin@localhost:9000/enctest6/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem
+
+    # Decrypt minio -> jfs:// (new JFS volume)
+    umount_jfs /jfs $META_URL
+    python3 .github/scripts/flush_meta.py $META_URL
+    rm -rf /var/jfs/myjfs /var/jfsCache/myjfs
+    ./juicefs format $META_URL myjfs
+    ./juicefs mount -d $META_URL /jfs
+    meta_url=$META_URL ./juicefs sync minio://minioadmin:minioadmin@localhost:9000/enctest6/ jfs://meta_url/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem --update
+
+    [ "$(cat /jfs/m2j.txt)" = "minio to jfs" ] || (echo "FAIL: jfs decrypt mismatch" && exit 1)
+    echo "test_sync_encrypt_minio_to_jfs passed"
+}
+
+# ---- sync global traffic control tests (minio) ----
+
+TC_PORT=12345
+TC_URL="http://localhost:${TC_PORT}/"
+TC_LOG="/tmp/tc_server.log"
+
+start_traffic_control_server(){
+    local bwlimit=${1:-0}
+    kill_traffic_control_server
+    python3 .github/scripts/traffic_control_server.py --port $TC_PORT --bwlimit $bwlimit --log $TC_LOG &
+    TC_PID=$!
+    sleep 1
+    if ! kill -0 $TC_PID 2>/dev/null; then
+        echo "FAIL: traffic control server failed to start"
+        exit 1
+    fi
+}
+
+kill_traffic_control_server(){
+    lsof -i :$TC_PORT -t 2>/dev/null | xargs -r kill -9 || true
+    sleep 0.5
+}
+
+check_tc_log(){
+    local min_requests=${1:-1}
+    [ ! -f $TC_LOG ] && echo "FAIL: TC log not found" && exit 1
+    local req_count=$(wc -l < $TC_LOG)
+    if [ "$req_count" -lt "$min_requests" ]; then
+        echo "FAIL: expected at least $min_requests TC requests, got $req_count"
+        cat $TC_LOG
+        exit 1
+    fi
+    echo "TC log: $req_count requests"
+}
+
+# Traffic control: JFS gateway -> minio with traffic control
+test_sync_traffic_control_minio(){
+    prepare_test
+    for i in $(seq 1 50); do
+        dd if=/dev/urandom of=/jfs/tc_file$i bs=10K count=1 status=none
+    done
+    dd if=/dev/urandom of=/jfs/tc_large bs=1M count=2 status=none
+    start_traffic_control_server 0
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/ minio://minioadmin:minioadmin@localhost:9000/myjfs/ \
+        --traffic-control-url $TC_URL >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in sync.log" && exit 1 || true
+    count1=$(./mc ls -r juicegw/myjfs/ | wc -l)
+    count2=$(./mc ls -r myminio/myjfs/ | wc -l)
+    [ "$count1" -eq "$count2" ] || (echo "FAIL: count mismatch $count1 vs $count2" && exit 1)
+    check_tc_log 1
+    kill_traffic_control_server
+    echo "test_sync_traffic_control_minio passed"
+}
+
+# Traffic control with rate limit: minio -> JFS
+test_sync_traffic_control_minio_to_jfs(){
+    prepare_test
+    (./mc rb myminio/tcsrc > /dev/null 2>&1 --force || true) && ./mc mb myminio/tcsrc
+    for i in $(seq 1 20); do
+        dd if=/dev/urandom of=/tmp/tc_minio_file$i bs=50K count=1 status=none
+        ./mc cp /tmp/tc_minio_file$i myminio/tcsrc/file$i
+    done
+    start_traffic_control_server 0
+    meta_url=$META_URL ./juicefs sync minio://minioadmin:minioadmin@localhost:9000/tcsrc/ jfs://meta_url/tc_from_minio/ \
+        --traffic-control-url $TC_URL >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in sync.log" && exit 1 || true
+    dec_count=$(find /jfs/tc_from_minio -type f | wc -l)
+    [ "$dec_count" -eq 20 ] || (echo "FAIL: expected 20 files, got $dec_count" && exit 1)
+    for i in $(seq 1 20); do
+        cmp /tmp/tc_minio_file$i /jfs/tc_from_minio/file$i || (echo "FAIL: file$i mismatch" && exit 1)
+    done
+    check_tc_log 1
+    kill_traffic_control_server
+    echo "test_sync_traffic_control_minio_to_jfs passed"
+}
+
+# Traffic control combined with encrypt/decrypt
+test_sync_traffic_control_encrypt(){
+    prepare_test
+    echo "tc encrypt test" > /jfs/tc_enc1.txt
+    dd if=/dev/urandom of=/jfs/tc_enc_large.bin bs=1M count=2 status=none
+    (./mc rb myminio/tcenc > /dev/null 2>&1 --force || true) && ./mc mb myminio/tcenc
+    start_traffic_control_server 0
+    # Encrypt with traffic control
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/ minio://minioadmin:minioadmin@localhost:9000/tcenc/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem --traffic-control-url $TC_URL >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in encrypt sync.log" && exit 1 || true
+    # Decrypt with traffic control
+    rm -rf /tmp/tc_enc_dec && mkdir -p /tmp/tc_enc_dec
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9000/tcenc/ /tmp/tc_enc_dec/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem --traffic-control-url $TC_URL >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in decrypt sync.log" && exit 1 || true
+    [ "$(cat /tmp/tc_enc_dec/tc_enc1.txt)" = "tc encrypt test" ] || (echo "FAIL: decrypt mismatch" && exit 1)
+    cmp /jfs/tc_enc_large.bin /tmp/tc_enc_dec/tc_enc_large.bin || (echo "FAIL: large file mismatch" && exit 1)
+    check_tc_log 2
+    kill_traffic_control_server
+    echo "test_sync_traffic_control_encrypt passed"
+}
+
 test_checkpoint_minio_basic(){
     # Test: checkpoint basic resume for minio-to-minio sync
     prepare_test

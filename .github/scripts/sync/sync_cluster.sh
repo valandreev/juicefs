@@ -375,6 +375,371 @@ start_gateway(){
     ./mc alias set juicegw http://172.20.0.1:9005 minioadmin minioadmin --api S3v4
 }
 
+# ---- sync encryption / decryption tests (cluster) ----
+
+setup_sync_encrypt_keys(){
+    openssl genrsa -out /tmp/sync-enc-nopass.pem 2048
+    openssl genrsa -out /tmp/sync-enc-wrong.pem 2048
+    openssl genrsa -aes256 -passout pass:cluster-enc-pass -out /tmp/sync-enc-withpass.pem 2048
+    # Make keys readable by juicedata user
+    chmod 666 /tmp/sync-enc-nopass.pem /tmp/sync-enc-wrong.pem /tmp/sync-enc-withpass.pem
+    # Copy keys to worker nodes
+    for node in 172.20.0.2 172.20.0.3; do
+        sudo -u juicedata scp -o StrictHostKeyChecking=no /tmp/sync-enc-nopass.pem juicedata@$node:/tmp/sync-enc-nopass.pem
+        sudo -u juicedata scp -o StrictHostKeyChecking=no /tmp/sync-enc-wrong.pem juicedata@$node:/tmp/sync-enc-wrong.pem
+        sudo -u juicedata scp -o StrictHostKeyChecking=no /tmp/sync-enc-withpass.pem juicedata@$node:/tmp/sync-enc-withpass.pem
+    done
+}
+setup_sync_encrypt_keys
+
+# Encrypt: jfs -> minio with distributed workers
+test_sync_encrypt_cluster_basic(){
+    prepare_test
+    ./juicefs mount -d $META_URL /jfs
+    file_count=100
+    mkdir -p /jfs/data
+    for i in $(seq 1 $file_count); do
+        dd if=/dev/urandom of=/jfs/data/file$i bs=1K count=$((RANDOM % 512 + 1)) status=none
+    done
+    # One multi-chunk file
+    dd if=/dev/urandom of=/jfs/data/bigfile bs=1M count=5 status=none
+    chmod -R 777 /jfs/data
+
+    (./mc rb myminio/encdata > /dev/null 2>&1 --force || true) && ./mc mb myminio/encdata
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v jfs://meta_url/data/ minio://minioadmin:minioadmin@172.20.0.1:9000/encdata/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in encrypt sync.log" && exit 1 || true
+
+    # Verify minio has all files
+    enc_count=$(./mc ls -r myminio/encdata/ | wc -l)
+    src_count=$(find /jfs/data -type f | wc -l)
+    [ "$enc_count" -eq "$src_count" ] || (echo "FAIL: file count mismatch enc=$enc_count src=$src_count" && exit 1)
+
+    # Decrypt back to a new JFS volume
+    umount_jfs /jfs $META_URL
+    python3 .github/scripts/flush_meta.py $META_URL
+    rm -rf /var/jfs/myjfs /var/jfsCache/myjfs
+    (./mc rb myminio/myjfs > /dev/null 2>&1 --force || true) && ./mc mb myminio/myjfs
+    ./juicefs format $META_URL myjfs --storage minio --access-key minioadmin --secret-key minioadmin --bucket http://172.20.0.1:9000/myjfs
+    ./juicefs mount -d $META_URL /jfs
+    chmod -R 777 /jfs
+
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v minio://minioadmin:minioadmin@172.20.0.1:9000/encdata/ jfs://meta_url/decdata/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in decrypt sync.log" && exit 1 || true
+
+    dec_count=$(find /jfs/decdata -type f | wc -l)
+    [ "$dec_count" -eq "$src_count" ] || (echo "FAIL: decrypt count mismatch dec=$dec_count src=$src_count" && exit 1)
+    echo "test_sync_encrypt_cluster_basic passed"
+}
+
+# Encrypt with chacha20-rsa in cluster mode
+test_sync_encrypt_cluster_chacha20(){
+    prepare_test
+    ./juicefs mount -d $META_URL /jfs
+    mkdir -p /jfs/data
+    for i in $(seq 1 50); do
+        echo "chacha20-cluster-$i" > /jfs/data/file$i.txt
+    done
+    dd if=/dev/urandom of=/jfs/data/large.bin bs=1M count=3 status=none
+    chmod -R 777 /jfs/data
+
+    (./mc rb myminio/encch > /dev/null 2>&1 --force || true) && ./mc mb myminio/encch
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v jfs://meta_url/data/ minio://minioadmin:minioadmin@172.20.0.1:9000/encch/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem --encrypt-algo chacha20-rsa \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in sync.log" && exit 1 || true
+
+    chmod 777 /jfs
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v minio://minioadmin:minioadmin@172.20.0.1:9000/encch/ jfs://meta_url/decdata/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem --decrypt-algo chacha20-rsa \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    cat sync.log
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in decrypt sync.log" && exit 1 || true
+
+    [ "$(cat /jfs/decdata/file1.txt)" = "chacha20-cluster-1" ] || (echo "FAIL: chacha20 cluster decrypt mismatch" && exit 1)
+    cmp /jfs/data/large.bin /jfs/decdata/large.bin || (echo "FAIL: large binary mismatch" && exit 1)
+    echo "test_sync_encrypt_cluster_chacha20 passed"
+}
+
+# Re-encrypt in cluster mode: decrypt key1 -> encrypt key2
+test_sync_reencrypt_cluster(){
+    prepare_test
+    ./juicefs mount -d $META_URL /jfs
+    mkdir -p /jfs/data
+    for i in $(seq 1 30); do
+        dd if=/dev/urandom of=/jfs/data/file$i bs=1K count=$((RANDOM % 256 + 1)) status=none
+    done
+    chmod -R 777 /jfs/data
+
+    (./mc rb myminio/reenc1 > /dev/null 2>&1 --force || true) && ./mc mb myminio/reenc1
+    (./mc rb myminio/reenc2 > /dev/null 2>&1 --force || true) && ./mc mb myminio/reenc2
+
+    # Encrypt with key1
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v jfs://meta_url/data/ minio://minioadmin:minioadmin@172.20.0.1:9000/reenc1/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal" && exit 1 || true
+
+    # Re-encrypt: key1 -> key2
+    sudo -u juicedata ./juicefs sync -v minio://minioadmin:minioadmin@172.20.0.1:9000/reenc1/ minio://minioadmin:minioadmin@172.20.0.1:9000/reenc2/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem --encrypt-rsa-key /tmp/sync-enc-wrong.pem \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal" && exit 1 || true
+
+    # Decrypt with key2 and verify
+    chmod 777 /jfs
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v minio://minioadmin:minioadmin@172.20.0.1:9000/reenc2/ jfs://meta_url/decdata/ \
+        --decrypt-rsa-key /tmp/sync-enc-wrong.pem \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    cat sync.log
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal" && exit 1 || true
+
+    diff /jfs/data/ /jfs/decdata/ || (echo "FAIL: reencrypt cluster data mismatch" && exit 1)
+    echo "test_sync_reencrypt_cluster passed"
+}
+
+# Encrypt with passphrase-protected key in cluster mode
+test_sync_encrypt_cluster_passphrase(){
+    prepare_test
+    ./juicefs mount -d $META_URL /jfs
+    mkdir -p /jfs/data
+    for i in $(seq 1 20); do
+        echo "passphrase-test-$i" > /jfs/data/file$i.txt
+    done
+    chmod -R 777 /jfs/data
+
+    (./mc rb myminio/encpass > /dev/null 2>&1 --force || true) && ./mc mb myminio/encpass
+    sudo -u juicedata JFS_ENCRYPT_RSA_PASSPHRASE=cluster-enc-pass meta_url=$META_URL \
+        ./juicefs sync -v jfs://meta_url/data/ minio://minioadmin:minioadmin@172.20.0.1:9000/encpass/ \
+        --encrypt-rsa-key /tmp/sync-enc-withpass.pem \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in encrypt sync.log" && exit 1 || true
+
+    chmod 777 /jfs
+    sudo -u juicedata JFS_DECRYPT_RSA_PASSPHRASE=cluster-enc-pass meta_url=$META_URL \
+        ./juicefs sync -v minio://minioadmin:minioadmin@172.20.0.1:9000/encpass/ jfs://meta_url/decdata/ \
+        --decrypt-rsa-key /tmp/sync-enc-withpass.pem \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    cat sync.log
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in decrypt sync.log" && exit 1 || true
+
+    [ "$(cat /jfs/decdata/file1.txt)" = "passphrase-test-1" ] || (echo "FAIL: passphrase decrypt mismatch" && exit 1)
+    diff /jfs/data/ /jfs/decdata/ || (echo "FAIL: passphrase cluster data mismatch" && exit 1)
+    echo "test_sync_encrypt_cluster_passphrase passed"
+}
+
+# Encrypt with --update --check-all in cluster mode
+test_sync_encrypt_cluster_update(){
+    prepare_test
+    ./juicefs mount -d $META_URL /jfs
+    mkdir -p /jfs/data
+    for i in $(seq 1 50); do
+        echo "initial-$i" > /jfs/data/file$i.txt
+    done
+    chmod -R 777 /jfs/data
+
+    (./mc rb myminio/encupd > /dev/null 2>&1 --force || true) && ./mc mb myminio/encupd
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v jfs://meta_url/data/ minio://minioadmin:minioadmin@172.20.0.1:9000/encupd/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal" && exit 1 || true
+
+    # Update some files
+    sleep 2
+    for i in $(seq 1 10); do
+        echo "updated-$i" > /jfs/data/file$i.txt
+    done
+
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v jfs://meta_url/data/ minio://minioadmin:minioadmin@172.20.0.1:9000/encupd/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem --update --check-all \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal" && exit 1 || true
+
+    # Decrypt and verify
+    chmod 777 /jfs
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v minio://minioadmin:minioadmin@172.20.0.1:9000/encupd/ jfs://meta_url/decdata/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    cat sync.log
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal" && exit 1 || true
+
+    [ "$(cat /jfs/decdata/file1.txt)" = "updated-1" ] || (echo "FAIL: updated file mismatch" && exit 1)
+    [ "$(cat /jfs/decdata/file20.txt)" = "initial-20" ] || (echo "FAIL: non-updated file mismatch" && exit 1)
+    echo "test_sync_encrypt_cluster_update passed"
+}
+
+
+# ---- sync global traffic control tests (cluster) ----
+
+TC_PORT=12345
+TC_URL="http://172.20.0.1:${TC_PORT}/"
+TC_LOG="/tmp/tc_server.log"
+
+start_traffic_control_server(){
+    local bwlimit=${1:-0}
+    kill_traffic_control_server
+    python3 .github/scripts/traffic_control_server.py --port $TC_PORT --bwlimit $bwlimit --log $TC_LOG &
+    TC_PID=$!
+    sleep 1
+    if ! kill -0 $TC_PID 2>/dev/null; then
+        echo "FAIL: traffic control server failed to start"
+        exit 1
+    fi
+}
+
+kill_traffic_control_server(){
+    lsof -i :$TC_PORT -t 2>/dev/null | xargs -r kill -9 || true
+    sleep 0.5
+}
+
+check_tc_log(){
+    local min_requests=${1:-1}
+    [ ! -f $TC_LOG ] && echo "FAIL: TC log not found" && exit 1
+    local req_count=$(wc -l < $TC_LOG)
+    if [ "$req_count" -lt "$min_requests" ]; then
+        echo "FAIL: expected at least $min_requests TC requests, got $req_count"
+        cat $TC_LOG
+        exit 1
+    fi
+    echo "TC log: $req_count requests"
+}
+
+# Traffic control with bwlimit combined: JFS -> minio with cluster
+test_sync_traffic_control_cluster_with_bwlimit(){
+    prepare_test
+    ./juicefs mount -d $META_URL /jfs
+    file_count=100
+    mkdir -p /jfs/data
+    for i in $(seq 1 $file_count); do
+        dd if=/dev/urandom of=/jfs/data/file$i bs=50K count=1 status=none
+    done
+    chmod -R 777 /jfs/data
+    (./mc rb myminio/tcdata > /dev/null 2>&1 --force || true) && ./mc mb myminio/tcdata
+    start_traffic_control_server 0
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v jfs://meta_url/data/ minio://minioadmin:minioadmin@172.20.0.1:9000/tcdata/ \
+        --traffic-control-url $TC_URL --bwlimit 8192 \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    cat sync.log
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in sync.log" && exit 1 || true
+    enc_count=$(./mc ls -r myminio/tcdata/ | wc -l)
+    [ "$enc_count" -eq "$file_count" ] || (echo "FAIL: count mismatch enc=$enc_count expected=$file_count" && exit 1)
+    check_tc_log 1
+    kill_traffic_control_server
+    echo "test_sync_traffic_control_cluster_with_bwlimit passed"
+}
+
+
+# Traffic control with encrypt in cluster mode
+test_sync_traffic_control_cluster_encrypt(){
+    prepare_test
+    ./juicefs mount -d $META_URL /jfs
+    mkdir -p /jfs/data
+    for i in $(seq 1 30); do
+        dd if=/dev/urandom of=/jfs/data/file$i bs=10K count=1 status=none
+    done
+    chmod -R 777 /jfs/data
+    (./mc rb myminio/tcenc > /dev/null 2>&1 --force || true) && ./mc mb myminio/tcenc
+    start_traffic_control_server 0
+    # Encrypt with traffic control
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v jfs://meta_url/data/ minio://minioadmin:minioadmin@172.20.0.1:9000/tcenc/ \
+        --encrypt-rsa-key /tmp/sync-enc-nopass.pem --traffic-control-url $TC_URL \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    cat sync.log
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in encrypt sync.log" && exit 1 || true
+    # Decrypt with traffic control
+    chmod 777 /jfs
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync -v minio://minioadmin:minioadmin@172.20.0.1:9000/tcenc/ jfs://meta_url/decdata/ \
+        --decrypt-rsa-key /tmp/sync-enc-nopass.pem --traffic-control-url $TC_URL \
+        --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+        --list-threads 10 --list-depth 5 \
+        >sync.log 2>&1
+    cat sync.log
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in decrypt sync.log" && exit 1 || true
+    diff /jfs/data/ /jfs/decdata/ || (echo "FAIL: traffic control encrypt/decrypt data mismatch" && exit 1)
+    check_tc_log 2
+    kill_traffic_control_server
+    echo "test_sync_traffic_control_cluster_encrypt passed"
+}
+
+test_sync_files_from_ignore_nonexistent_cluster(){
+    # PR #6339: verify files-from gracefully ignores non-existent paths in cluster mode
+    prepare_test
+    ./juicefs mount -d $META_URL /jfs
+
+    # Create source files
+    mkdir -p /jfs/src
+    for i in $(seq 1 30); do
+        echo "content-$i" > /jfs/src/file$i
+    done
+    chmod -R 777 /jfs/src
+
+    # Create files-from list with both existing and non-existing paths
+    cat > /tmp/files_list << 'EOF'
+file1
+file2
+file3
+missing_aaa
+missing_bbb
+missing_ccc
+file10
+file20
+file30
+EOF
+    chmod 644 /tmp/files_list
+
+    sudo -u juicedata meta_url=$META_URL ./juicefs sync jfs://meta_url/src/ jfs://meta_url/dst/ \
+         --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 \
+         --list-threads 10 --list-depth 5 --files-from /tmp/files_list \
+         >sync.log 2>&1
+
+    # Verify non-existent paths were ignored
+    grep "Ignored 3 non-existent paths from the file list" sync.log || (echo "FAIL: expected 3 ignored paths" && cat sync.log && exit 1)
+
+    # Verify existing files in the list were synced
+    for name in file1 file2 file3 file10 file20 file30; do
+        [ -f "/jfs/dst/$name" ] || (echo "FAIL: $name not synced" && exit 1)
+    done
+
+    # Verify files NOT in the list were NOT synced
+    for name in file4 file5 file15; do
+        [ ! -f "/jfs/dst/$name" ] || (echo "FAIL: $name should not be synced (not in files list)" && exit 1)
+    done
+
+    grep "panic:\|<FATAL>" sync.log && echo "panic or fatal in sync.log" && exit 1 || true
+    echo "PASS: test_sync_files_from_ignore_nonexistent_cluster"
+}
+
 skip_test_checkpoint_cluster_save_on_check_change_failure(){
     # Issue #6890: cluster sync with --check-change that fails should save checkpoint
     # Use long checkpoint-interval so only explicit save-on-failure creates the checkpoint.
