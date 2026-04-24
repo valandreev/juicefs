@@ -1571,14 +1571,7 @@ func (m *baseMeta) inheritMode(ctx Context, _type uint8, parentGid uint32, paren
 		if _type == TypeDirectory {
 			childMode |= 02000
 		} else if childMode&02010 == 02010 && ctx.Uid() != 0 {
-			found := false
-			for _, g := range ctx.Gids() {
-				if g == parentGid {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !containsGid(ctx, parentGid) {
 				childMode &= ^uint16(02000)
 			}
 		}
@@ -3563,7 +3556,7 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 	}
 	if set&SetAttrMode != 0 {
 		if ctx.Uid() != 0 && (attr.Mode&02000) != 0 {
-			if ctx.Gid() != cur.Gid {
+			if !containsGid(ctx, cur.Gid) {
 				attr.Mode &= 05777
 			}
 		}
