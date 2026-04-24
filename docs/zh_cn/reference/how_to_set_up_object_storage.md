@@ -191,6 +191,7 @@ juicefs format \
 | [本地磁盘](#本地磁盘)                       | `file`     |
 | [SFTP/SSH](#sftp)                           | `sftp`     |
 | [NFS](#nfs)                                 | `nfs`      |
+| [CIFS/SMB](#cifs)                           | `cifs`     |
 
 ### Amazon S3
 
@@ -1223,6 +1224,37 @@ juicefs format  \
 - `--bucket` 用来设置服务器的地址及存储路径，格式为 `[sftp://]<IP/Domain>:[port]:<Path>`。注意，目录名应该以 `/` 结尾，端口号为可选项默认为 `22`，例如 `192.168.1.11:22:myjfs/`。
 - `--access-key` 用来设置远程服务器的用户名
 - `--secret-key` 用来设置远程服务器的密码
+
+### CIFS/SMB {#cifs}
+
+CIFS/SMB（Common Internet File System / Server Message Block）是一种在 Windows 环境中广泛使用的网络文件共享协议，它允许网络中的计算机访问远程服务器上的共享文件和文件夹。
+
+JuiceFS 支持使用 CIFS/SMB 作为底层数据存储。当你有现有的 Windows 文件服务器或支持 SMB 协议的 NAS 设备时，这非常有用。
+
+```bash
+juicefs format \
+    --storage cifs \
+    --bucket 192.168.1.100/share \
+    --access-key username \
+    --secret-key password \
+    ...
+    redis://localhost:6379/1 myjfs
+```
+
+:::note 注意事项
+
+- `--storage` 可以设置为 `cifs` 或 `smb`，两者都支持。
+- `--bucket` 格式为 `<host>[:port]/<share>` 或 `cifs://<host>[:port]/<share>`，其中 `<share>` 是 SMB 共享名称。默认端口为 `445`。
+- `--access-key` 是 SMB 认证的用户名。
+- `--secret-key` 是 SMB 认证的密码。
+:::
+
+:::caution 限制
+
+- SMB 协议对 Unix 文件权限的支持有限。仅支持只读（0444）和可写（0666）两种模式，其他权限位会被忽略。
+- 符号链接不能像 POSIX 系统那样完全支持。
+- 要调整连接池大小，请设置 `JFS_CIFS_MAX_POOL` 环境变量（默认为 8）。
+:::
 
 ### NFS {#nfs}
 
